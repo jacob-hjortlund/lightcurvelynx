@@ -430,6 +430,24 @@ def test_obs_table_filter_rows():
         _ = ops_data.filter_rows(bad_mask)
 
 
+def test_obs_table_filter_invalid_rows():
+    """Test that we can filter out rows with invalid values in the required columns."""
+    values = {
+        "time": np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+        "ra": np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]),
+        "dec": np.array([-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0]),
+        "zp": np.array([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, np.nan, 7.0]),
+        "sky_bg_e": np.array([0.0, np.nan, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+        "filter": np.array(["r", "g", "i", "r", "g", "i", "r", "g"]),
+    }
+    ops_data = ObsTable(values)
+
+    # Filter out rows with invalid values in the specified columns.
+    ops_data = ops_data.filter_invalid_rows(["ra", "dec", "zp", "sky_bg_e", "filter", "time"])
+    assert len(ops_data) == 6
+    assert np.allclose(ops_data._table["time"], [0.0, 2.0, 3.0, 4.0, 5.0, 7.0])
+
+
 def test_get_value_per_row_uses_positional_indices_for_table_columns():
     """Test that get_value_per_row() treats indices as row positions for table columns."""
     values = {
@@ -926,7 +944,6 @@ def test_obstable_make_resampled_table():
         pixel_scale=0.112,
         radius=1.03,
         survey_other=1.2,
-        apply_saturation=True,
         saturation_mags=saturation_mags,
     )
 
@@ -985,7 +1002,6 @@ def test_obstable_make_resampled_table_overwrite():
         values,
         detector_footprint=detector_footprint,
         saturation_mags=saturation_mags,
-        apply_saturation=True,
     )
 
     # Create a resampled ObsTable with some new values.

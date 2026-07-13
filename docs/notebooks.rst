@@ -35,6 +35,7 @@ features and models of the LightCurveLynx package.
     Extrapolation in Time and Wavelength <notebooks/extrapolation>
     Advanced Sampling Techniques <notebooks/advanced_sampling>
     Simulating Multiple Surveys <notebooks/multiple_surveys>
+    Sampling with ModelDAGs <notebooks/pre_executed/modeldag_sampling>
     Detector Footprints <notebooks/detector_footprint>
     Parallel Runs <notebooks/parallel_runs>
     Setting Saturation Limits <notebooks/saturation>
@@ -75,6 +76,7 @@ in roughly alphabetical order of simulation package or simulation type).
     Resampling LCLIB <notebooks/pre_executed/lclib_example>
     SNANA Models <notebooks/pre_executed/snana_example>
     Synphot-based Models <notebooks/pre_executed/synphot_example>
+    BayeSN Supernova Ia Model <notebooks/pre_executed/bayeSN_example>
 
 
 Other Surveys
@@ -85,6 +87,7 @@ The following notebooks provide example simulations using non-Rubin surveys.
 .. toctree::
     :maxdepth: 1
 
+    All-Sky ObsTable Example <notebooks/location_free_obstable>
     Argus Survey (prototype development)<notebooks/pre_executed/argus_example>
     SkyMapper Survey <notebooks/pre_executed/skymapper_example>
 

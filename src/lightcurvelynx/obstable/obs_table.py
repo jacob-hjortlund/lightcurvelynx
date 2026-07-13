@@ -173,7 +173,7 @@ class ObsTable:
             for alt_name, standard_name in self._alt_filter_name_map.items():
                 mask = self._table["filter"] == alt_name
                 if mask.any():
-                    logger.info(f"Remapping filter name '{alt_name}' to standard name '{standard_name}'.")
+                    logger.debug(f"Remapping filter name '{alt_name}' to standard name '{standard_name}'.")
                     self._table.loc[mask, "filter"] = standard_name
 
         # Save the survey values, with table metadata and keyword arguments overwriting the defaults.
@@ -723,6 +723,27 @@ class ObsTable:
         self._table = self._table[mask]
         self._update_cached_data()
 
+        return self
+
+    def filter_invalid_rows(self, columns):
+        """Filter the rows in the ObsTable to only include those that have valid (non-NaN) values
+        in the specified columns.
+
+        Parameters
+        ----------
+        columns : list of str
+            The columns to check for valid values.
+
+        Returns
+        -------
+        self : ObsTable
+            The filtered ObsTable object.
+        """
+        mask = np.ones(len(self._table), dtype=bool)
+        for col in columns:
+            mask &= ~self._table[col].isna()
+        self._table = self._table[mask]
+        self._update_cached_data()
         return self
 
     def is_observed(self, query_ra, query_dec, *, radius=None, t_min=None, t_max=None):

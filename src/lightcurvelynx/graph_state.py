@@ -148,8 +148,23 @@ class GraphState:
             for var_name, var_value in node_params.items():
                 if var_name not in other_params:
                     return False
-                if not np.allclose(var_value, other_params[var_name]):
-                    return False
+
+                values1 = np.atleast_1d(var_value)
+                values2 = np.atleast_1d(other_params[var_name])
+                if np.all(values1 == None) and np.all(values2 == None):  # noqa: E711
+                    # Both arrays are all None values, so they are equal.
+                    # This happens a lot for unset values.
+                    continue
+
+                # If the values are numeric, test that they are close.
+                # If this fails (e.g. because the values are objects), then
+                # test for exact equality.
+                try:
+                    if not np.allclose(values1, values2, equal_nan=True):
+                        return False
+                except (TypeError, ValueError):
+                    if not np.array_equal(values1, values2):
+                        return False
 
         # Finally check that the 'fixed' dictionary is the same.
         return self.fixed_vars == other.fixed_vars
@@ -472,7 +487,7 @@ class GraphState:
         if self.num_samples == 1:
             # If this GraphState holds only a single sample, set it from the given value.
             self.states[node_name][var_name] = value
-        elif np.isscalar(value):
+        elif value is None or np.isscalar(value):
             # If the value is a scalar, expand it to the correct number of samples.
             self.states[node_name][var_name] = np.full(self.num_samples, value)
         elif len(value) != self.num_samples:
@@ -535,6 +550,67 @@ class GraphState:
             for var_name, value in node_vars.items():
                 self.set(node_name, var_name, value, force_copy=force_copy, fixed=all_fixed)
 
+    def repeat(self, repeats):
+        """Expand the GraphState to a new number of samples by repeating the existing values
+        for all node.parameter combinations.
+
+        Note
+        ----
+        This method is experimental and may be removed in the future.
+
+        Parameters
+        ----------
+        repeats : array-like or int
+            An array of the number of repetitions for each of the current samples.
+            The length of this array must match the current number of samples.
+            If an integer is provided, all samples will be repeated that many times.
+            The sum of the entries in this array will determine the new number of samples.
+        """
+        # If we get a scalar integer, repeat all samples by that amount.
+        if isinstance(repeats, int | np.integer):
+            repeats = np.full(self.num_samples, int(repeats), dtype=int)
+        else:
+            repeats = np.asarray(repeats)
+            if repeats.ndim != 1:
+                raise TypeError("repeats must be an int or a 1D array-like of integers.")
+            if not np.issubdtype(repeats.dtype, np.integer):
+                raise TypeError("Entries in repeats must be integers.")
+            if len(repeats) != self.num_samples:
+                raise ValueError(
+                    f"Length of repeats must match the current number of samples. "
+                    f"Received {len(repeats)} and {self.num_samples}."
+                )
+        # Check that the entries are valid.
+        if np.any(repeats < 0):
+            raise ValueError("Entries in repeats must be non-negative.")
+
+        # Check how many samples we will have after the repeats.
+        new_num_samples = np.sum(repeats)
+        if new_num_samples == 0:
+            raise ValueError("Cannot have zero samples in GraphState.")
+
+        # Update each the array (or value) for each node+parameter in the GraphState by
+        # repeating the values according to repeats.
+        for node_name, node_vars in self.states.items():
+            for var_name, value in node_vars.items():
+                # Compute the new values as an array.
+                if self.num_samples == 1:
+                    new_values = np.full(repeats[0], value)
+                else:
+                    new_values = np.repeat(value, repeats)
+
+                # If we only have a single sample at the end, store its value.
+                if new_num_samples == 1:
+                    new_values = new_values[0]
+
+                # Save the updated values.
+                self.states[node_name][var_name] = new_values
+
+        # Update the number of samples.
+        self.num_samples = new_num_samples
+        if self.num_samples != 1:
+            self.sample_idx = None
+
     def extract_single_sample(self, sample_num):
         """Create a new GraphState with a single sample state and all scalar values.
 
@@ -543,23 +619,49 @@ class GraphState:
         sample_num : int
             The number of sample to extract.
         """
+        new_state = self.extract_slice(sample_num, sample_num + 1)
+        new_state.sample_idx = new_state.sample_offset
+        return new_state
+
+    def extract_slice(self, start, stop):
+        """Create a new GraphState with a slice of samples.
+
+        Note
+        ----
+        We use a contiguous slice of samples (instead of an arbitrary set of indices) to preserve
+        the semantics of the sample_offset attribute.
+
+        Parameters
+        ----------
+        start : int
+            The starting index of the slice (inclusive).
+        stop : int
+            The stopping index of the slice (exclusive).
+
+        Returns
+        -------
+        GraphState
+            The sliced GraphState.
+        """
         if self.num_samples <= 0:
             raise ValueError("Cannot sample an empty GraphState")
-        if sample_num < 0 or sample_num >= self.num_samples:
-            raise ValueError(f"Invalid index {sample_num} in GraphState with {self.num_samples} entries.")
+        if start < 0 or stop > self.num_samples or start >= stop:
+            raise ValueError(f"Invalid slice [{start}:{stop}] in GraphState with {self.num_samples} entries.")
+        indices = np.arange(start, stop)
 
-        # Make a copy of the GraphState with exactly one sample.
-        new_state = GraphState(1)
+        # Make a slice of the GraphState with the specified samples.
+        new_state = GraphState(len(indices))
         new_state.num_parameters = self.num_parameters
-        new_state.sample_offset = self.sample_offset
-        new_state.sample_idx = sample_num
+        new_state.sample_offset = start + self.sample_offset
         for node_name in self.states:
             new_state.states[node_name] = {}
             for var_name, value in self.states[node_name].items():
                 if self.num_samples == 1:
                     new_state.states[node_name][var_name] = value
+                elif new_state.num_samples == 1:
+                    new_state.states[node_name][var_name] = value[indices[0]]
                 else:
-                    new_state.states[node_name][var_name] = value[sample_num]
+                    new_state.states[node_name][var_name] = value[indices]
 
         # Copy over the sets of fixed variables. This is a single set of strings
         # per node, so we just need to copy the sets.
@@ -701,8 +803,16 @@ class GraphState:
                 names.append(full_name)
                 if self.num_samples == 1:
                     arrays.append(pa.array([param_value]))
-                else:
+                elif np.ndim(param_value) < 2:
                     arrays.append(pa.array(param_value))
+                else:
+                    inner_size = np.prod(param_value.shape[1:])
+                    flat_arrow = pa.array(np.reshape(param_value, (-1,)))
+                    list_arrow = pa.FixedSizeListArray.from_arrays(
+                        values=flat_arrow,
+                        list_size=inner_size,
+                    )
+                    arrays.append(list_arrow)
         return pa.StructArray.from_arrays(arrays, names=names)
 
     def save_to_file(self, filename, overwrite=False):
@@ -811,6 +921,33 @@ class DependencyGraph:
             raise KeyError("Both parameters must be added to the graph before adding an edge.")
         self.incoming[to_param].add(from_param)
         self.outgoing[from_param].add(to_param)
+
+    def get_all_dependencies(self, param_name):
+        """Get the parameters that the given parameter depends on, including transitive dependencies.
+
+        Parameters
+        ----------
+        param_name : str
+            The name of the parameter to get the dependencies for.
+
+        Returns
+        -------
+        dependencies : set
+            The set of parameters that the given parameter depends on, including transitive dependencies.
+        """
+        if param_name not in self.all_params:
+            raise KeyError(f"Parameter '{param_name}' not found in the graph.")
+
+        to_visit = [param_name]
+        dependencies = set()
+        while to_visit:
+            current = to_visit.pop()
+            for dep in self.incoming[current]:
+                if dep not in dependencies:
+                    dependencies.add(dep)
+                    to_visit.append(dep)
+
+        return dependencies
 
     def build_subgraph(self, param_name, incoming=True, outgoing=True):
         """Get the DAG subgraph that contains this parameter. This can be:

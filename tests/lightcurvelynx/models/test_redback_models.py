@@ -8,7 +8,7 @@ from lightcurvelynx.models.redback_models import RedbackWrapperModel
 from lightcurvelynx.utils.extrapolate import ConstantPadding
 
 
-class ToySNModel:
+class _ToySNModel:
     """A toy model that mimics the data structure of a RedbackTimeSeriesSource,
     but we can control.
 
@@ -20,9 +20,11 @@ class ToySNModel:
         The width of the toy model peak.
     """
 
-    def __init__(self, height, width):
+    def __init__(self, height, width, min_phase=None, max_phase=None):
         self.height = height
         self.width = width
+        self._min_phase = min_phase
+        self._max_phase = max_phase
 
     def minwave(self):
         """Get the minimum wavelength of the model."""
@@ -36,11 +38,11 @@ class ToySNModel:
 
     def minphase(self):
         """Get the minimum phase of the model."""
-        return None
+        return None  # The model does not know its own phase bounds (like redback kilanova).
 
     def maxphase(self):
         """Get the maximum phase of the model."""
-        return None
+        return None  # The model does not know its own phase bounds (like redback kilanova).
 
     def get_flux_density(self, times, wavelengths):
         """A toy flux function that depends on time and wave.
@@ -58,6 +60,11 @@ class ToySNModel:
         flux_density : numpy.ndarray
             A length T x N matrix of SED values (in nJy).
         """
+        if self._min_phase is not None and (times < self._min_phase).any():
+            raise ValueError("Times are out of bounds for this model.")
+        if self._max_phase is not None and (times > self._max_phase).any():
+            raise ValueError("Times are out of bounds for this model.")
+
         lightcurve = self.height * np.exp(-(times**2) / (self.width**2))
         flux_density = lightcurve[:, np.newaxis] * (1000.0 / wavelengths[np.newaxis, :])
         return flux_density
@@ -65,7 +72,12 @@ class ToySNModel:
 
 def _toy_redback_model(times, height, width, **kwargs):
     """Create and return the toy model."""
-    return ToySNModel(height, width)
+    return _ToySNModel(height, width)
+
+
+def _toy_redback_model_with_bounds(times, height, width, **kwargs):
+    """Create and return the toy model with bounds."""
+    return _ToySNModel(height, width, min_phase=0.0, max_phase=10.0)
 
 
 # Fake the appending of a citation to the model function.
@@ -88,6 +100,7 @@ def test_redback_models_toy() -> None:
         ra=0.0,  # Set other parameters
         dec=-10.0,
         t0=t0,
+        phase_bounds=(None, None),  # No phase bounds for this test
         node_label="source",
     )
     assert set(model.source_param_names) == {"height", "width"}
@@ -127,6 +140,7 @@ def test_redback_models_fail_toy() -> None:
     model = RedbackWrapperModel(
         _toy_redback_model,
         parameters={"height": 1000.0},  # Missing "width"
+        phase_bounds=(1e-3, None),
         t0=t0,
         node_label="source",
     )
@@ -145,9 +159,74 @@ def test_redback_models_fail_toy() -> None:
         _ = RedbackWrapperModel(
             "one_component_kilonova_model",
             parameters={"height": 1000.0, "width": 10.0, "redshift": 0.05},
+            phase_bounds=(1e-3, None),
             redshift=0.1,
             node_label="toy",
         )
+
+    # Fail if we don't provide required phase bounds.
+    with pytest.raises(ValueError):
+        _ = RedbackWrapperModel(
+            _toy_redback_model,
+            parameters={"height": 1000.0, "width": 10.0},
+            t0=t0,
+            node_label="source",
+        )
+
+
+def test_redback_models_bounded_toy() -> None:
+    """Test that we can create and evaluate a model with phase bounds."""
+    t0 = 64350.0
+    parameters = {
+        "height": 1000.0,
+        "width": 10.0,
+    }
+
+    # Create the model.
+    model = RedbackWrapperModel(
+        _toy_redback_model_with_bounds,
+        parameters=parameters,  # Set ALL the redback model parameters
+        t0=t0,
+        phase_bounds=(None, None),
+        node_label="source",
+    )
+    assert set(model.source_param_names) == {"height", "width"}
+
+    # Despite the underlying model having bounds, the wrapper model does not know about them yet.
+    assert model.minphase() is None
+    assert model.maxphase() is None
+    assert model.minwave() is None
+    assert model.maxwave() is None
+
+    # We can evalute the model.
+    state = model.sample_parameters()
+    times = np.array([-10.0, -5.0, 0.5, 10.0, 15.0]) + t0
+    waves_ang = np.array([1000.0, 2000.0])
+
+    # We fail when evaluating outside the phase bounds of the model.
+    with pytest.raises(ValueError):
+        _ = model.evaluate_sed(times, waves_ang, graph_state=state)
+
+    # We can create a "safe" model with predefined bounds that will just return 0.0 outside the bounds.
+    safe_model = RedbackWrapperModel(
+        _toy_redback_model_with_bounds,
+        parameters=parameters,  # Set ALL the redback model parameters
+        t0=t0,
+        phase_bounds=(0.0, 10.0),
+        wave_bounds=(10.0, 10000.0),
+        time_extrapolation=(ConstantPadding(0.0), ConstantPadding(0.0)),
+        node_label="source",
+    )
+    assert safe_model.minphase() == 0.0
+    assert safe_model.maxphase() == 10.0
+    assert safe_model.minwave() == 10.0
+    assert safe_model.maxwave() == 10000.0
+
+    safe_fluxes = safe_model.evaluate_sed(times, waves_ang, graph_state=state)
+    assert safe_fluxes.shape == (5, 2)
+    assert np.all(safe_fluxes[0:2, :] == 0.0)  # out of bounds on the left
+    assert np.all(safe_fluxes[2:4, :] > 0.0)  # in bounds
+    assert np.all(safe_fluxes[4, :] == 0.0)  # out of bounds on the right
 
 
 def test_redback_models_chained_toy() -> None:
@@ -163,6 +242,7 @@ def test_redback_models_chained_toy() -> None:
         _toy_redback_model,
         parameters=parameters,  # Set ALL the redback model parameters
         t0=t0,
+        phase_bounds=(1e-6, None),
         node_label="source",
     )
     assert set(model.source_param_names) == {"height", "width"}
@@ -208,6 +288,7 @@ def test_redback_model_extrapolation() -> None:
         _toy_redback_function,
         parameters={"param1": 1.0, "param2": 2.0},
         t0=t0,
+        phase_bounds=(None, None),  # No predefined bounds (we use model's bounds)
         node_label="source",
         wave_extrapolation=(ConstantPadding(1.0), ConstantPadding(2.0)),
         time_extrapolation=(ConstantPadding(3.0), ConstantPadding(4.0)),
@@ -240,3 +321,53 @@ def test_redback_model_extrapolation() -> None:
     # bypass the extrapolation logic and just query the spline directly (all zeros).
     direct_fluxes = model.compute_sed(times, waves_ang, state)
     assert np.all(direct_fluxes == 0.0)
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_redback_kilanova_model_bounds() -> None:
+    """Test that we can create a RedbackWrapperModel from a function
+    that has bounds, and that the wrapper model correctly infers the bounds."""
+    redback = pytest.importorskip("redback")
+
+    # Load a kilonova model from redback's model library.
+    model_fn = redback.model_library.all_models_dict["one_component_kilonova_model"]
+
+    # Set the parameters that are needed by the redback model.
+    parameters = {
+        "mej": 0.0474626158082385,
+        "redshift": 0.04149890084774436,
+        "temperature_floor": 3000,
+        "kappa": 1,
+        "vej": 0.2,
+    }
+
+    # Create the model itself.
+    t0 = 64483.0
+    source = RedbackWrapperModel(
+        model_fn,
+        parameters=parameters,  # Set ALL the redback model parameters
+        ra=0.0,
+        dec=0.0,
+        t0=t0,
+        node_label="source",
+        phase_bounds=(0.1, None),
+    )
+
+    # Try with all times after t0.
+    waves = np.array([5000.0, 6000.0, 7000.0])
+    fluxes = source.evaluate_sed(t0 + np.array([1.0, 2.0]), waves)
+    assert fluxes.shape == (2, 3)
+    assert np.all(fluxes > 0.0)  # The model should return positive fluxes in bounds.
+
+    # Try with a single invalid time (before t0). This should be set to zero.
+    fluxes = source.evaluate_sed(t0 + np.array([-1.0, 1.0, 10.0, 20.0]), waves)
+    assert np.all(fluxes[0, :] == 0.0)  # The flux for the invalid time should be zero.
+    assert np.all(fluxes[1, :] > 0.0)  # The flux for the valid time should be positive.
+
+    # Try with only invalid times. This should all be set to zero.
+    fluxes = source.evaluate_sed(t0 + np.array([-2.0, -1.0]), waves)
+    assert np.all(fluxes == 0.0)
+
+    # Try with just t0=0.0. This falls outside the bounds.
+    fluxes = source.evaluate_sed(np.array([t0]), waves)
+    assert np.all(fluxes == 0.0)

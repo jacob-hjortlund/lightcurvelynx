@@ -32,8 +32,8 @@ The key columns in the nested light curve DataFrame are:
 
     * ``mjd``: The Modified Julian Date of the observation.
     * ``filter``: The filter name for the observation.
-    * ``flux``: The observed flux in nJy for the object at that time and filter. This is what is read out of the sensor.
-    * ``fluxerr``: The uncertainty on the observed flux.
+    * ``flux``: The observed flux in nJy for the object at that time and filter, including noise. This is what is read out of the sensor.
+    * ``fluxerr``: The uncertainty on the observed flux. See the :doc:`noise models <noise_models>` page for more information on how this is computed.
     * ``flux_perfect``: The underlying flux (in nJy) for the object as it reaches the Earth's atmosphere. This represents the object's flux with all effects applied (except atmosphere/sensor noise).
 
 The nested light curve DataFrame also contains book keeping information that can be useful in ad hoc post analysis:
@@ -93,6 +93,23 @@ If users want to include specific parameters as separate columns in the results 
 
 The new column will be named ``salt2_c`` with an underscore instead of a dot (so the name is not interpreted
 as a nested key).
+
+
+Joining ObsTable Data
+--------------------------------------------------------------------------------
+
+Users can include data from the ObsTables' rows in the results by using ``obstable_save_cols`` parameter when starting a simulation. This parameter takes a list of column names from the ObsTable. The values from these columns will be saved in light curve nested table, because there will be one value for each observation (which corresponds to a single row in the ObsTable).
+
+If users have already run a simulation and want to include specific columns from the ObsTable in the results table, they can use the ``results_append_obstable_data()`` function in utils/post_process_results:
+
+.. code-block:: python
+
+    from lightcurvelynx.utils.post_process_results import results_append_obstable_data
+    results = results_append_obstable_data(res1, "test_col", [ops_table_1, ops_table_2])
+
+The data will be stored in the ``test_col`` column in the nested light curve DataFrame.
+
+Note that if the simulation was run with mutiple surveys, the function matches observations to each observation based on the ``survey_idx`` and ``obs_idx`` columns in the nested light curve DataFrame.  In this case, users will need to pass in a list of ObsTable in the same order as the original simulation.
 
 
 Plotting Results

@@ -118,6 +118,47 @@ def test_create_graph_state_offset():
     assert state.sample_offset == 5
 
 
+def test_graph_state_slice():
+    """Test that we can create a slice of a GraphState."""
+    state = GraphState(20, sample_offset=5)
+    state.set("a", "v1", np.arange(20))
+    state.set("a", "v2", np.arange(20) + 1)
+    state.set("b", "v1", np.arange(20) - 1)
+    assert len(state) == 3
+
+    # Check that we can extract a slice of the GraphState.
+    slice_state = state.extract_slice(5, 10)
+    assert slice_state.num_samples == 5
+    assert slice_state.sample_offset == 10
+    assert np.array_equal(slice_state["a"]["v1"], np.arange(5, 10))
+    assert np.array_equal(slice_state["a"]["v2"], np.arange(6, 11))
+    assert np.array_equal(slice_state["b"]["v1"], np.arange(4, 9))
+
+    # We can slice a slice.
+    slice_state2 = slice_state.extract_slice(1, 3)
+    assert slice_state2.num_samples == 2
+    assert slice_state2.sample_offset == 11
+    assert np.array_equal(slice_state2["a"]["v1"], np.arange(6, 8))
+    assert np.array_equal(slice_state2["a"]["v2"], np.arange(7, 9))
+    assert np.array_equal(slice_state2["b"]["v1"], np.arange(5, 7))
+
+    # We can correctly slice out a single sample and get scalars.
+    slice_state3 = state.extract_slice(5, 6)
+    assert slice_state3.num_samples == 1
+    assert slice_state3.sample_offset == 10
+    assert slice_state3["a"]["v1"] == 5
+    assert slice_state3["a"]["v2"] == 6
+    assert slice_state3["b"]["v1"] == 4
+
+    # We fail with invalid slice indices.
+    with pytest.raises(ValueError):
+        _ = state.extract_slice(-1, 5)
+    with pytest.raises(ValueError):
+        _ = state.extract_slice(5, 25)
+    with pytest.raises(ValueError):
+        _ = state.extract_slice(10, 5)
+
+
 def test_create_single_graph_state_from_flattened_dict():
     """Test that we can create a single GraphState from a flattened dictionary."""
     input = {
@@ -278,7 +319,7 @@ def test_create_multi_sample_graph_state():
     new_state = state.extract_single_sample(3)
     assert len(new_state) == 3
     assert new_state.num_samples == 1
-    assert new_state.sample_offset == 0
+    assert new_state.sample_offset == 3
     assert new_state.sample_idx == 3
     assert new_state["a"]["v1"] == 1.0
     assert new_state["a"]["v2"] == 3.5
@@ -530,6 +571,40 @@ def test_graph_state_equal():
     assert state5 != state6
 
 
+def test_graph_state_equal_scalars():
+    """Test that we use == on GraphStates with scalar values."""
+    state1 = GraphState(num_samples=1)
+    state1.set("a", "v1", 1.0)
+    state1.set("a", "v2", 2.0)
+    state1.set("b", "v1", None)
+
+    state2 = GraphState(num_samples=1)
+    state2.set("a", "v1", 1.0)
+    state2.set("a", "v2", 2.0)
+    state2.set("b", "v1", None)
+    assert state1 == state2
+
+    state2.set("a", "v2", 3.0)
+    assert state1 != state2
+
+
+def test_graph_state_equal_nones():
+    """Test that we use == on GraphStates with None values."""
+    state1 = GraphState(num_samples=3)
+    state1.set("a", "v1", [1.0, 2.0, 3.0])
+    state1.set("a", "v2", [2, 3, None])  # One None
+    state1.set("b", "v1", [None, None, None])  # All None
+
+    state2 = GraphState(num_samples=3)
+    state2.set("a", "v1", [1.0, 2.0, 3.0])
+    state2.set("a", "v2", [2, 3, None])  # One None
+    state2.set("b", "v1", [None, None, None])  # All None
+    assert state1 == state2
+
+    state2.set("b", "v1", [2, 4, None])
+    assert state1 != state2
+
+
 def test_graph_state_fixed():
     """Test that we respected the 'fixed' flag for GraphState."""
     state = GraphState()
@@ -768,6 +843,107 @@ def test_graph_state_update_multi():
         state.update(state4)
 
 
+def test_graph_state_repeat_multi_sample():
+    """Test that repeat correctly expands a multi-sample GraphState."""
+    state = GraphState(num_samples=3)
+    state.set("a", "v1", [1.0, 2.0, 3.0])
+    state.set("a", "v2", [10.0, 20.0, 30.0])
+    state.set("b", "v1", [-1.0, -2.0, -3.0])
+
+    # We fail if the length of the repeat array does not match the number of samples.
+    with pytest.raises(ValueError):
+        state.repeat([2, 0])
+
+    # We fail if the repeat array contains negative values or non-integer values.
+    with pytest.raises(ValueError):
+        state.repeat([2, -1, 3])
+    with pytest.raises(TypeError):
+        state.repeat([2, 0.5, 3])
+
+    # We fail if we would remove all the values.
+    with pytest.raises(ValueError):
+        state.repeat([0, 0, 0])
+
+    # Do a valid repeat and check the results.
+    state.repeat([2, 0, 3])
+    assert state.num_samples == 5
+    assert np.array_equal(state["a"]["v1"], [1.0, 1.0, 3.0, 3.0, 3.0])
+    assert np.array_equal(state["a"]["v2"], [10.0, 10.0, 30.0, 30.0, 30.0])
+    assert np.array_equal(state["b"]["v1"], [-1.0, -1.0, -3.0, -3.0, -3.0])
+
+    # We can repeat again and it works as expected (note that we need to define the
+    # repeat array with the new number of samples).
+    state.repeat([1, 2, 1, 0, 3])
+    assert state.num_samples == 7
+    assert np.array_equal(state["a"]["v1"], [1.0, 1.0, 1.0, 3.0, 3.0, 3.0, 3.0])
+    assert np.array_equal(state["a"]["v2"], [10.0, 10.0, 10.0, 30.0, 30.0, 30.0, 30.0])
+    assert np.array_equal(state["b"]["v1"], [-1.0, -1.0, -1.0, -3.0, -3.0, -3.0, -3.0])
+
+
+def test_graph_state_repeat_multi_to_single():
+    """Test that repeat correctly 'expands' a multi-sample GraphState to a
+    single-sample GraphState."""
+    state = GraphState(num_samples=3)
+    state.set("a", "v1", [1.0, 2.0, 3.0])
+    state.set("a", "v2", [10.0, 20.0, 30.0])
+    state.set("b", "v1", [-1.0, -2.0, -3.0])
+
+    # Do a valid repeat and check the results.
+    state.repeat([0, 1, 0])
+    assert state.num_samples == 1
+    assert np.isscalar(state["a"]["v1"])
+    assert state["a"]["v1"] == 2.0
+    assert np.isscalar(state["a"]["v2"])
+    assert state["a"]["v2"] == 20.0
+    assert np.isscalar(state["b"]["v1"])
+    assert state["b"]["v1"] == -2.0
+
+
+def test_graph_state_repeat_single_sample():
+    """Test that repeat correctly expands a single-sample GraphState."""
+    state = GraphState(num_samples=1)
+    state.set("a", "v1", 2.5)
+    state.set("b", "v1", -4.0)
+
+    state.repeat([4])
+    assert state.num_samples == 4
+    assert np.array_equal(state["a"]["v1"], [2.5, 2.5, 2.5, 2.5])
+    assert np.array_equal(state["b"]["v1"], [-4.0, -4.0, -4.0, -4.0])
+
+
+def test_graph_state_repeat_single_to_single():
+    """Test that repeat handle a single-sample GraphState with repeat = 1."""
+    state = GraphState(num_samples=1)
+    state.set("a", "v1", 2.5)
+    state.set("b", "v1", -4.0)
+
+    state.repeat([1])
+    assert state.num_samples == 1
+    assert np.isscalar(state["a"]["v1"])
+    assert state["a"]["v1"] == 2.5
+    assert np.isscalar(state["b"]["v1"])
+    assert state["b"]["v1"] == -4.0
+
+
+def test_graph_state_repeat_integer_shortcut():
+    """Test that repeat accepts a scalar integer and applies it to all samples."""
+    state = GraphState(num_samples=3)
+    state.set("a", "v1", [1.0, 2.0, 3.0])
+
+    # We fail with invalid values.
+    with pytest.raises(ValueError):
+        state.repeat(0)
+    with pytest.raises(ValueError):
+        state.repeat(-1)
+    with pytest.raises(TypeError):
+        state.repeat(1.5)
+
+    # Valid repeat value.
+    state.repeat(2)
+    assert state.num_samples == 6
+    assert np.array_equal(state["a"]["v1"], [1.0, 1.0, 2.0, 2.0, 3.0, 3.0])
+
+
 def test_graph_to_from_file(tmp_path):
     """Test that we can create an AstroPy Table from a GraphState."""
     state = GraphState(num_samples=3)
@@ -989,6 +1165,13 @@ def test_dependency_graph_subgraphs():
     assert len(dep_graph) == 7
     assert set(dep_graph.all_nodes) == {"a", "b", "c", "d", "e"}
     assert set(dep_graph.all_params) == {"a.1", "b.1", "c.1", "c.2", "d.1", "d.2", "e.1"}
+
+    # We can ask about different node's dependencies.
+    assert dep_graph.get_all_dependencies("b.1") == set(["a.1", "c.1"])
+    assert dep_graph.get_all_dependencies("c.2") == set(["a.1", "b.1", "c.1"])
+    assert dep_graph.get_all_dependencies("d.1") == set(["a.1", "b.1", "c.1"])
+    assert dep_graph.get_all_dependencies("a.1") == set()
+    assert dep_graph.get_all_dependencies("e.1") == set()
 
     # We can get the various types of subgraphs for a node, including:
     # 1) All nodes on which this node depends (incoming=True, outgoing=False)
