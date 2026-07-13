@@ -1,77 +1,251 @@
-import torch
-import logging
-import caustics
-import importlib
 import numpy as np
 
-from pathlib import Path
-from citation_compass import CiteClass
-from astropy.coordinates import SkyCoord
-from lightcurvelynx.models.physical_model import SEDModel
-from lightcurvelynx import _LIGHTCURVELYNX_DOWNLOAD_DATA_DIR
+from lightcurvelynx.models.multi_object_model import MultiObjectModel
+from lightcurvelynx.models.physical_model import BandfluxModel, BasePhysicalModel
 
-class StrongLensModel(SEDModel):
 
-    def __init__(self, model_name, lens_redshift, source_redshift, cosmo, **kwargs):
+class UnresolvedStrongLensModel(MultiObjectModel):
+    """Wrap one physical source as an unresolved static macro-lens system.
 
-        # TODO: Add comment about potential issues with ra/decs and generalization with siblings
-        try:
-            import caustics
-            import torch
-        except ImportError as err:
-            raise ImportError(
-                "caustics is not installed by default. To use the StrongLens class, "
-                "please install caustics with `pip install caustics`"
-            )
+    The model evaluates the source at observer-frame times shifted by each
+    macro-image's relative arrival delay, scales those evaluations by absolute
+    macro-magnifications, and returns their sum.
 
-        try:
-            lens_model = getattr(caustics, model_name)
-        except:
-            raise ValueError(f"Model {model_name} not found in caustics.")
+    Parameters
+    ----------
+    source_model : BasePhysicalModel
+        The physical source to lens.
+    macro_magnifications : parameter
+        Absolute, dimensionless image magnifications. Each sampled value is a
+        one-dimensional array.
+    time_delays : parameter
+        Image arrival delays in observer-frame days. An arbitrary common offset
+        is allowed and removed before evaluation.
+    num_images : parameter, optional
+        Number of active entries in the image arrays. If None, every entry is
+        active.
+    node_label : str, optional
+        Label for the outer model node.
+    **kwargs : dict, optional
+        Overrides for outer physical-model parameters such as ra, dec, t0, and
+        redshift. Unspecified values are linked to the source model.
+    """
 
-        self.lens = lens_model(name="lens",
-                               cosmology=cosmo,
-                               z_l=lens_redshift,
-                               z_s=source_redshift,
-                               **kwargs)
+    def __init__(
+        self,
+        source_model: BasePhysicalModel,
+        *,
+        macro_magnifications,
+        time_delays,
+        num_images=None,
+        node_label=None,
+        **kwargs,
+    ):
+        if not isinstance(source_model, BasePhysicalModel):
+            raise TypeError("source_model must be a BasePhysicalModel.")
 
-        super().__init__(self._lens_model, **kwargs)
+        kwargs.setdefault("ra", source_model.ra)
+        kwargs.setdefault("dec", source_model.dec)
+        kwargs.setdefault("redshift", source_model.redshift)
+        kwargs.setdefault("t0", source_model.t0)
+        kwargs.setdefault("distance", source_model.distance)
 
-    def _lens_model(self, **kwargs):
-        """
-        Generate lens configuration by inverting the lens equation, then sampling source position from inside the caustic.
-        """
-        # TODO: add special cases for when we know the analytical cautics
+        super().__init__([source_model], node_label=node_label, **kwargs)
+        self.source_model = source_model
 
-        # create a grid in source plane
-        
-        n_pix = 100
-        res = 0.05
-        upsample_factor = 2
-        fov = res * n_pix
-        thx, thy = caustics.utils.meshgrid(
-            res / upsample_factor,
-            upsample_factor * n_pix,
-            dtype=torch.float32,
+        self.add_parameter(
+            "macro_magnifications",
+            macro_magnifications,
+            description="Absolute macro-image magnifications (unitless).",
+            allow_gradient=False,
+        )
+        self.add_parameter(
+            "time_delays",
+            time_delays,
+            description="Macro-image observer-frame arrival delays (days).",
+            allow_gradient=False,
+        )
+        self.add_parameter(
+            "num_images",
+            num_images,
+            description="Number of active macro-images.",
+            allow_gradient=False,
         )
 
-        # invert the lens equation, then ray trace to get caustics (lens plane)
-        A = lens_model.jacobian_lens_equation(thx, thy)
-        detA = torch.linalg.det(A)
+        # This composite overrides the single-state evaluation pipeline. Redshift
+        # conversion is owned by the child source and must not be applied twice.
+        self.apply_redshift = False
 
-        # transform back to the source plane, sample from within the caustics
+    def minwave(self, graph_state=None):
+        """Return the child's minimum supported wavelength in Angstroms."""
+        return self.source_model.minwave(graph_state=graph_state)
 
+    def maxwave(self, graph_state=None):
+        """Return the child's maximum supported wavelength in Angstroms."""
+        return self.source_model.maxwave(graph_state=graph_state)
 
-        lp_grid_x, lp_grid_y = self.lens.forward_raytrace(sp_x, sp_y)
+    def _get_active_images(self, state):
+        """Return validated magnifications and normalized delays for one system."""
+        params = self.get_local_params(state)
+        magnifications = np.asarray(params["macro_magnifications"], dtype=float)
+        time_delays = np.asarray(params["time_delays"], dtype=float)
 
-        self.image_x = lp_x # lens plane x position of images
-        self.image_y = lp_y # lens plane y position of images
-        self.macro_mag = self.lens.magnification(lp_x, lp_y)
-        self.time_delays = self.lens.time_delay(lp_x, lp_y)
+        if magnifications.ndim != 1 or time_delays.ndim != 1:
+            raise ValueError(
+                "macro_magnifications and time_delays must be one-dimensional "
+                "for a single GraphState sample."
+            )
+        if len(magnifications) != len(time_delays):
+            raise ValueError(
+                "macro_magnifications and time_delays must have the same length."
+            )
 
-    def flux(self, t):
+        raw_num_images = params["num_images"]
+        if raw_num_images is None:
+            num_images = len(magnifications)
+        else:
+            if np.ndim(raw_num_images) != 0:
+                raise ValueError("num_images must be a scalar for one sample.")
+            num_images = int(raw_num_images)
+            if num_images != raw_num_images:
+                raise ValueError("num_images must be an integer.")
 
-        # only for unresolved right now!
-        flux = source.flux(t, )
+        if num_images < 2:
+            raise ValueError("A strong lens system must contain at least two images.")
+        if num_images > len(magnifications):
+            raise ValueError(
+                f"num_images={num_images} exceeds the image-array length "
+                f"{len(magnifications)}."
+            )
 
-        return flux
+        magnifications = magnifications[:num_images]
+        time_delays = time_delays[:num_images]
+
+        if not np.all(np.isfinite(magnifications)):
+            raise ValueError("Active macro_magnifications must be finite.")
+        if np.any(magnifications < 0.0):
+            raise ValueError("Active macro_magnifications must be non-negative.")
+        if not np.any(magnifications > 0.0):
+            raise ValueError("At least one macro_magnification must be positive.")
+        if not np.all(np.isfinite(time_delays)):
+            raise ValueError("Active time_delays must be finite.")
+
+        relative_delays = time_delays - np.min(time_delays)
+        order = np.argsort(relative_delays, kind="stable")
+        return magnifications[order], relative_delays[order]
+
+    def _apply_wrapper_sed_effects(
+        self,
+        flux_density,
+        *,
+        times,
+        wavelengths,
+        state,
+    ):
+        params = self.get_local_params(state)
+        for effect in self.obs_frame_effects:
+            flux_density = effect.apply(
+                flux_density,
+                times=times,
+                wavelengths=wavelengths,
+                **params,
+            )
+        return flux_density
+
+    def _apply_wrapper_bandflux_effects(
+        self,
+        bandfluxes,
+        *,
+        times,
+        filters,
+        state,
+    ):
+        params = self.get_local_params(state)
+        for effect in self.obs_frame_effects:
+            bandfluxes = effect.apply_bandflux(
+                bandfluxes,
+                times=times,
+                filters=filters,
+                **params,
+            )
+        return bandfluxes
+
+    def _evaluate_single(self, times, wavelengths, state, **kwargs):
+        """Evaluate one unresolved lensed SED in observer-frame units."""
+        if isinstance(self.source_model, BandfluxModel):
+            raise TypeError(
+                "UnresolvedStrongLensModel contains a BandfluxModel, which does "
+                "not support SED evaluation."
+            )
+
+        times = np.asarray(times, dtype=float)
+        wavelengths = np.asarray(wavelengths, dtype=float)
+        magnifications, relative_delays = self._get_active_images(state)
+
+        num_images = len(magnifications)
+        num_times = len(times)
+        num_waves = len(wavelengths)
+
+        shifted_times = times[np.newaxis, :] - relative_delays[:, np.newaxis]
+        source_flux = self.source_model.evaluate_sed(
+            shifted_times.reshape(num_images * num_times),
+            wavelengths,
+            state,
+            **kwargs,
+        )
+        source_flux = np.asarray(source_flux).reshape(
+            num_images,
+            num_times,
+            num_waves,
+        )
+        flux_density = np.einsum(
+            "i,itw->tw",
+            magnifications,
+            source_flux,
+            optimize=True,
+        )
+
+        return self._apply_wrapper_sed_effects(
+            flux_density,
+            times=times,
+            wavelengths=wavelengths,
+            state=state,
+        )
+
+    def _evaluate_bandfluxes_single(
+        self,
+        passband_group,
+        times,
+        filters,
+        state,
+    ):
+        """Evaluate one unresolved lensed bandflux time series in nJy."""
+        times = np.asarray(times, dtype=float)
+        filters = np.asarray(filters)
+        magnifications, relative_delays = self._get_active_images(state)
+
+        num_images = len(magnifications)
+        num_times = len(times)
+
+        shifted_times = times[np.newaxis, :] - relative_delays[:, np.newaxis]
+        shifted_filters = np.tile(filters, num_images)
+        source_flux = self.source_model.evaluate_bandfluxes(
+            passband_group,
+            shifted_times.reshape(num_images * num_times),
+            shifted_filters,
+            state,
+        )
+        source_flux = np.asarray(source_flux).reshape(num_images, num_times)
+        bandfluxes = np.einsum(
+            "i,it->t",
+            magnifications,
+            source_flux,
+            optimize=True,
+        )
+
+        return self._apply_wrapper_bandflux_effects(
+            bandfluxes,
+            times=times,
+            filters=filters,
+            state=state,
+        )
