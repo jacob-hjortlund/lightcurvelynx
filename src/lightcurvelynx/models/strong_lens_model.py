@@ -1,17 +1,16 @@
-import importlib
+import torch
 import logging
-from pathlib import Path
-
+import caustics
+import importlib
 import numpy as np
-import pooch
-from astropy.coordinates import SkyCoord
+
+from pathlib import Path
 from citation_compass import CiteClass
-
+from astropy.coordinates import SkyCoord
+from lightcurvelynx.models.physical_model import SEDModel
 from lightcurvelynx import _LIGHTCURVELYNX_DOWNLOAD_DATA_DIR
-from lightcurvelynx.base_models import FunctionNode
 
-
-class StrongLens(FunctionNode):
+class StrongLensModel(SEDModel):
 
     def __init__(self, model_name, lens_redshift, source_redshift, cosmo, **kwargs):
 
