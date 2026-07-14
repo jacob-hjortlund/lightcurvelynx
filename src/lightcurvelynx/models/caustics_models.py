@@ -676,6 +676,578 @@ def _find_all_pseudo_caustics(
     )
 
 
+def _import_shapely():
+    """Lazily import Shapely for source-plane topology operations.
+
+    Returns
+    -------
+    shapely : module
+        Imported Shapely package.
+
+    Raises
+    ------
+    ImportError
+        If Shapely is unavailable. The original import error is retained as the
+        exception cause.
+    """
+    try:
+        import shapely
+    except ImportError as err:  # pragma: no cover
+        raise ImportError(
+            "Caustics source-position sampling requires the optional 'shapely' "
+            "package. Install it with `pip install shapely`."
+        ) from err
+    return shapely
+
+
+def _close_curve(curve, *, tolerance):
+    """Validate and close one numerical source-plane boundary.
+
+    Parameters
+    ----------
+    curve : array-like, shape (N, 2)
+        Source-plane x/y coordinates in arcseconds.
+    tolerance : float
+        Maximum permitted distance between the first and last vertices in
+        arcseconds.
+
+    Returns
+    -------
+    numpy.ndarray, shape (M, 2)
+        Finite floating-point coordinates with at least three unique vertices
+        and an exactly repeated first/last vertex. ``M`` equals ``N`` for an
+        already closed curve and ``N + 1`` otherwise.
+
+    Raises
+    ------
+    ValueError
+        If ``tolerance`` is not finite and positive.
+    RuntimeError
+        If the coordinates are malformed/non-finite, contain fewer than three
+        unique vertices, or have an endpoint gap larger than ``tolerance``.
+    """
+    tolerance = float(tolerance)
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("Curve closure tolerance must be finite and positive.")
+
+    coordinates = np.asarray(curve, dtype=float)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+        raise RuntimeError("A caustic boundary must have shape (N, 2).")
+    if len(coordinates) < 3 or not np.all(np.isfinite(coordinates)):
+        raise RuntimeError("A caustic boundary must contain at least three finite vertices.")
+
+    endpoint_gap = float(np.linalg.norm(coordinates[0] - coordinates[-1]))
+    if endpoint_gap > tolerance:
+        raise RuntimeError(
+            "A caustic boundary is open; endpoint gap "
+            f"{endpoint_gap} arcsec exceeds tolerance {tolerance} arcsec."
+        )
+    if endpoint_gap > 0.0:
+        coordinates = np.concatenate((coordinates, coordinates[:1]), axis=0)
+
+    if len(coordinates) < 4 or len(np.unique(coordinates[:-1], axis=0)) < 3:
+        raise RuntimeError("A caustic boundary has fewer than three unique vertices.")
+    return coordinates
+
+
+def _extract_polygonal_geometry(geometry):
+    """Retain every polygonal part of a repaired Shapely geometry.
+
+    Parameters
+    ----------
+    geometry : shapely.Geometry
+        Geometry returned by a Shapely construction or validity-repair
+        operation.
+
+    Returns
+    -------
+    shapely.Polygon or shapely.MultiPolygon or shapely.GeometryCollection
+        All polygonal components, merged without replacing concavities or holes.
+        An empty input returns an empty ``GeometryCollection``.
+
+    Raises
+    ------
+    RuntimeError
+        If a non-empty point or line component remains after validity repair,
+        or if merging polygonal components produces a non-polygonal result.
+
+    Notes
+    -----
+    Rejecting non-polygonal remnants is deliberately conservative. Such parts
+    can indicate collapsed or ambiguous input linework, which must not silently
+    reduce the inferred strong-lensing cross-section.
+    """
+    shapely = _import_shapely()
+    if geometry.is_empty:
+        return shapely.GeometryCollection()
+    if geometry.geom_type == "Polygon":
+        return geometry
+    if geometry.geom_type == "MultiPolygon":
+        return geometry
+
+    polygons = []
+    non_polygonal_types = []
+
+    def collect_parts(current_geometry):
+        if current_geometry.is_empty:
+            return
+        if current_geometry.geom_type == "Polygon":
+            polygons.append(current_geometry)
+        elif current_geometry.geom_type in {"MultiPolygon", "GeometryCollection"}:
+            for part in current_geometry.geoms:
+                collect_parts(part)
+        else:
+            non_polygonal_types.append(current_geometry.geom_type)
+
+    collect_parts(geometry)
+    if non_polygonal_types:
+        names = ", ".join(sorted(set(non_polygonal_types)))
+        raise RuntimeError(f"Validity repair left non-polygonal caustic geometry component(s): {names}.")
+    if not polygons:
+        return shapely.GeometryCollection()
+
+    polygonal_geometry = shapely.union_all(polygons)
+    if polygonal_geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+        raise RuntimeError(
+            "Expected polygonal geometry after merging repaired components, got "
+            f"{polygonal_geometry.geom_type}."
+        )
+    return polygonal_geometry
+
+
+def _build_strong_lensing_region(
+    caustic_curves,
+    pseudo_caustic_curves,
+    *,
+    geometry_tolerance,
+):
+    """Build the geometric union of all caustic-enclosed interiors.
+
+    Parameters
+    ----------
+    caustic_curves : iterable of array-like
+        True-caustic source-plane boundaries in arcseconds.
+    pseudo_caustic_curves : iterable of array-like
+        Pseudo-caustic source-plane boundaries in arcseconds.
+    geometry_tolerance : float
+        Endpoint closure tolerance and Shapely precision-grid spacing in
+        arcseconds.
+
+    Returns
+    -------
+    shapely.Polygon or shapely.MultiPolygon
+        Valid, finite, positive-area strong-lensing geometry. Disconnected
+        components, concavities, and holes are retained.
+
+    Raises
+    ------
+    ImportError
+        If Shapely is unavailable.
+    RuntimeError
+        If no boundaries exist, a boundary cannot be interpreted as polygonal,
+        or the final union is empty, non-polygonal, non-finite, or has
+        non-positive area.
+
+    Notes
+    -----
+    Each boundary is converted to its own interior before union. This avoids
+    accepting bounded faces that are collectively formed by several curves but
+    lie inside none of the individual caustic interiors.
+    """
+    shapely = _import_shapely()
+    curves = [*caustic_curves, *pseudo_caustic_curves]
+    if not curves:
+        raise RuntimeError("No caustic or pseudo-caustic boundaries were found.")
+
+    enclosed_regions = []
+    for boundary_index, curve in enumerate(curves):
+        coordinates = _close_curve(curve, tolerance=geometry_tolerance)
+        boundary_region = shapely.make_valid(shapely.Polygon(coordinates))
+        try:
+            boundary_region = _extract_polygonal_geometry(boundary_region)
+        except RuntimeError as err:
+            raise RuntimeError(f"Caustic boundary {boundary_index} could not be repaired.") from err
+        area = float(boundary_region.area)
+        if boundary_region.is_empty or not np.isfinite(area) or area <= 0.0:
+            raise RuntimeError(
+                f"Caustic boundary {boundary_index} did not enclose a finite positive-area polygonal region."
+            )
+        enclosed_regions.append(boundary_region)
+
+    region = shapely.union_all(enclosed_regions, grid_size=geometry_tolerance)
+    region = shapely.make_valid(region)
+    region = _extract_polygonal_geometry(region)
+    area = float(region.area)
+    if region.is_empty or not np.isfinite(area) or area <= 0.0:
+        raise RuntimeError("The strong-lensing region has no finite positive area.")
+    if region.geom_type not in {"Polygon", "MultiPolygon"}:
+        raise RuntimeError(f"Expected polygonal strong-lensing geometry, got {region.geom_type}.")
+    return region
+
+
+def _sample_position(
+    region,
+    rng,
+    *,
+    max_attempts,
+    lens_identifier,
+    geometry_settings,
+):
+    """Uniformly sample one point from a polygonal source-plane region.
+
+    Parameters
+    ----------
+    region : shapely.Polygon or shapely.MultiPolygon
+        Strong-lensing source-plane region.
+    rng : numpy.random.Generator
+        Per-sample random number generator. It is intentionally isolated from
+        generators used by other graph samples.
+    max_attempts : int
+        Maximum number of bounding-box rejection draws.
+    lens_identifier : str
+        Human-readable lens/sample identifier included in failure diagnostics.
+    geometry_settings : Mapping
+        Numerical geometry configuration included in failure diagnostics.
+
+    Returns
+    -------
+    source_x : float
+        Sampled source-plane x position in arcseconds.
+    source_y : float
+        Sampled source-plane y position in arcseconds.
+    strong_lensing_area : float
+        Area of ``region`` in square arcseconds.
+    sampling_attempts : int
+        Number of bounding-box draws consumed before acceptance.
+
+    Raises
+    ------
+    RuntimeError
+        If the region has invalid bounds/area or no point is accepted within
+        ``max_attempts``.
+    """
+    shapely = _import_shapely()
+    bounds = tuple(float(value) for value in region.bounds)
+    area = float(region.area)
+    if len(bounds) != 4 or not np.all(np.isfinite(bounds)):
+        raise RuntimeError(f"Strong-lensing region for {lens_identifier} has invalid bounds.")
+    min_x, min_y, max_x, max_y = bounds
+    bounding_box_area = (max_x - min_x) * (max_y - min_y)
+    if not np.isfinite(area) or area <= 0.0 or not np.isfinite(bounding_box_area) or bounding_box_area <= 0.0:
+        raise RuntimeError(
+            f"Strong-lensing region for {lens_identifier} has invalid area "
+            f"{area} or bounding-box area {bounding_box_area}."
+        )
+
+    for attempt in range(1, max_attempts + 1):
+        source_x = float(rng.uniform(min_x, max_x))
+        source_y = float(rng.uniform(min_y, max_y))
+        if bool(shapely.contains_xy(region, source_x, source_y)):
+            return source_x, source_y, area, attempt
+
+    settings = ", ".join(f"{name}={value}" for name, value in geometry_settings.items())
+    raise RuntimeError(
+        "Unable to sample the strong-lensing region for "
+        f"{lens_identifier} after {max_attempts} attempts; bounding-box area="
+        f"{bounding_box_area} arcsec^2, polygon area={area} arcsec^2, {settings}."
+    )
+
+
+def _validate_source_position_configuration(
+    *,
+    lens_model,
+    lens_parameters,
+    fov,
+    pixelscale,
+    pseudo_caustic_points,
+    pseudo_caustic_epsilon,
+    geometry_tolerance,
+    max_attempts,
+):
+    """Validate immutable source-position geometry and sampling settings.
+
+    Parameters are the corresponding ``CausticsSourcePositionNode`` constructor
+    arguments. Angular configuration values are measured in arcseconds.
+
+    Raises
+    ------
+    TypeError
+        If a count setting is not an integer or shared lens configuration has
+        the wrong type.
+    ValueError
+        If the lens lacks a complete geometry adapter or a numerical setting is
+        non-finite, outside its allowed range, or inconsistent with another
+        setting.
+    """
+    _validate_lens_configuration(lens_model, lens_parameters)
+    _get_lens_geometry_adapter(lens_model)
+
+    numeric_settings = {
+        "fov": fov,
+        "pixelscale": pixelscale,
+        "pseudo_caustic_epsilon": pseudo_caustic_epsilon,
+        "geometry_tolerance": geometry_tolerance,
+    }
+    normalized = {}
+    for name, value in numeric_settings.items():
+        try:
+            normalized[name] = float(value)
+        except (TypeError, ValueError) as err:
+            raise TypeError(f"{name} must be a scalar number.") from err
+        if not np.isfinite(normalized[name]) or normalized[name] <= 0.0:
+            raise ValueError(f"{name} must be finite and positive.")
+
+    if normalized["pixelscale"] >= normalized["fov"]:
+        raise ValueError("pixelscale must be smaller than fov.")
+    if normalized["geometry_tolerance"] >= normalized["pixelscale"]:
+        raise ValueError("geometry_tolerance must be smaller than pixelscale.")
+    if not isinstance(pseudo_caustic_points, int) or pseudo_caustic_points < 3:
+        raise ValueError("pseudo_caustic_points must be an integer of at least three.")
+    if not isinstance(max_attempts, int) or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer.")
+
+
+class CausticsSourcePositionNode(FunctionNode, CiteClass):
+    """Uniformly sample the complete geometric strong-lensing source region.
+
+    For each realized lens configuration, this node extracts all supported true
+    caustics and pseudo-caustics, constructs the union of their source-plane
+    interiors, and samples one position uniformly in area. The realized point,
+    geometric cross-section, and rejection-attempt count are persisted in the
+    node's ``GraphState`` entries.
+
+    Parameters
+    ----------
+    lens_model : str
+        Name of a Caustics lens class with a registered complete geometry
+        adapter.
+    cosmology : caustics.Cosmology
+        Fixed cosmology used to construct each realized lens.
+    lens_redshift : parameter
+        Dimensionless lens-redshift setter.
+    source_redshift : parameter
+        Dimensionless source-redshift setter.
+    lens_parameters : Mapping
+        Caustics constructor parameter names mapped to LightCurveLynx setters.
+        Every entry is registered separately to preserve graph dependencies.
+    fov : float, optional
+        Image-plane critical-curve search width in arcseconds.
+    pixelscale : float, optional
+        Maximum image-plane Jacobian-grid spacing in arcseconds.
+    pseudo_caustic_points : int, optional
+        Unique vertices used for each mapped singular boundary.
+    pseudo_caustic_epsilon : float, optional
+        Initial image-plane offset from singular boundaries in arcseconds.
+    geometry_tolerance : float, optional
+        Curve-closure, convergence, and topology precision in arcseconds.
+    max_attempts : int, optional
+        Maximum bounding-box rejection draws per lens realization.
+    seed : int, optional
+        Seed for the node-owned fallback random generator.
+    node_label : str, optional
+        Human-readable graph node identifier.
+
+    Notes
+    -----
+    ``strong_lensing_area`` is a geometric source-plane cross-section in square
+    arcseconds. It does not include magnification bias, detectability, cadence,
+    image resolution, or cross-section weighting of the upstream lens sample.
+
+    References
+    ----------
+    * Caustics - https://github.com/Ciela-Institute/caustics
+    * Shapely - https://shapely.readthedocs.io/en/stable/
+    """
+
+    _OUTPUTS = [
+        "source_x",
+        "source_y",
+        "strong_lensing_area",
+        "sampling_attempts",
+    ]
+
+    def __init__(
+        self,
+        lens_model,
+        *,
+        cosmology,
+        lens_redshift,
+        source_redshift,
+        lens_parameters,
+        fov=5.0,
+        pixelscale=0.01,
+        pseudo_caustic_points=2_048,
+        pseudo_caustic_epsilon=1.0e-5,
+        geometry_tolerance=1.0e-6,
+        max_attempts=1_000,
+        seed=None,
+        node_label=None,
+    ):
+        _validate_source_position_configuration(
+            lens_model=lens_model,
+            lens_parameters=lens_parameters,
+            fov=fov,
+            pixelscale=pixelscale,
+            pseudo_caustic_points=pseudo_caustic_points,
+            pseudo_caustic_epsilon=pseudo_caustic_epsilon,
+            geometry_tolerance=geometry_tolerance,
+            max_attempts=max_attempts,
+        )
+
+        self.lens_model = lens_model
+        self.cosmology = cosmology
+        self.fov = float(fov)
+        self.pixelscale = float(pixelscale)
+        self.pseudo_caustic_points = int(pseudo_caustic_points)
+        self.pseudo_caustic_epsilon = float(pseudo_caustic_epsilon)
+        self.geometry_tolerance = float(geometry_tolerance)
+        self.max_attempts = int(max_attempts)
+        self._lens_parameter_names = tuple(lens_parameters)
+        self._rng = np.random.default_rng(seed)
+
+        node_inputs = {
+            "lens_redshift": lens_redshift,
+            "source_redshift": source_redshift,
+        }
+        for name, setter in lens_parameters.items():
+            node_inputs[f"lens_{name}"] = setter
+
+        super().__init__(
+            self._non_func,
+            node_label=node_label,
+            outputs=self._OUTPUTS,
+            **node_inputs,
+        )
+
+    def set_seed(self, seed):
+        """Reset the node-owned fallback random generator.
+
+        Parameters
+        ----------
+        seed : int or None
+            Seed accepted by ``numpy.random.default_rng``.
+        """
+        self._rng = np.random.default_rng(seed)
+
+    def _region_for_one_lens(self, values):
+        """Construct the strong-lensing region for one realized lens system.
+
+        Parameters
+        ----------
+        values : Mapping
+            Numeric inputs for exactly one graph sample, including redshifts and
+            every registered ``lens_<parameter>`` entry.
+
+        Returns
+        -------
+        shapely.Polygon or shapely.MultiPolygon
+            Complete supported source-plane strong-lensing region in arcseconds.
+        """
+        lens, _ = _construct_caustics_lens(
+            lens_model=self.lens_model,
+            cosmology=self.cosmology,
+            values=values,
+            lens_parameter_names=self._lens_parameter_names,
+        )
+        geometry_adapter = _get_lens_geometry_adapter(self.lens_model)
+        singular_points = geometry_adapter.singular_points(values)
+        caustic_curves = _find_all_caustics(
+            lens,
+            center=_lens_plane_origin(values),
+            fov=self.fov,
+            pixelscale=self.pixelscale,
+            geometry_tolerance=self.geometry_tolerance,
+            singular_points=singular_points,
+        )
+        pseudo_caustic_curves = _find_all_pseudo_caustics(
+            lens,
+            lens_model=self.lens_model,
+            values=values,
+            num_points=self.pseudo_caustic_points,
+            epsilon=self.pseudo_caustic_epsilon,
+            geometry_tolerance=self.geometry_tolerance,
+        )
+        return _build_strong_lensing_region(
+            caustic_curves,
+            pseudo_caustic_curves,
+            geometry_tolerance=self.geometry_tolerance,
+        )
+
+    def compute(self, graph_state, rng_info=None, **kwargs):
+        """Sample one uniform strong-lensing source position per graph sample.
+
+        A fixed number of sub-seeds is drawn from ``rng_info`` (or the node-owned
+        fallback generator) before any rejection sampling. Variable rejection
+        counts for one lens therefore cannot perturb later lens samples.
+
+        Parameters
+        ----------
+        graph_state : GraphState
+            State containing the realized node inputs and receiving the four
+            computed outputs.
+        rng_info : numpy.random.Generator, optional
+            Caller-owned random generator. When omitted, the node-owned generator
+            configured by ``seed`` or ``set_seed`` is used.
+        **kwargs : dict, optional
+            Explicit overrides for registered node inputs.
+
+        Returns
+        -------
+        list
+            ``source_x``, ``source_y``, ``strong_lensing_area``, and
+            ``sampling_attempts`` as scalars for one sample or sample-first
+            NumPy arrays for multiple samples.
+        """
+        input_values = self._build_inputs(graph_state, **kwargs)
+        num_samples = graph_state.num_samples
+        rng = self._rng if rng_info is None else rng_info
+        sample_seeds = rng.integers(
+            0,
+            2**63,
+            size=num_samples,
+            dtype=np.uint64,
+        )
+
+        source_x = np.empty(num_samples, dtype=float)
+        source_y = np.empty(num_samples, dtype=float)
+        areas = np.empty(num_samples, dtype=float)
+        attempts = np.empty(num_samples, dtype=int)
+        geometry_settings = {
+            "fov": self.fov,
+            "pixelscale": self.pixelscale,
+            "pseudo_caustic_points": self.pseudo_caustic_points,
+            "pseudo_caustic_epsilon": self.pseudo_caustic_epsilon,
+            "geometry_tolerance": self.geometry_tolerance,
+        }
+
+        for sample_index, sample_seed in enumerate(sample_seeds):
+            values = {
+                name: _sample_value(value, sample_index, num_samples) for name, value in input_values.items()
+            }
+            region = self._region_for_one_lens(values)
+            sample_rng = np.random.default_rng(sample_seed)
+            (
+                source_x[sample_index],
+                source_y[sample_index],
+                areas[sample_index],
+                attempts[sample_index],
+            ) = _sample_position(
+                region,
+                sample_rng,
+                max_attempts=self.max_attempts,
+                lens_identifier=(f"{self.lens_model} sample {sample_index} at node '{self.node_string}'"),
+                geometry_settings=geometry_settings,
+            )
+
+        if num_samples == 1:
+            results = [source_x[0], source_y[0], areas[0], attempts[0]]
+        else:
+            results = [source_x, source_y, areas, attempts]
+
+        self._save_results(results, graph_state)
+        return results
+
+
 class CausticsLensImageNode(FunctionNode, CiteClass):
     """Compute point-source macro-images with the optional Caustics package.
 
