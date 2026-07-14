@@ -118,6 +118,30 @@ def _sample_value(value, sample_index, num_samples):
     return value[sample_index]
 
 
+def _pixelscale_to_divisions(fov, pixelscale):
+    """Convert an image-plane pixel scale to Caustics grid divisions.
+
+    Parameters
+    ----------
+    fov : float
+        Width of the square image-plane search region in arcseconds.
+    pixelscale : float
+        Requested nominal image-plane grid spacing in arcseconds.
+
+    Returns
+    -------
+    divisions : int
+        Integer grid resolution accepted by Caustics ``forward_raytrace``.
+
+    Notes
+    -----
+    Rounding up makes the nominal scale, ``fov / divisions``, no larger than
+    the requested ``pixelscale``. This preserves Caustics' public convention
+    that ``divisions`` is the number of divisions across the field of view.
+    """
+    return int(np.ceil(float(fov) / float(pixelscale)))
+
+
 def _validate_lens_redshifts(values):
     """Validate redshifts from one realized Caustics-node input mapping.
 
@@ -1279,7 +1303,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         max_images,
         min_images=2,
         fov=5.0,
-        divisions=100,
+        pixelscale=0.05,
         epsilon=1.0e-3,
         max_depth=25,
         node_label=None,
@@ -1289,7 +1313,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             raise ValueError("max_images must be an integer greater than one.")
         if not isinstance(min_images, int) or not 1 <= min_images <= max_images:
             raise ValueError("min_images must be between one and max_images.")
-        if fov <= 0.0 or divisions < 2 or epsilon <= 0.0 or max_depth < 1:
+        if fov <= 0.0 or pixelscale <= 0.0 or pixelscale >= fov or epsilon <= 0.0 or max_depth < 1:
             raise ValueError("Invalid forward-raytrace solver configuration.")
 
         self.lens_model = lens_model
@@ -1297,7 +1321,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         self.max_images = max_images
         self.min_images = min_images
         self.fov = float(fov)
-        self.divisions = int(divisions)
+        self.pixelscale = float(pixelscale)
         self.epsilon = float(epsilon)
         self.max_depth = int(max_depth)
         self._lens_parameter_names = tuple(lens_parameters)
@@ -1386,7 +1410,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             beta_y,
             epsilon=self.epsilon,
             fov=self.fov,
-            divisions=self.divisions,
+            divisions=_pixelscale_to_divisions(self.fov, self.pixelscale),
             max_depth=self.max_depth,
         )
 
