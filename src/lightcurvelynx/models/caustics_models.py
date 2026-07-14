@@ -7,6 +7,97 @@ from citation_compass import CiteClass
 
 from lightcurvelynx.base_models import FunctionNode
 
+_RESERVED_LENS_PARAMETERS = {
+    "cosmology",
+    "name",
+    "z_l",
+    "z_s",
+}
+
+
+def _validate_lens_configuration(lens_model, lens_parameters):
+    """Validate configuration shared by Caustics-backed lens nodes."""
+    if not isinstance(lens_model, str) or not lens_model:
+        raise TypeError("lens_model must be a non-empty Caustics class name.")
+    if not isinstance(lens_parameters, Mapping):
+        raise TypeError("lens_parameters must be a mapping.")
+
+    collisions = _RESERVED_LENS_PARAMETERS.intersection(lens_parameters)
+    if collisions:
+        names = ", ".join(sorted(collisions))
+        raise ValueError(f"Reserved lens parameter name(s): {names}.")
+
+
+def _import_caustics_dependencies():
+    """Lazily import the optional Caustics runtime dependencies."""
+    try:
+        import caustics
+        import torch
+    except ImportError as err:  # pragma: no cover
+        raise ImportError(
+            "Caustics-backed lens nodes require the optional 'caustics' package. "
+            "Install it with `pip install caustics`."
+        ) from err
+    return caustics, torch
+
+
+def _to_numpy(tensor):
+    """Detach a backend tensor and return a CPU float array."""
+    return tensor.detach().cpu().numpy().astype(float, copy=False)
+
+
+def _sample_value(value, sample_index, num_samples):
+    """Extract one realized value from a scalar or sample-first array."""
+    if num_samples == 1:
+        return value
+    return value[sample_index]
+
+
+def _validate_lens_redshifts(values):
+    """Return validated lens and source redshifts for one realization."""
+    z_l = float(values["lens_redshift"])
+    z_s = float(values["source_redshift"])
+    if not np.isfinite(z_l) or not np.isfinite(z_s):
+        raise ValueError("Lens and source redshifts must be finite.")
+    if z_l < 0.0 or z_s <= z_l:
+        raise ValueError(
+            f"Expected 0 <= lens_redshift < source_redshift; got {z_l} and {z_s}."
+        )
+    return z_l, z_s
+
+
+def _construct_caustics_lens(
+    *,
+    lens_model,
+    cosmology,
+    values,
+    lens_parameter_names,
+):
+    """Construct one Caustics lens from realized numeric graph values."""
+    caustics, torch = _import_caustics_dependencies()
+    z_l, z_s = _validate_lens_redshifts(values)
+
+    # TODO: Currently only supports base lens classes in Caustics. Implement a
+    # helper for compound lens configurations such as SIE plus external shear.
+    try:
+        lens_class = getattr(caustics, lens_model)
+    except AttributeError as err:
+        raise ValueError(f"Unknown Caustics lens model '{lens_model}'.") from err
+
+    dtype = torch.float64
+    lens_kwargs = {
+        name: torch.as_tensor(values[f"lens_{name}"], dtype=dtype)
+        for name in lens_parameter_names
+    }
+    lens = lens_class(
+        name="lens",
+        cosmology=cosmology,
+        z_l=torch.as_tensor(z_l, dtype=dtype),
+        z_s=torch.as_tensor(z_s, dtype=dtype),
+        **lens_kwargs,
+    )
+    return lens, torch
+
 
 class CausticsLensImageNode(FunctionNode, CiteClass):
     """Compute point-source macro-images with the optional Caustics package.
@@ -23,12 +114,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         "macro_magnifications",
         "time_delays",
     ]
-    _RESERVED_LENS_PARAMETERS = {
-        "cosmology",
-        "name",
-        "z_l",
-        "z_s",
-    }
 
     def __init__(
         self,
@@ -49,10 +134,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         residual_tolerance=1.0e-4,
         node_label=None,
     ):
-        if not isinstance(lens_model, str) or not lens_model:
-            raise TypeError("lens_model must be a non-empty Caustics class name.")
-        if not isinstance(lens_parameters, Mapping):
-            raise TypeError("lens_parameters must be a mapping.")
+        _validate_lens_configuration(lens_model, lens_parameters)
         if not isinstance(max_images, int) or max_images < 2:
             raise ValueError("max_images must be an integer greater than one.")
         if not isinstance(min_images, int) or not 1 <= min_images <= max_images:
@@ -61,11 +143,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             raise ValueError("Invalid forward-raytrace solver configuration.")
         if residual_tolerance <= 0.0:
             raise ValueError("residual_tolerance must be positive.")
-
-        collisions = self._RESERVED_LENS_PARAMETERS.intersection(lens_parameters)
-        if collisions:
-            names = ", ".join(sorted(collisions))
-            raise ValueError(f"Reserved lens parameter name(s): {names}.")
 
         self.lens_model = lens_model
         self.cosmology = cosmology
@@ -96,61 +173,12 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             **node_inputs,
         )
 
-    @staticmethod
-    def _import_dependencies():
-        try:
-            import caustics
-            import torch
-        except ImportError as err:  # pragma: no cover
-            raise ImportError(
-                "CausticsLensImageNode requires the optional 'caustics' package. "
-                "Install it with `pip install caustics`."
-            ) from err
-        return caustics, torch
-
-    @staticmethod
-    def _to_numpy(tensor):
-        """Detach a backend tensor and return a CPU float array."""
-        return tensor.detach().cpu().numpy().astype(float, copy=False)
-
-    @staticmethod
-    def _sample_value(value, sample_index, num_samples):
-        if num_samples == 1:
-            return value
-        return value[sample_index]
-
     def _solve_one(self, values):
-        caustics, torch = self._import_dependencies()
-
-        z_l = float(values["lens_redshift"])
-        z_s = float(values["source_redshift"])
-        if not np.isfinite(z_l) or not np.isfinite(z_s):
-            raise ValueError("Lens and source redshifts must be finite.")
-        if z_l < 0.0 or z_s <= z_l:
-            raise ValueError(
-                f"Expected 0 <= lens_redshift < source_redshift; got {z_l} and {z_s}."
-            )
-
-        # TODO: Currently only supports base lens classes in Caustics. Implement helper to construct
-        # complex lens configurations, i.e. SIE+Shear
-        try:
-            lens_class = getattr(caustics, self.lens_model)
-        except AttributeError as err:
-            raise ValueError(
-                f"Unknown Caustics lens model '{self.lens_model}'."
-            ) from err
-
-        dtype = torch.float64
-        lens_kwargs = {
-            name: torch.as_tensor(values[f"lens_{name}"], dtype=dtype)
-            for name in self._lens_parameter_names
-        }
-        lens = lens_class(
-            name="lens",
+        lens, torch = _construct_caustics_lens(
+            lens_model=self.lens_model,
             cosmology=self.cosmology,
-            z_l=torch.as_tensor(z_l, dtype=dtype),
-            z_s=torch.as_tensor(z_s, dtype=dtype),
-            **lens_kwargs,
+            values=values,
+            lens_parameter_names=self._lens_parameter_names,
         )
 
         for method_name in (
@@ -165,8 +193,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                     f"required method '{method_name}'."
                 )
 
-        beta_x = torch.as_tensor(values["source_x"], dtype=dtype)
-        beta_y = torch.as_tensor(values["source_y"], dtype=dtype)
+        beta_x = torch.as_tensor(values["source_x"], dtype=torch.float64)
+        beta_y = torch.as_tensor(values["source_y"], dtype=torch.float64)
         image_x, image_y = lens.forward_raytrace(
             beta_x,
             beta_y,
@@ -191,10 +219,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         magnifications = torch.abs(lens.magnification(image_x, image_y))
         time_delays = lens.time_delay(image_x, image_y)
 
-        image_x = self._to_numpy(image_x)
-        image_y = self._to_numpy(image_y)
-        magnifications = self._to_numpy(magnifications)
-        time_delays = self._to_numpy(time_delays)
+        image_x = _to_numpy(image_x)
+        image_y = _to_numpy(image_y)
+        magnifications = _to_numpy(magnifications)
+        time_delays = _to_numpy(time_delays)
 
         num_images = len(image_x)
         if num_images < self.min_images:
@@ -240,7 +268,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         for sample_index in range(num_samples):
             current_values = {
-                name: self._sample_value(value, sample_index, num_samples)
+                name: _sample_value(value, sample_index, num_samples)
                 for name, value in input_values.items()
             }
             current_x, current_y, current_mu, current_delay = self._solve_one(
