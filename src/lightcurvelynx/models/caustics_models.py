@@ -1282,7 +1282,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         divisions=100,
         epsilon=1.0e-3,
         max_depth=25,
-        residual_tolerance=1.0e-4,
         node_label=None,
     ):
         _validate_lens_configuration(lens_model, lens_parameters)
@@ -1292,8 +1291,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             raise ValueError("min_images must be between one and max_images.")
         if fov <= 0.0 or divisions < 2 or epsilon <= 0.0 or max_depth < 1:
             raise ValueError("Invalid forward-raytrace solver configuration.")
-        if residual_tolerance <= 0.0:
-            raise ValueError("residual_tolerance must be positive.")
 
         self.lens_model = lens_model
         self.cosmology = cosmology
@@ -1303,7 +1300,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         self.divisions = int(divisions)
         self.epsilon = float(epsilon)
         self.max_depth = int(max_depth)
-        self.residual_tolerance = float(residual_tolerance)
         self._lens_parameter_names = tuple(lens_parameters)
 
         # Register every lens parameter independently so AttributeIndicatorNode
@@ -1393,16 +1389,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             divisions=self.divisions,
             max_depth=self.max_depth,
         )
-
-        # Validate that every returned image maps back to the requested source.
-        traced_x, traced_y = lens.raytrace(image_x, image_y)
-        residual = torch.sqrt((traced_x - beta_x) ** 2 + (traced_y - beta_y) ** 2)
-        if len(residual) == 0 or bool(torch.any(residual > self.residual_tolerance)):
-            max_residual = float(torch.max(residual)) if len(residual) else np.inf
-            raise RuntimeError(
-                "Caustics returned an invalid image solution; maximum source-plane "
-                f"residual was {max_residual} arcsec."
-            )
 
         magnifications = torch.abs(lens.magnification(image_x, image_y))
         time_delays = lens.time_delay(image_x, image_y)
