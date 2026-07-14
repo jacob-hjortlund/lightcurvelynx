@@ -7,6 +7,8 @@ from citation_compass import CiteClass
 
 from lightcurvelynx.base_models import FunctionNode
 
+__all__ = ["CausticsLensImageNode", "CausticsSourcePositionNode"]
+
 _RESERVED_LENS_PARAMETERS = {
     "cosmology",
     "name",
