@@ -461,10 +461,49 @@ class _PointSingularityGeometryAdapter:
         return pseudo_caustics
 
 
-_POINT_SINGULARITY_ADAPTER = _PointSingularityGeometryAdapter()
+_INITIAL_FOV_PADDING = 1.1
+
+
+def _positive_lens_parameter(values, name):
+    """Return one finite positive realized lens parameter as a float."""
+    key = f"lens_{name}"
+    try:
+        value = float(values[key])
+    except KeyError as err:
+        raise ValueError(f"Automatic FOV estimation requires lens parameter '{name}'.") from err
+    except (TypeError, ValueError) as err:
+        raise TypeError(f"Realized lens parameter '{name}' must be a scalar number.") from err
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"Realized lens parameter '{name}' must be finite and positive.")
+    return value
+
+
+class _SIEGeometryAdapter(_PointSingularityGeometryAdapter):
+    """Complete singular geometry and initial-FOV policy for Caustics SIE."""
+
+    @staticmethod
+    def initial_fov(values):
+        """Return a padded analytic critical-curve diameter in arcseconds."""
+        einstein_radius = _positive_lens_parameter(values, "Rein")
+        axis_ratio = _positive_lens_parameter(values, "q")
+        if axis_ratio > 1.0:
+            raise ValueError("Realized SIE lens parameter 'q' must be no greater than one.")
+        return 2.0 * _INITIAL_FOV_PADDING * einstein_radius / np.sqrt(axis_ratio)
+
+
+class _SISGeometryAdapter(_PointSingularityGeometryAdapter):
+    """Complete singular geometry and initial-FOV policy for Caustics SIS."""
+
+    @staticmethod
+    def initial_fov(values):
+        """Return a padded analytic critical-curve diameter in arcseconds."""
+        einstein_radius = _positive_lens_parameter(values, "Rein")
+        return 2.0 * _INITIAL_FOV_PADDING * einstein_radius
+
+
 _LENS_GEOMETRY_ADAPTERS = {
-    "SIE": _POINT_SINGULARITY_ADAPTER,
-    "SIS": _POINT_SINGULARITY_ADAPTER,
+    "SIE": _SIEGeometryAdapter(),
+    "SIS": _SISGeometryAdapter(),
 }
 
 
@@ -985,6 +1024,7 @@ def _validate_source_position_configuration(
     lens_parameters,
     fov,
     pixelscale,
+    max_fov_expansions,
     pseudo_caustic_points,
     pseudo_caustic_epsilon,
     geometry_tolerance,
@@ -992,7 +1032,7 @@ def _validate_source_position_configuration(
 ):
     """Validate immutable source-position geometry and sampling settings.
 
-    Parameters are the corresponding ``CausticsSourcePositionNode`` constructor
+    Parameters correspond to the CausticsSourcePositionNode constructor
     arguments. Angular configuration values are measured in arcseconds.
 
     Raises
@@ -1009,11 +1049,13 @@ def _validate_source_position_configuration(
     _get_lens_geometry_adapter(lens_model)
 
     numeric_settings = {
-        "fov": fov,
         "pixelscale": pixelscale,
         "pseudo_caustic_epsilon": pseudo_caustic_epsilon,
         "geometry_tolerance": geometry_tolerance,
     }
+    if fov is not None:
+        numeric_settings["fov"] = fov
+
     normalized = {}
     for name, value in numeric_settings.items():
         try:
@@ -1023,10 +1065,16 @@ def _validate_source_position_configuration(
         if not np.isfinite(normalized[name]) or normalized[name] <= 0.0:
             raise ValueError(f"{name} must be finite and positive.")
 
-    if normalized["pixelscale"] >= normalized["fov"]:
+    if fov is not None and normalized["pixelscale"] >= normalized["fov"]:
         raise ValueError("pixelscale must be smaller than fov.")
     if normalized["geometry_tolerance"] >= normalized["pixelscale"]:
         raise ValueError("geometry_tolerance must be smaller than pixelscale.")
+    if (
+        not isinstance(max_fov_expansions, int)
+        or isinstance(max_fov_expansions, bool)
+        or max_fov_expansions < 0
+    ):
+        raise ValueError("max_fov_expansions must be a non-negative integer.")
     if not isinstance(pseudo_caustic_points, int) or pseudo_caustic_points < 3:
         raise ValueError("pseudo_caustic_points must be an integer of at least three.")
     if not isinstance(max_attempts, int) or max_attempts < 1:
@@ -1100,8 +1148,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         lens_redshift,
         source_redshift,
         lens_parameters,
-        fov=5.0,
+        fov=None,
         pixelscale=0.01,
+        max_fov_expansions=3,
         pseudo_caustic_points=2_048,
         pseudo_caustic_epsilon=1.0e-5,
         geometry_tolerance=1.0e-6,
@@ -1114,6 +1163,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             lens_parameters=lens_parameters,
             fov=fov,
             pixelscale=pixelscale,
+            max_fov_expansions=max_fov_expansions,
             pseudo_caustic_points=pseudo_caustic_points,
             pseudo_caustic_epsilon=pseudo_caustic_epsilon,
             geometry_tolerance=geometry_tolerance,
@@ -1122,8 +1172,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         self.lens_model = lens_model
         self.cosmology = cosmology
-        self.fov = float(fov)
+        self.fov = None if fov is None else float(fov)
         self.pixelscale = float(pixelscale)
+        self.max_fov_expansions = int(max_fov_expansions)
         self.pseudo_caustic_points = int(pseudo_caustic_points)
         self.pseudo_caustic_epsilon = float(pseudo_caustic_epsilon)
         self.geometry_tolerance = float(geometry_tolerance)
@@ -1155,6 +1206,38 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         """
         self._rng = np.random.default_rng(seed)
 
+    def _initial_fov_for_one_lens(self, geometry_adapter, values):
+        """Return the explicit or adapter-derived starting FOV in arcseconds."""
+        if self.fov is not None:
+            return self.fov
+
+        estimator = getattr(geometry_adapter, "initial_fov", None)
+        if not callable(estimator):
+            raise ValueError(
+                "Caustics source-position sampling requires an explicit fov "
+                f"for lens model '{self.lens_model}' because its geometry "
+                "adapter has no initial_fov estimator."
+            )
+
+        estimated_fov = estimator(values)
+        try:
+            initial_fov = float(estimated_fov)
+        except (TypeError, ValueError) as err:
+            raise TypeError(
+                f"Geometry adapter for '{self.lens_model}' must return a scalar initial fov."
+            ) from err
+        if not np.isfinite(initial_fov) or initial_fov <= 0.0:
+            raise ValueError(
+                f"Geometry adapter for '{self.lens_model}' returned an invalid "
+                f"initial fov of {initial_fov} arcsec."
+            )
+        if initial_fov <= self.pixelscale:
+            raise ValueError(
+                f"Geometry adapter initial fov {initial_fov} arcsec must be "
+                f"larger than pixelscale={self.pixelscale} arcsec."
+            )
+        return initial_fov
+
     def _region_for_one_lens(self, values):
         """Construct the strong-lensing region for one realized lens system.
 
@@ -1176,11 +1259,15 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             lens_parameter_names=self._lens_parameter_names,
         )
         geometry_adapter = _get_lens_geometry_adapter(self.lens_model)
+        initial_fov = self._initial_fov_for_one_lens(
+            geometry_adapter,
+            values,
+        )
         singular_points = geometry_adapter.singular_points(values)
         caustic_curves = _find_all_caustics(
             lens,
             center=_lens_plane_origin(values),
-            fov=self.fov,
+            fov=initial_fov,
             pixelscale=self.pixelscale,
             geometry_tolerance=self.geometry_tolerance,
             singular_points=singular_points,
