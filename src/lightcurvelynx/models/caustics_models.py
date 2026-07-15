@@ -144,6 +144,80 @@ def _pixelscale_to_divisions(fov, pixelscale):
     return int(np.ceil(float(fov) / float(pixelscale)))
 
 
+def _merge_image_candidates(coordinates, residuals, new_coordinates, new_residuals, *, epsilon):
+    """Greedily merge valid roots without ever decreasing the stored count."""
+    merged_coordinates = [np.asarray(point, dtype=float) for point in coordinates]
+    merged_residuals = [float(residual) for residual in residuals]
+    for point, residual in zip(new_coordinates, new_residuals, strict=True):
+        matches = [
+            index
+            for index, existing in enumerate(merged_coordinates)
+            if np.linalg.norm(point - existing) < epsilon
+        ]
+        if not matches:
+            merged_coordinates.append(np.asarray(point, dtype=float))
+            merged_residuals.append(float(residual))
+        else:
+            best = matches[0]
+            if residual < merged_residuals[best]:
+                merged_coordinates[best] = np.asarray(point, dtype=float)
+                merged_residuals[best] = float(residual)
+    if not merged_coordinates:
+        return np.empty((0, 2), dtype=float), np.empty(0, dtype=float)
+    return np.vstack(merged_coordinates), np.asarray(merged_residuals)
+
+
+def _validated_image_candidates(lens, torch, image_x, image_y, beta_x, beta_y, epsilon):
+    """Return finite forward-raytrace roots whose source residual is below epsilon."""
+    candidate_x = _to_numpy(image_x)
+    candidate_y = _to_numpy(image_y)
+    if candidate_x.ndim != 1 or candidate_y.ndim != 1 or candidate_x.shape != candidate_y.shape:
+        raise RuntimeError(
+            "Caustics forward_raytrace returned image coordinates with invalid shapes "
+            f"{candidate_x.shape} and {candidate_y.shape}."
+        )
+
+    finite_coordinates = np.isfinite(candidate_x) & np.isfinite(candidate_y)
+    candidate_coordinates = np.column_stack(
+        (candidate_x[finite_coordinates], candidate_y[finite_coordinates])
+    )
+    if not len(candidate_coordinates):
+        return np.empty((0, 2), dtype=float), np.empty(0, dtype=float)
+
+    mapped_x, mapped_y = lens.raytrace(
+        torch.as_tensor(candidate_coordinates[:, 0], dtype=torch.float64),
+        torch.as_tensor(candidate_coordinates[:, 1], dtype=torch.float64),
+    )
+    mapped_x = _to_numpy(mapped_x)
+    mapped_y = _to_numpy(mapped_y)
+    if mapped_x.ndim != 1 or mapped_y.ndim != 1 or mapped_x.shape != mapped_y.shape:
+        raise RuntimeError(
+            "Caustics raytrace returned source coordinates with invalid shapes "
+            f"{mapped_x.shape} and {mapped_y.shape}."
+        )
+    if mapped_x.shape != candidate_coordinates[:, 0].shape:
+        raise RuntimeError("Caustics raytrace returned a different number of mapped and image coordinates.")
+
+    source_x = float(_to_numpy(beta_x))
+    source_y = float(_to_numpy(beta_y))
+    finite_mappings = np.isfinite(mapped_x) & np.isfinite(mapped_y)
+    residuals = np.hypot(mapped_x - source_x, mapped_y - source_y)
+    valid = finite_mappings & np.isfinite(residuals) & (residuals < epsilon)
+    return candidate_coordinates[valid], residuals[valid]
+
+
+def _is_retryable_forward_raytrace_error(error):
+    """Return whether Caustics failed because the current global mesh found no usable root."""
+    message = str(error).lower()
+    if isinstance(error, IndexError):
+        return "index 0 is out of bounds" in message
+    return (
+        isinstance(error, RuntimeError)
+        and "linalg.solve" in message
+        and ("input matrix is singular" in message or "singular u" in message)
+    )
+
+
 def _validate_lens_redshifts(values):
     """Validate redshifts from one realized Caustics-node input mapping.
 
@@ -1807,6 +1881,12 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         "image_y",
         "macro_magnifications",
         "time_delays",
+        "image_count_deficit",
+        "solver_fov",
+        "solver_pixelscale",
+        "solver_attempts",
+        "solver_fov_expansions",
+        "solver_pixelscale_refinements",
     ]
 
     def __init__(
@@ -1821,28 +1901,56 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         lens_parameters,
         max_images,
         min_images=2,
+        expected_num_images=None,
         fov=5.0,
+        fov_multiplier=1.0,
         pixelscale=0.05,
         epsilon=1.0e-3,
         max_depth=25,
+        max_fov_expansions=3,
+        max_pixelscale_refinements=3,
         node_label=None,
     ):
         _validate_lens_configuration(lens_model, lens_parameters)
-        if not isinstance(max_images, int) or max_images < 2:
+        integer_types = (int, np.integer)
+        boolean_types = (bool, np.bool_)
+        if (
+            isinstance(max_images, boolean_types)
+            or not isinstance(max_images, integer_types)
+            or max_images < 2
+        ):
             raise ValueError("max_images must be an integer greater than one.")
-        if not isinstance(min_images, int) or not 1 <= min_images <= max_images:
+        if (
+            isinstance(min_images, boolean_types)
+            or not isinstance(min_images, integer_types)
+            or not 1 <= min_images <= max_images
+        ):
             raise ValueError("min_images must be between one and max_images.")
-        if fov <= 0.0 or pixelscale <= 0.0 or pixelscale >= fov or epsilon <= 0.0 or max_depth < 1:
+        if not np.isfinite(pixelscale) or pixelscale <= 0.0:
             raise ValueError("Invalid forward-raytrace solver configuration.")
+        if not np.isfinite(epsilon) or epsilon <= 0.0:
+            raise ValueError("Invalid forward-raytrace solver configuration.")
+        if isinstance(max_depth, boolean_types) or not isinstance(max_depth, integer_types) or max_depth < 1:
+            raise ValueError("Invalid forward-raytrace solver configuration.")
+        if not np.isfinite(fov_multiplier) or fov_multiplier <= 0.0:
+            raise ValueError("fov_multiplier must be positive and finite.")
+        for name, limit in (
+            ("max_fov_expansions", max_fov_expansions),
+            ("max_pixelscale_refinements", max_pixelscale_refinements),
+        ):
+            if isinstance(limit, boolean_types) or not isinstance(limit, integer_types) or limit < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
 
         self.lens_model = lens_model
         self.cosmology = cosmology
-        self.max_images = max_images
-        self.min_images = min_images
-        self.fov = float(fov)
+        self.max_images = int(max_images)
+        self.min_images = int(min_images)
+        self.fov_multiplier = float(fov_multiplier)
         self.pixelscale = float(pixelscale)
         self.epsilon = float(epsilon)
         self.max_depth = int(max_depth)
+        self.max_fov_expansions = int(max_fov_expansions)
+        self.max_pixelscale_refinements = int(max_pixelscale_refinements)
         self._lens_parameter_names = tuple(lens_parameters)
 
         # Register every lens parameter independently so AttributeIndicatorNode
@@ -1852,6 +1960,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             "source_redshift": source_redshift,
             "source_x": source_x,
             "source_y": source_y,
+            "fov": fov,
+            "expected_num_images": expected_num_images,
         }
         for name, setter in lens_parameters.items():
             node_inputs[f"lens_{name}"] = setter
@@ -1861,6 +1971,39 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             node_label=node_label,
             outputs=self._OUTPUTS,
             **node_inputs,
+        )
+
+    def _forward_raytrace_candidates(
+        self,
+        lens,
+        torch,
+        beta_x,
+        beta_y,
+        *,
+        center_x,
+        center_y,
+        current_fov,
+        current_pixelscale,
+    ):
+        """Run one global forward-raytrace search and validate its candidate roots."""
+        image_x, image_y = lens.forward_raytrace(
+            beta_x,
+            beta_y,
+            epsilon=self.epsilon,
+            x0=torch.as_tensor(center_x, dtype=torch.float64),
+            y0=torch.as_tensor(center_y, dtype=torch.float64),
+            fov=current_fov,
+            divisions=_pixelscale_to_divisions(current_fov, current_pixelscale),
+            max_depth=self.max_depth,
+        )
+        return _validated_image_candidates(
+            lens,
+            torch,
+            image_x,
+            image_y,
+            beta_x,
+            beta_y,
+            self.epsilon,
         )
 
     def _solve_one(self, values):
@@ -1884,6 +2027,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             Finite, absolute dimensionless macro-magnifications.
         time_delays : numpy.ndarray, shape (I,)
             Observer-frame relative delays in days, normalized to start at zero.
+        diagnostics : dict
+            Scalar recovery diagnostics for the accepted global-search result.
 
         Notes
         -----
@@ -1903,6 +2048,32 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             If root residuals, image counts, or active solver outputs fail
             validation.
         """
+        try:
+            realized_fov = float(values["fov"])
+        except (TypeError, ValueError) as err:
+            raise TypeError("fov must realize to a scalar numeric value.") from err
+        if not np.isfinite(realized_fov) or realized_fov <= 0.0:
+            raise ValueError("fov must realize to a positive finite value.")
+        initial_fov = realized_fov * self.fov_multiplier
+        if not np.isfinite(initial_fov) or initial_fov <= self.pixelscale:
+            raise ValueError(
+                f"Initial solver fov={initial_fov} arcsec must be finite and larger "
+                f"than pixelscale={self.pixelscale} arcsec."
+            )
+
+        expected_num_images = values["expected_num_images"]
+        if expected_num_images is not None:
+            if (
+                isinstance(expected_num_images, (bool, np.bool_))
+                or not isinstance(expected_num_images, (int, np.integer))
+                or not self.min_images <= expected_num_images <= self.max_images
+            ):
+                raise ValueError(
+                    "expected_num_images must be None or a non-Boolean integer "
+                    "between min_images and max_images."
+                )
+            expected_num_images = int(expected_num_images)
+
         lens, torch = _construct_caustics_lens(
             lens_model=self.lens_model,
             cosmology=self.cosmology,
@@ -1924,28 +2095,97 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         beta_x = torch.as_tensor(values["source_x"], dtype=torch.float64)
         beta_y = torch.as_tensor(values["source_y"], dtype=torch.float64)
-        image_x, image_y = lens.forward_raytrace(
-            beta_x,
-            beta_y,
-            epsilon=self.epsilon,
-            fov=self.fov,
-            divisions=_pixelscale_to_divisions(self.fov, self.pixelscale),
-            max_depth=self.max_depth,
-        )
+        center_x, center_y = _lens_plane_origin(values)
+        coordinates = np.empty((0, 2), dtype=float)
+        residuals = np.empty(0, dtype=float)
+        retryable_errors = []
+        solver_attempts = 0
 
-        magnifications = torch.abs(lens.magnification(image_x, image_y))
-        time_delays = lens.time_delay(image_x, image_y)
+        def attempt_global(current_fov, current_pixelscale):
+            nonlocal coordinates, residuals, solver_attempts
+            solver_attempts += 1
+            try:
+                new_coordinates, new_residuals = self._forward_raytrace_candidates(
+                    lens,
+                    torch,
+                    beta_x,
+                    beta_y,
+                    center_x=center_x,
+                    center_y=center_y,
+                    current_fov=current_fov,
+                    current_pixelscale=current_pixelscale,
+                )
+            except Exception as error:
+                if not _is_retryable_forward_raytrace_error(error):
+                    raise
+                retryable_errors.append(f"{type(error).__name__}: {error}")
+                new_coordinates = np.empty((0, 2), dtype=float)
+                new_residuals = np.empty(0, dtype=float)
 
-        image_x = _to_numpy(image_x)
-        image_y = _to_numpy(image_y)
+            coordinates, residuals = _merge_image_candidates(
+                coordinates,
+                residuals,
+                new_coordinates,
+                new_residuals,
+                epsilon=self.epsilon,
+            )
+            recovered_count = len(coordinates)
+            if expected_num_images is not None and recovered_count > expected_num_images:
+                raise RuntimeError(
+                    f"Found {recovered_count} images, exceeding expected_num_images={expected_num_images}."
+                )
+            if recovered_count > self.max_images:
+                raise RuntimeError(f"Found {recovered_count} images, exceeding max_images={self.max_images}.")
+            if expected_num_images is not None:
+                return recovered_count == expected_num_images
+            return recovered_count >= self.min_images
+
+        current_fov = initial_fov
+        current_pixelscale = self.pixelscale
+        fov_expansions = 0
+        pixelscale_refinements = 0
+        complete = attempt_global(current_fov, current_pixelscale)
+
+        for expansion in range(1, self.max_fov_expansions + 1):
+            if complete:
+                break
+            fov_expansions = expansion
+            current_fov *= _FOV_EXPANSION_FACTOR
+            complete = attempt_global(current_fov, current_pixelscale)
+
+        for refinement in range(1, self.max_pixelscale_refinements + 1):
+            if complete:
+                break
+            pixelscale_refinements = refinement
+            current_pixelscale *= 0.5
+            complete = attempt_global(current_fov, current_pixelscale)
+
+        num_images = len(coordinates)
+        if not complete and num_images < self.min_images:
+            latest_retryable_error = retryable_errors[-1] if retryable_errors else None
+            expected_count = self.min_images if expected_num_images is None else expected_num_images
+            raise RuntimeError(
+                "Caustics image recovery exhausted; "
+                f"expected_count={expected_count}, expected_num_images={expected_num_images}, "
+                f"recovered_num_images={num_images}, "
+                f"initial_fov={initial_fov}, current_fov={current_fov}, "
+                f"initial_pixelscale={self.pixelscale}, current_pixelscale={current_pixelscale}, "
+                f"solver_fov_expansions={fov_expansions}, "
+                f"solver_pixelscale_refinements={pixelscale_refinements}, "
+                f"solver_attempts={solver_attempts}, "
+                f"latest_retryable_error={latest_retryable_error}."
+            )
+
+        image_x_tensor = torch.as_tensor(coordinates[:, 0], dtype=torch.float64)
+        image_y_tensor = torch.as_tensor(coordinates[:, 1], dtype=torch.float64)
+        magnifications = torch.abs(lens.magnification(image_x_tensor, image_y_tensor))
+        time_delays = lens.time_delay(image_x_tensor, image_y_tensor)
+
+        image_x = coordinates[:, 0]
+        image_y = coordinates[:, 1]
         magnifications = _to_numpy(magnifications)
         time_delays = _to_numpy(time_delays)
 
-        num_images = len(image_x)
-        if num_images < self.min_images:
-            raise RuntimeError(f"Expected at least {self.min_images} images, found {num_images}.")
-        if num_images > self.max_images:
-            raise RuntimeError(f"Found {num_images} images, exceeding max_images={self.max_images}.")
         if not all(
             np.all(np.isfinite(values_array))
             for values_array in (
@@ -1965,6 +2205,16 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             image_y[order],
             magnifications[order],
             time_delays[order],
+            {
+                "image_count_deficit": (
+                    -1 if expected_num_images is None else expected_num_images - num_images
+                ),
+                "solver_fov": current_fov,
+                "solver_pixelscale": current_pixelscale,
+                "solver_attempts": solver_attempts,
+                "solver_fov_expansions": fov_expansions,
+                "solver_pixelscale_refinements": pixelscale_refinements,
+            },
         )
 
     def compute(self, graph_state, rng_info=None, **kwargs):
@@ -1978,18 +2228,30 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         image_y = np.full((num_samples, self.max_images), np.nan)
         magnifications = np.zeros((num_samples, self.max_images), dtype=float)
         time_delays = np.full((num_samples, self.max_images), np.nan)
+        image_count_deficit = np.empty(num_samples, dtype=int)
+        solver_fov = np.empty(num_samples, dtype=float)
+        solver_pixelscale = np.empty(num_samples, dtype=float)
+        solver_attempts = np.empty(num_samples, dtype=int)
+        solver_fov_expansions = np.empty(num_samples, dtype=int)
+        solver_pixelscale_refinements = np.empty(num_samples, dtype=int)
 
         for sample_index in range(num_samples):
             current_values = {
                 name: _sample_value(value, sample_index, num_samples) for name, value in input_values.items()
             }
-            current_x, current_y, current_mu, current_delay = self._solve_one(current_values)
+            current_x, current_y, current_mu, current_delay, diagnostics = self._solve_one(current_values)
             count = len(current_x)
             counts[sample_index] = count
             image_x[sample_index, :count] = current_x
             image_y[sample_index, :count] = current_y
             magnifications[sample_index, :count] = current_mu
             time_delays[sample_index, :count] = current_delay
+            image_count_deficit[sample_index] = diagnostics["image_count_deficit"]
+            solver_fov[sample_index] = diagnostics["solver_fov"]
+            solver_pixelscale[sample_index] = diagnostics["solver_pixelscale"]
+            solver_attempts[sample_index] = diagnostics["solver_attempts"]
+            solver_fov_expansions[sample_index] = diagnostics["solver_fov_expansions"]
+            solver_pixelscale_refinements[sample_index] = diagnostics["solver_pixelscale_refinements"]
 
         if num_samples == 1:
             results = [
@@ -1998,6 +2260,12 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 image_y[0],
                 magnifications[0],
                 time_delays[0],
+                image_count_deficit[0],
+                solver_fov[0],
+                solver_pixelscale[0],
+                solver_attempts[0],
+                solver_fov_expansions[0],
+                solver_pixelscale_refinements[0],
             ]
         else:
             results = [
@@ -2006,6 +2274,12 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 image_y,
                 magnifications,
                 time_delays,
+                image_count_deficit,
+                solver_fov,
+                solver_pixelscale,
+                solver_attempts,
+                solver_fov_expansions,
+                solver_pixelscale_refinements,
             ]
 
         self._save_results(results, graph_state)
