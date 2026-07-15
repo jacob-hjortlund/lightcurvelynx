@@ -768,6 +768,8 @@ def _find_all_caustics(
 
     center_x, center_y = (float(value) for value in center)
     num_intervals = int(np.ceil(fov / pixelscale))
+    if num_intervals % 2:
+        num_intervals += 1
     actual_pixelscale = float(fov) / num_intervals
     half_fov = 0.5 * float(fov)
     x_axis = torch.linspace(
@@ -1678,6 +1680,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     ):
         """Refine typed boundaries until displacement and topology converge."""
         previous = None
+        last_previous = None
         last_uncertainty = np.inf
         last_topology_stable = False
         for refinement in range(self.max_boundary_refinements + 1):
@@ -1691,6 +1694,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 initial_fov=None if previous is None else previous.critical_curve_fov,
             )
             if previous is not None:
+                last_previous = previous
                 current, last_uncertainty, last_topology_stable = _compare_boundary_geometry(
                     previous,
                     current,
@@ -1699,13 +1703,21 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 if last_topology_stable and last_uncertainty <= self.boundary_tolerance:
                     return previous, current, last_uncertainty, refinement
             previous = current
+        if last_previous is None:
+            raise AssertionError("Boundary certification did not produce two resolution snapshots.")
         raise RuntimeError(
             "Boundary certification exhausted refinement for "
             f"{self.lens_model} sample {sample_index} at node '{self.node_string}'; "
             f"last displacement={last_uncertainty} arcsec, "
             f"topology_stable={last_topology_stable}, "
             f"boundary_tolerance={self.boundary_tolerance} arcsec, "
-            f"max_boundary_refinements={self.max_boundary_refinements}."
+            f"max_boundary_refinements={self.max_boundary_refinements}, "
+            f"previous_pixelscale={last_previous.pixelscale} arcsec, "
+            f"previous_pseudo_caustic_points={last_previous.pseudo_caustic_points}, "
+            f"previous_critical_curve_fov={last_previous.critical_curve_fov} arcsec, "
+            f"current_pixelscale={current.pixelscale} arcsec, "
+            f"current_pseudo_caustic_points={current.pseudo_caustic_points}, "
+            f"current_critical_curve_fov={current.critical_curve_fov} arcsec."
         )
 
     def _region_for_one_lens(self, values, *, sample_index):
@@ -2145,7 +2157,21 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         retryable_errors = []
         solver_attempts = 0
 
-        def merge_candidates(new_coordinates, new_residuals):
+        def recovery_context(recovered_count, recovery_stage):
+            latest_retryable_error = retryable_errors[-1] if retryable_errors else None
+            return (
+                f"initial_fov={initial_fov}, current_fov={current_fov}, "
+                f"initial_pixelscale={self.pixelscale}, current_pixelscale={current_pixelscale}, "
+                f"recovery_stage={recovery_stage}, "
+                f"solver_fov_expansions={fov_expansions}, "
+                f"solver_pixelscale_refinements={pixelscale_refinements}, "
+                f"solver_attempts={solver_attempts}, "
+                f"expected_num_images={expected_num_images}, max_images={self.max_images}, "
+                f"recovered_num_images={recovered_count}, "
+                f"latest_retryable_error={latest_retryable_error}"
+            )
+
+        def merge_candidates(new_coordinates, new_residuals, *, recovery_stage):
             nonlocal coordinates, residuals
             coordinates, residuals = _merge_image_candidates(
                 coordinates,
@@ -2157,15 +2183,19 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             recovered_count = len(coordinates)
             if expected_num_images is not None and recovered_count > expected_num_images:
                 raise RuntimeError(
-                    f"Found {recovered_count} images, exceeding expected_num_images={expected_num_images}."
+                    f"Found {recovered_count} images, exceeding expected_num_images={expected_num_images}; "
+                    f"{recovery_context(recovered_count, recovery_stage)}."
                 )
             if recovered_count > self.max_images:
-                raise RuntimeError(f"Found {recovered_count} images, exceeding max_images={self.max_images}.")
+                raise RuntimeError(
+                    f"Found {recovered_count} images, exceeding max_images={self.max_images}; "
+                    f"{recovery_context(recovered_count, recovery_stage)}."
+                )
             if expected_num_images is not None:
                 return recovered_count == expected_num_images
             return recovered_count >= self.min_images
 
-        def attempt_global(current_fov, current_pixelscale):
+        def attempt_global(current_fov, current_pixelscale, *, recovery_stage):
             nonlocal solver_attempts
             solver_attempts += 1
             try:
@@ -2185,13 +2215,21 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 retryable_errors.append(f"{type(error).__name__}: {error}")
                 new_coordinates = np.empty((0, 2), dtype=float)
                 new_residuals = np.empty(0, dtype=float)
-            return merge_candidates(new_coordinates, new_residuals)
+            return merge_candidates(
+                new_coordinates,
+                new_residuals,
+                recovery_stage=recovery_stage,
+            )
 
         current_fov = initial_fov
         current_pixelscale = self.pixelscale
         fov_expansions = 0
         pixelscale_refinements = 0
-        complete = attempt_global(current_fov, current_pixelscale)
+        complete = attempt_global(
+            current_fov,
+            current_pixelscale,
+            recovery_stage="initial_global",
+        )
 
         geometry_adapter = _LENS_GEOMETRY_ADAPTERS.get(self.lens_model)
         if not complete and geometry_adapter is not None:
@@ -2219,21 +2257,33 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                     retryable_errors.append(f"{type(error).__name__}: {error}")
                     new_coordinates = np.empty((0, 2), dtype=float)
                     new_residuals = np.empty(0, dtype=float)
-                complete = merge_candidates(new_coordinates, new_residuals)
+                complete = merge_candidates(
+                    new_coordinates,
+                    new_residuals,
+                    recovery_stage="singular_seed",
+                )
 
         for expansion in range(1, self.max_fov_expansions + 1):
             if complete:
                 break
             fov_expansions = expansion
             current_fov *= _FOV_EXPANSION_FACTOR
-            complete = attempt_global(current_fov, current_pixelscale)
+            complete = attempt_global(
+                current_fov,
+                current_pixelscale,
+                recovery_stage="fov_expansion",
+            )
 
         for refinement in range(1, self.max_pixelscale_refinements + 1):
             if complete:
                 break
             pixelscale_refinements = refinement
             current_pixelscale *= 0.5
-            complete = attempt_global(current_fov, current_pixelscale)
+            complete = attempt_global(
+                current_fov,
+                current_pixelscale,
+                recovery_stage="pixelscale_refinement",
+            )
 
         num_images = len(coordinates)
         if not complete and num_images < self.min_images:
