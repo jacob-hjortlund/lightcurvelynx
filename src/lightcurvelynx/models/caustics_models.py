@@ -610,9 +610,10 @@ def _find_all_caustics(
         If the lens lacks the required protocol or returns a Jacobian with an
         unsupported representation.
     RuntimeError
-        If the grid/Jacobian is invalid, a contour reaches the field-of-view
-        boundary, a contour is malformed or open, or raytracing yields an
-        invalid caustic.
+        If the grid/Jacobian is invalid, a contour is malformed or open, or
+        raytracing yields an invalid caustic. The ``_CausticFOVError`` subclass
+        is raised when no critical curves are found, a curve reaches the
+        boundary, or the boundary Jacobian is not positive definite.
     """
     contourpy = _import_contourpy()
     _, torch = _import_caustics_dependencies()
@@ -1083,12 +1084,13 @@ def _validate_source_position_configuration(
     Raises
     ------
     TypeError
-        If a count setting is not an integer or shared lens configuration has
-        the wrong type.
+        If shared lens configuration has the wrong type or an angular setting
+        cannot be converted to a scalar number.
     ValueError
-        If the lens lacks a complete geometry adapter or a numerical setting is
-        non-finite, outside its allowed range, or inconsistent with another
-        setting.
+        If shared lens configuration is invalid, the lens lacks a complete
+        geometry adapter, a count setting is not a valid integer in its allowed
+        range, or a numerical setting is non-finite, outside its allowed range,
+        or inconsistent with another setting.
     """
     _validate_lens_configuration(lens_model, lens_parameters)
     _get_lens_geometry_adapter(lens_model)
@@ -1149,10 +1151,16 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     lens_parameters : Mapping
         Caustics constructor parameter names mapped to LightCurveLynx setters.
         Every entry is registered separately to preserve graph dependencies.
-    fov : float, optional
-        Image-plane critical-curve search width in arcseconds.
+    fov : float or None, optional
+        Initial image-plane critical-curve search width in arcseconds. When
+        None, the registered lens geometry adapter derives a starting width
+        from each realized lens configuration.
     pixelscale : float, optional
-        Maximum image-plane Jacobian-grid spacing in arcseconds.
+        Maximum image-plane Jacobian-grid spacing in arcseconds. This spacing
+        remains fixed while adaptive FOV expansion increases the grid size.
+    max_fov_expansions : int, optional
+        Maximum number of factor-of-two FOV expansions after the initial
+        attempt. Larger values can increase two-dimensional grid cost rapidly.
     pseudo_caustic_points : int, optional
         Unique vertices used for each mapped singular boundary.
     pseudo_caustic_epsilon : float, optional
@@ -1171,6 +1179,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     ``strong_lensing_area`` is a geometric source-plane cross-section in square
     arcseconds. It does not include magnification bias, detectability, cadence,
     image resolution, or cross-section weighting of the upstream lens sample.
+    Doubling FOV at a fixed pixelscale approximately quadruples the
+    Jacobian-grid point count.
 
     References
     ----------
@@ -1334,7 +1344,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             Numeric inputs for exactly one graph sample, including redshifts and
             every registered ``lens_<parameter>`` entry.
         sample_index : int
-            Zero-based graph sample index used in FOV-exhaustion diagnostics.
+            Zero-based graph sample index included in adaptive-FOV exhaustion
+            diagnostics.
 
         Returns
         -------
