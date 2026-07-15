@@ -1,9 +1,11 @@
 """Caustics-backed nodes for strong-lens image configurations."""
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import numpy as np
 from citation_compass import CiteClass
+from scipy.optimize import linear_sum_assignment
 
 from lightcurvelynx.base_models import FunctionNode
 
@@ -385,6 +387,30 @@ class _PointSingularityGeometryAdapter:
         if "lens_x0" not in values or "lens_y0" not in values:
             raise ValueError("Point-singularity geometry requires lens_parameters entries for 'x0' and 'y0'.")
         return (_lens_plane_origin(values),)
+
+    @staticmethod
+    def expected_num_images(
+        source_x,
+        source_y,
+        *,
+        caustic_curves,
+        pseudo_caustic_curves,
+        geometry_tolerance,
+    ):
+        """Count every regular SIE/SIS image from typed boundary containment."""
+        shapely = _import_shapely()
+        true_regions = _boundary_regions(
+            caustic_curves,
+            geometry_tolerance=geometry_tolerance,
+        )
+        pseudo_regions = _boundary_regions(
+            pseudo_caustic_curves,
+            geometry_tolerance=geometry_tolerance,
+        )
+        count = 1
+        count += 2 * sum(bool(shapely.contains_xy(region, source_x, source_y)) for region in true_regions)
+        count += sum(bool(shapely.contains_xy(region, source_x, source_y)) for region in pseudo_regions)
+        return count
 
     def pseudo_caustics(
         self,
@@ -811,6 +837,15 @@ def _import_shapely():
     return shapely
 
 
+@dataclass(frozen=True)
+class _BoundaryGeometry:
+    caustic_curves: tuple[np.ndarray, ...]
+    pseudo_caustic_curves: tuple[np.ndarray, ...]
+    critical_curve_fov: float
+    pixelscale: float
+    pseudo_caustic_points: int
+
+
 def _close_curve(curve, *, tolerance):
     """Validate and close one numerical source-plane boundary.
 
@@ -926,6 +961,127 @@ def _extract_polygonal_geometry(geometry):
     return polygonal_geometry
 
 
+def _boundary_regions(curves, *, geometry_tolerance):
+    """Return one repaired positive-area polygonal region per curve."""
+    regions = []
+    for boundary_index, curve in enumerate(curves):
+        coordinates = _close_curve(curve, tolerance=geometry_tolerance)
+        region = _extract_polygonal_geometry(
+            _import_shapely().make_valid(_import_shapely().Polygon(coordinates))
+        )
+        area = float(region.area)
+        if region.is_empty or not np.isfinite(area) or area <= 0.0:
+            raise RuntimeError(
+                f"Caustic boundary {boundary_index} did not enclose a finite positive-area polygonal region."
+            )
+        regions.append(region)
+    return tuple(regions)
+
+
+def _match_boundary_curves(reference_curves, candidate_curves, *, geometry_tolerance):
+    """Match one typed boundary set and return ordered candidates and displacement."""
+    if len(reference_curves) != len(candidate_curves):
+        return tuple(candidate_curves), np.inf, False
+    if not reference_curves:
+        return (), 0.0, True
+    shapely = _import_shapely()
+    reference_lines = [
+        shapely.LineString(_close_curve(curve, tolerance=geometry_tolerance)) for curve in reference_curves
+    ]
+    candidate_lines = [
+        shapely.LineString(_close_curve(curve, tolerance=geometry_tolerance)) for curve in candidate_curves
+    ]
+    costs = np.array(
+        [
+            [float(reference.hausdorff_distance(candidate)) for candidate in candidate_lines]
+            for reference in reference_lines
+        ]
+    )
+    rows, columns = linear_sum_assignment(costs)
+    assignment = dict(zip(rows.tolist(), columns.tolist(), strict=True))
+    ordered = tuple(candidate_curves[assignment[index]] for index in range(len(reference_curves)))
+    displacement = max(float(costs[index, assignment[index]]) for index in range(len(reference_curves)))
+    return ordered, displacement, True
+
+
+def _boundary_topology_signature(geometry, *, geometry_tolerance):
+    """Return typed component, ring, and pairwise-relation topology."""
+    true_regions = _boundary_regions(
+        geometry.caustic_curves,
+        geometry_tolerance=geometry_tolerance,
+    )
+    pseudo_regions = _boundary_regions(
+        geometry.pseudo_caustic_curves,
+        geometry_tolerance=geometry_tolerance,
+    )
+
+    def region_counts(region):
+        polygons = (region,) if region.geom_type == "Polygon" else tuple(region.geoms)
+        return len(polygons), sum(len(polygon.interiors) for polygon in polygons)
+
+    typed_counts = (
+        tuple(region_counts(region) for region in true_regions),
+        tuple(region_counts(region) for region in pseudo_regions),
+    )
+    regions = (*true_regions, *pseudo_regions)
+    relations = tuple(
+        (
+            bool(regions[first].disjoint(regions[second])),
+            bool(regions[first].within(regions[second])),
+            bool(regions[first].contains(regions[second])),
+            bool(regions[first].overlaps(regions[second])),
+            bool(regions[first].touches(regions[second])),
+        )
+        for first in range(len(regions))
+        for second in range(first + 1, len(regions))
+    )
+    return typed_counts, relations
+
+
+def _compare_boundary_geometry(previous, current, geometry_tolerance):
+    """Match boundary snapshots and compare their displacement and topology."""
+    caustic_curves, caustic_displacement, caustic_counts_stable = _match_boundary_curves(
+        previous.caustic_curves,
+        current.caustic_curves,
+        geometry_tolerance=geometry_tolerance,
+    )
+    pseudo_caustic_curves, pseudo_displacement, pseudo_counts_stable = _match_boundary_curves(
+        previous.pseudo_caustic_curves,
+        current.pseudo_caustic_curves,
+        geometry_tolerance=geometry_tolerance,
+    )
+    current = _BoundaryGeometry(
+        caustic_curves=caustic_curves,
+        pseudo_caustic_curves=pseudo_caustic_curves,
+        critical_curve_fov=current.critical_curve_fov,
+        pixelscale=current.pixelscale,
+        pseudo_caustic_points=current.pseudo_caustic_points,
+    )
+    displacement = max(caustic_displacement, pseudo_displacement)
+    typed_counts_stable = caustic_counts_stable and pseudo_counts_stable
+    topology_stable = typed_counts_stable and _boundary_topology_signature(
+        previous,
+        geometry_tolerance=geometry_tolerance,
+    ) == _boundary_topology_signature(
+        current,
+        geometry_tolerance=geometry_tolerance,
+    )
+    return current, displacement, topology_stable
+
+
+def _source_boundary_clearance(source_x, source_y, geometry, geometry_tolerance):
+    """Return source distance to the nearest typed boundary in arcseconds."""
+    curves = (*geometry.caustic_curves, *geometry.pseudo_caustic_curves)
+    if not curves:
+        return np.inf
+    shapely = _import_shapely()
+    source = shapely.Point(source_x, source_y)
+    return min(
+        float(source.distance(shapely.LineString(_close_curve(curve, tolerance=geometry_tolerance))))
+        for curve in curves
+    )
+
+
 def _build_strong_lensing_region(
     caustic_curves,
     pseudo_caustic_curves,
@@ -970,20 +1126,10 @@ def _build_strong_lensing_region(
     if not curves:
         raise RuntimeError("No caustic or pseudo-caustic boundaries were found.")
 
-    enclosed_regions = []
-    for boundary_index, curve in enumerate(curves):
-        coordinates = _close_curve(curve, tolerance=geometry_tolerance)
-        boundary_region = shapely.make_valid(shapely.Polygon(coordinates))
-        try:
-            boundary_region = _extract_polygonal_geometry(boundary_region)
-        except RuntimeError as err:
-            raise RuntimeError(f"Caustic boundary {boundary_index} could not be repaired.") from err
-        area = float(boundary_region.area)
-        if boundary_region.is_empty or not np.isfinite(area) or area <= 0.0:
-            raise RuntimeError(
-                f"Caustic boundary {boundary_index} did not enclose a finite positive-area polygonal region."
-            )
-        enclosed_regions.append(boundary_region)
+    enclosed_regions = _boundary_regions(
+        curves,
+        geometry_tolerance=geometry_tolerance,
+    )
 
     region = shapely.union_all(enclosed_regions, grid_size=geometry_tolerance)
     region = shapely.make_valid(region)
@@ -1074,6 +1220,8 @@ def _validate_source_position_configuration(
     pseudo_caustic_points,
     pseudo_caustic_epsilon,
     geometry_tolerance,
+    boundary_tolerance,
+    max_boundary_refinements,
     max_attempts,
 ):
     """Validate immutable source-position geometry and sampling settings.
@@ -1099,6 +1247,7 @@ def _validate_source_position_configuration(
         "pixelscale": pixelscale,
         "pseudo_caustic_epsilon": pseudo_caustic_epsilon,
         "geometry_tolerance": geometry_tolerance,
+        "boundary_tolerance": boundary_tolerance,
     }
     if fov is not None:
         numeric_settings["fov"] = fov
@@ -1116,6 +1265,8 @@ def _validate_source_position_configuration(
         raise ValueError("pixelscale must be smaller than fov.")
     if normalized["geometry_tolerance"] >= normalized["pixelscale"]:
         raise ValueError("geometry_tolerance must be smaller than pixelscale.")
+    if normalized["boundary_tolerance"] < normalized["geometry_tolerance"]:
+        raise ValueError("boundary_tolerance must be at least geometry_tolerance.")
     if (
         not isinstance(max_fov_expansions, int)
         or isinstance(max_fov_expansions, bool)
@@ -1124,6 +1275,12 @@ def _validate_source_position_configuration(
         raise ValueError("max_fov_expansions must be a non-negative integer.")
     if not isinstance(pseudo_caustic_points, int) or pseudo_caustic_points < 3:
         raise ValueError("pseudo_caustic_points must be an integer of at least three.")
+    if (
+        not isinstance(max_boundary_refinements, int)
+        or isinstance(max_boundary_refinements, bool)
+        or max_boundary_refinements < 1
+    ):
+        raise ValueError("max_boundary_refinements must be a positive integer.")
     if not isinstance(max_attempts, int) or max_attempts < 1:
         raise ValueError("max_attempts must be a positive integer.")
 
@@ -1134,7 +1291,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     For each realized lens configuration, this node extracts all supported true
     caustics and pseudo-caustics, constructs the union of their source-plane
     interiors, and samples one position uniformly in area. The realized point,
-    geometric cross-section, and rejection-attempt count are persisted in the
+    geometric cross-section, rejection-attempt count, expected mathematical
+    image count, and boundary-certification diagnostics are persisted in the
     node's ``GraphState`` entries.
 
     Parameters
@@ -1167,6 +1325,12 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         Initial image-plane offset from singular boundaries in arcseconds.
     geometry_tolerance : float, optional
         Curve-closure, convergence, and topology precision in arcseconds.
+    boundary_tolerance : float, optional
+        Maximum matched-boundary displacement required for certification in
+        arcseconds. It must be at least ``geometry_tolerance``.
+    max_boundary_refinements : int, optional
+        Maximum number of factor-of-two resolution refinements used to certify
+        boundary displacement and topology.
     max_attempts : int, optional
         Maximum bounding-box rejection draws per lens realization.
     seed : int, optional
@@ -1193,6 +1357,11 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         "source_y",
         "strong_lensing_area",
         "sampling_attempts",
+        "expected_num_images",
+        "critical_curve_fov",
+        "boundary_uncertainty",
+        "source_boundary_clearance",
+        "boundary_refinements",
     ]
 
     def __init__(
@@ -1209,6 +1378,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         pseudo_caustic_points=2_048,
         pseudo_caustic_epsilon=1.0e-5,
         geometry_tolerance=1.0e-6,
+        boundary_tolerance=1.0e-4,
+        max_boundary_refinements=3,
         max_attempts=1_000,
         seed=None,
         node_label=None,
@@ -1222,6 +1393,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             pseudo_caustic_points=pseudo_caustic_points,
             pseudo_caustic_epsilon=pseudo_caustic_epsilon,
             geometry_tolerance=geometry_tolerance,
+            boundary_tolerance=boundary_tolerance,
+            max_boundary_refinements=max_boundary_refinements,
             max_attempts=max_attempts,
         )
 
@@ -1233,6 +1406,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         self.pseudo_caustic_points = int(pseudo_caustic_points)
         self.pseudo_caustic_epsilon = float(pseudo_caustic_epsilon)
         self.geometry_tolerance = float(geometry_tolerance)
+        self.boundary_tolerance = float(boundary_tolerance)
+        self.max_boundary_refinements = int(max_boundary_refinements)
         self.max_attempts = int(max_attempts)
         self._lens_parameter_names = tuple(lens_parameters)
         self._rng = np.random.default_rng(seed)
@@ -1300,25 +1475,29 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         values,
         *,
         sample_index,
+        pixelscale,
+        initial_fov=None,
     ):
         """Extract complete caustics with bounded sample-local FOV expansion."""
-        initial_fov = self._initial_fov_for_one_lens(
-            geometry_adapter,
-            values,
-        )
+        if initial_fov is None:
+            initial_fov = self._initial_fov_for_one_lens(
+                geometry_adapter,
+                values,
+            )
         current_fov = initial_fov
         singular_points = geometry_adapter.singular_points(values)
 
         for expansion_count in range(self.max_fov_expansions + 1):
             try:
-                return _find_all_caustics(
+                caustic_curves = _find_all_caustics(
                     lens,
                     center=_lens_plane_origin(values),
                     fov=current_fov,
-                    pixelscale=self.pixelscale,
+                    pixelscale=pixelscale,
                     geometry_tolerance=self.geometry_tolerance,
                     singular_points=singular_points,
                 )
+                return tuple(caustic_curves), current_fov
             except _CausticFOVError as err:
                 if expansion_count == self.max_fov_expansions:
                     raise RuntimeError(
@@ -1326,7 +1505,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                         f"expansion for {self.lens_model} sample {sample_index} "
                         f"at node '{self.node_string}'; initial fov={initial_fov} "
                         f"arcsec, final fov={current_fov} arcsec, "
-                        f"pixelscale={self.pixelscale} arcsec, "
+                        f"pixelscale={pixelscale} arcsec, "
                         f"max_fov_expansions={self.max_fov_expansions}. "
                         "Increase max_fov_expansions, provide a larger fov, "
                         "or reassess pixelscale."
@@ -1335,8 +1514,84 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         raise AssertionError("The bounded FOV expansion loop terminated unexpectedly.")
 
+    def _boundary_geometry_for_one_lens(
+        self,
+        lens,
+        geometry_adapter,
+        values,
+        *,
+        sample_index,
+        pixelscale,
+        pseudo_caustic_points,
+        initial_fov=None,
+    ):
+        """Extract one immutable typed-boundary snapshot for a realized lens."""
+        caustic_curves, critical_curve_fov = self._find_all_caustics_for_one_lens(
+            lens,
+            geometry_adapter,
+            values,
+            sample_index=sample_index,
+            pixelscale=pixelscale,
+            initial_fov=initial_fov,
+        )
+        pseudo_caustic_curves = _find_all_pseudo_caustics(
+            lens,
+            lens_model=self.lens_model,
+            values=values,
+            num_points=pseudo_caustic_points,
+            epsilon=self.pseudo_caustic_epsilon,
+            geometry_tolerance=self.geometry_tolerance,
+        )
+        return _BoundaryGeometry(
+            caustic_curves=tuple(caustic_curves),
+            pseudo_caustic_curves=tuple(pseudo_caustic_curves),
+            critical_curve_fov=float(critical_curve_fov),
+            pixelscale=float(pixelscale),
+            pseudo_caustic_points=int(pseudo_caustic_points),
+        )
+
+    def _certified_boundary_geometry_for_one_lens(
+        self,
+        lens,
+        geometry_adapter,
+        values,
+        *,
+        sample_index,
+    ):
+        """Refine typed boundaries until displacement and topology converge."""
+        previous = None
+        last_uncertainty = np.inf
+        last_topology_stable = False
+        for refinement in range(self.max_boundary_refinements + 1):
+            current = self._boundary_geometry_for_one_lens(
+                lens,
+                geometry_adapter,
+                values,
+                sample_index=sample_index,
+                pixelscale=self.pixelscale / (2**refinement),
+                pseudo_caustic_points=self.pseudo_caustic_points * (2**refinement),
+                initial_fov=None if previous is None else previous.critical_curve_fov,
+            )
+            if previous is not None:
+                current, last_uncertainty, last_topology_stable = _compare_boundary_geometry(
+                    previous,
+                    current,
+                    geometry_tolerance=self.geometry_tolerance,
+                )
+                if last_topology_stable and last_uncertainty <= self.boundary_tolerance:
+                    return previous, current, last_uncertainty, refinement
+            previous = current
+        raise RuntimeError(
+            "Boundary certification exhausted refinement for "
+            f"{self.lens_model} sample {sample_index} at node '{self.node_string}'; "
+            f"last displacement={last_uncertainty} arcsec, "
+            f"topology_stable={last_topology_stable}, "
+            f"boundary_tolerance={self.boundary_tolerance} arcsec, "
+            f"max_boundary_refinements={self.max_boundary_refinements}."
+        )
+
     def _region_for_one_lens(self, values, *, sample_index):
-        """Construct the strong-lensing region for one realized lens system.
+        """Certify typed boundaries and construct one strong-lensing region.
 
         Parameters
         ----------
@@ -1349,8 +1604,10 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         Returns
         -------
-        shapely.Polygon or shapely.MultiPolygon
-            Complete supported source-plane strong-lensing region in arcseconds.
+        tuple
+            Geometry adapter, penultimate and final boundary snapshots,
+            boundary uncertainty in arcseconds, refinement count, and complete
+            supported source-plane strong-lensing region.
         """
         lens, _ = _construct_caustics_lens(
             lens_model=self.lens_model,
@@ -1359,24 +1616,26 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             lens_parameter_names=self._lens_parameter_names,
         )
         geometry_adapter = _get_lens_geometry_adapter(self.lens_model)
-        caustic_curves = self._find_all_caustics_for_one_lens(
-            lens,
+        previous_geometry, geometry, uncertainty, refinements = (
+            self._certified_boundary_geometry_for_one_lens(
+                lens,
+                geometry_adapter,
+                values,
+                sample_index=sample_index,
+            )
+        )
+        region = _build_strong_lensing_region(
+            geometry.caustic_curves,
+            geometry.pseudo_caustic_curves,
+            geometry_tolerance=self.geometry_tolerance,
+        )
+        return (
             geometry_adapter,
-            values,
-            sample_index=sample_index,
-        )
-        pseudo_caustic_curves = _find_all_pseudo_caustics(
-            lens,
-            lens_model=self.lens_model,
-            values=values,
-            num_points=self.pseudo_caustic_points,
-            epsilon=self.pseudo_caustic_epsilon,
-            geometry_tolerance=self.geometry_tolerance,
-        )
-        return _build_strong_lensing_region(
-            caustic_curves,
-            pseudo_caustic_curves,
-            geometry_tolerance=self.geometry_tolerance,
+            previous_geometry,
+            geometry,
+            uncertainty,
+            refinements,
+            region,
         )
 
     def compute(self, graph_state, rng_info=None, **kwargs):
@@ -1389,7 +1648,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         Parameters
         ----------
         graph_state : GraphState
-            State containing the realized node inputs and receiving the four
+            State containing the realized node inputs and receiving the nine
             computed outputs.
         rng_info : numpy.random.Generator, optional
             Caller-owned random generator. When omitted, the node-owned generator
@@ -1401,7 +1660,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         -------
         list
             ``source_x``, ``source_y``, ``strong_lensing_area``, and
-            ``sampling_attempts`` as scalars for one sample or sample-first
+            certification diagnostics as scalars for one sample or sample-first
             NumPy arrays for multiple samples.
         """
         input_values = self._build_inputs(graph_state, **kwargs)
@@ -1418,6 +1677,11 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         source_y = np.empty(num_samples, dtype=float)
         areas = np.empty(num_samples, dtype=float)
         attempts = np.empty(num_samples, dtype=int)
+        expected_num_images = np.empty(num_samples, dtype=int)
+        critical_curve_fov = np.empty(num_samples, dtype=float)
+        boundary_uncertainty = np.empty(num_samples, dtype=float)
+        source_boundary_clearance = np.empty(num_samples, dtype=float)
+        boundary_refinements = np.empty(num_samples, dtype=int)
         geometry_settings = {
             "fov": self.fov,
             "pixelscale": self.pixelscale,
@@ -1425,13 +1689,22 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             "pseudo_caustic_points": self.pseudo_caustic_points,
             "pseudo_caustic_epsilon": self.pseudo_caustic_epsilon,
             "geometry_tolerance": self.geometry_tolerance,
+            "boundary_tolerance": self.boundary_tolerance,
+            "max_boundary_refinements": self.max_boundary_refinements,
         }
 
         for sample_index, sample_seed in enumerate(sample_seeds):
             values = {
                 name: _sample_value(value, sample_index, num_samples) for name, value in input_values.items()
             }
-            region = self._region_for_one_lens(
+            (
+                geometry_adapter,
+                previous_geometry,
+                geometry,
+                uncertainty,
+                refinements,
+                region,
+            ) = self._region_for_one_lens(
                 values,
                 sample_index=sample_index,
             )
@@ -1449,10 +1722,72 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 geometry_settings=geometry_settings,
             )
 
+            previous_count = geometry_adapter.expected_num_images(
+                source_x[sample_index],
+                source_y[sample_index],
+                caustic_curves=previous_geometry.caustic_curves,
+                pseudo_caustic_curves=previous_geometry.pseudo_caustic_curves,
+                geometry_tolerance=self.geometry_tolerance,
+            )
+            final_count = geometry_adapter.expected_num_images(
+                source_x[sample_index],
+                source_y[sample_index],
+                caustic_curves=geometry.caustic_curves,
+                pseudo_caustic_curves=geometry.pseudo_caustic_curves,
+                geometry_tolerance=self.geometry_tolerance,
+            )
+            clearance = _source_boundary_clearance(
+                source_x[sample_index],
+                source_y[sample_index],
+                geometry,
+                self.geometry_tolerance,
+            )
+            if previous_count != final_count or clearance <= uncertainty:
+                raise RuntimeError(
+                    "Sampled source-position certification failed for "
+                    f"{self.lens_model} sample {sample_index} at node '{self.node_string}'; "
+                    f"penultimate expected_num_images={previous_count}, "
+                    f"final expected_num_images={final_count}, "
+                    f"source_boundary_clearance={clearance} arcsec, "
+                    f"boundary_uncertainty={uncertainty} arcsec, "
+                    f"penultimate pixelscale={previous_geometry.pixelscale} arcsec, "
+                    "penultimate pseudo_caustic_points="
+                    f"{previous_geometry.pseudo_caustic_points}, "
+                    f"final pixelscale={geometry.pixelscale} arcsec, "
+                    f"final pseudo_caustic_points={geometry.pseudo_caustic_points}, "
+                    f"boundary_refinements={refinements}."
+                )
+
+            expected_num_images[sample_index] = final_count
+            critical_curve_fov[sample_index] = geometry.critical_curve_fov
+            boundary_uncertainty[sample_index] = uncertainty
+            source_boundary_clearance[sample_index] = clearance
+            boundary_refinements[sample_index] = refinements
+
         if num_samples == 1:
-            results = [source_x[0], source_y[0], areas[0], attempts[0]]
+            results = [
+                source_x[0],
+                source_y[0],
+                areas[0],
+                attempts[0],
+                expected_num_images[0],
+                critical_curve_fov[0],
+                boundary_uncertainty[0],
+                source_boundary_clearance[0],
+                boundary_refinements[0],
+            ]
         else:
-            results = [source_x, source_y, areas, attempts]
+            results = [
+                source_x,
+                source_y,
+                areas,
+                attempts,
+                expected_num_images,
+                critical_curve_fov,
+                boundary_uncertainty,
+                source_boundary_clearance,
+                boundary_refinements,
+            ]
 
         self._save_results(results, graph_state)
         return results
