@@ -17,6 +17,8 @@ _RESERVED_LENS_PARAMETERS = {
     "z_l",
     "z_s",
 }
+_SINGULAR_SEED_POINTS = 256
+_SINGULAR_ROOT_REFINEMENTS = 8
 
 
 def _validate_lens_configuration(lens_model, lens_parameters):
@@ -206,8 +208,34 @@ def _validated_image_candidates(lens, torch, image_x, image_y, beta_x, beta_y, e
     return candidate_coordinates[valid], residuals[valid]
 
 
+def _refine_image_seeds(lens, torch, seeds, beta_x, beta_y, epsilon):
+    """Refine targeted image seeds and validate their source residuals."""
+    from caustics.lenses.func import forward_raytrace_rootfind
+
+    roots = torch.as_tensor(seeds, dtype=torch.float64)
+    beta_x = torch.as_tensor(beta_x, dtype=torch.float64)
+    beta_y = torch.as_tensor(beta_y, dtype=torch.float64)
+    for _ in range(_SINGULAR_ROOT_REFINEMENTS):
+        roots = forward_raytrace_rootfind(
+            roots[:, 0],
+            roots[:, 1],
+            beta_x,
+            beta_y,
+            lens.raytrace,
+        )
+    return _validated_image_candidates(
+        lens,
+        torch,
+        roots[:, 0],
+        roots[:, 1],
+        beta_x,
+        beta_y,
+        epsilon,
+    )
+
+
 def _is_retryable_forward_raytrace_error(error):
-    """Return whether Caustics failed because the current global mesh found no usable root."""
+    """Return whether a Caustics image-root search failed for a known retryable reason."""
     message = str(error).lower()
     if isinstance(error, IndexError):
         return "index 0 is out of bounds" in message
@@ -461,6 +489,22 @@ class _PointSingularityGeometryAdapter:
         if "lens_x0" not in values or "lens_y0" not in values:
             raise ValueError("Point-singularity geometry requires lens_parameters entries for 'x0' and 'y0'.")
         return (_lens_plane_origin(values),)
+
+    def singular_image_seeds(self, lens, values, *, source_x, source_y, radius):
+        """Return one nearest mapped-circle seed per active point singularity."""
+        singular_points = self.singular_points(values)
+        if not singular_points:
+            return np.empty((0, 2), dtype=float)
+        angles = 2.0 * np.pi * np.arange(_SINGULAR_SEED_POINTS) / _SINGULAR_SEED_POINTS
+        directions = np.column_stack((np.cos(angles), np.sin(angles)))
+        source_position = np.array([source_x, source_y], dtype=float)
+        seeds = []
+        for singular_point in singular_points:
+            circle = np.asarray(singular_point, dtype=float) + radius * directions
+            mapped_circle = _raytrace_curve(lens, circle)
+            nearest = np.argmin(np.linalg.norm(mapped_circle - source_position, axis=1))
+            seeds.append(circle[nearest])
+        return np.asarray(seeds, dtype=float)
 
     @staticmethod
     def expected_num_images(
@@ -2101,27 +2145,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         retryable_errors = []
         solver_attempts = 0
 
-        def attempt_global(current_fov, current_pixelscale):
-            nonlocal coordinates, residuals, solver_attempts
-            solver_attempts += 1
-            try:
-                new_coordinates, new_residuals = self._forward_raytrace_candidates(
-                    lens,
-                    torch,
-                    beta_x,
-                    beta_y,
-                    center_x=center_x,
-                    center_y=center_y,
-                    current_fov=current_fov,
-                    current_pixelscale=current_pixelscale,
-                )
-            except Exception as error:
-                if not _is_retryable_forward_raytrace_error(error):
-                    raise
-                retryable_errors.append(f"{type(error).__name__}: {error}")
-                new_coordinates = np.empty((0, 2), dtype=float)
-                new_residuals = np.empty(0, dtype=float)
-
+        def merge_candidates(new_coordinates, new_residuals):
+            nonlocal coordinates, residuals
             coordinates, residuals = _merge_image_candidates(
                 coordinates,
                 residuals,
@@ -2140,11 +2165,61 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 return recovered_count == expected_num_images
             return recovered_count >= self.min_images
 
+        def attempt_global(current_fov, current_pixelscale):
+            nonlocal solver_attempts
+            solver_attempts += 1
+            try:
+                new_coordinates, new_residuals = self._forward_raytrace_candidates(
+                    lens,
+                    torch,
+                    beta_x,
+                    beta_y,
+                    center_x=center_x,
+                    center_y=center_y,
+                    current_fov=current_fov,
+                    current_pixelscale=current_pixelscale,
+                )
+            except Exception as error:
+                if not _is_retryable_forward_raytrace_error(error):
+                    raise
+                retryable_errors.append(f"{type(error).__name__}: {error}")
+                new_coordinates = np.empty((0, 2), dtype=float)
+                new_residuals = np.empty(0, dtype=float)
+            return merge_candidates(new_coordinates, new_residuals)
+
         current_fov = initial_fov
         current_pixelscale = self.pixelscale
         fov_expansions = 0
         pixelscale_refinements = 0
         complete = attempt_global(current_fov, current_pixelscale)
+
+        geometry_adapter = _LENS_GEOMETRY_ADAPTERS.get(self.lens_model)
+        if not complete and geometry_adapter is not None:
+            seeds = geometry_adapter.singular_image_seeds(
+                lens,
+                values,
+                source_x=values["source_x"],
+                source_y=values["source_y"],
+                radius=min(self.epsilon, current_pixelscale),
+            )
+            if len(seeds):
+                solver_attempts += 1
+                try:
+                    new_coordinates, new_residuals = _refine_image_seeds(
+                        lens,
+                        torch,
+                        seeds,
+                        beta_x,
+                        beta_y,
+                        self.epsilon,
+                    )
+                except Exception as error:
+                    if not _is_retryable_forward_raytrace_error(error):
+                        raise
+                    retryable_errors.append(f"{type(error).__name__}: {error}")
+                    new_coordinates = np.empty((0, 2), dtype=float)
+                    new_residuals = np.empty(0, dtype=float)
+                complete = merge_candidates(new_coordinates, new_residuals)
 
         for expansion in range(1, self.max_fov_expansions + 1):
             if complete:
