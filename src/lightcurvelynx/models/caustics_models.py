@@ -538,6 +538,29 @@ def _get_lens_geometry_adapter(lens_model):
         ) from err
 
 
+_FOV_EXPANSION_FACTOR = 2.0
+
+
+class _CausticFOVError(RuntimeError):
+    """Signal that a larger image-plane FOV is required for completeness."""
+
+
+def _outer_grid_boundary(values):
+    """Return every outer-boundary value from a square grid without duplicates."""
+    values = np.asarray(values)
+    if values.ndim < 2 or values.shape[0] != values.shape[1]:
+        raise ValueError("Expected a square grid with at least two dimensions.")
+    return np.concatenate(
+        (
+            values[0],
+            values[-1],
+            values[1:-1, 0],
+            values[1:-1, -1],
+        ),
+        axis=0,
+    )
+
+
 def _find_all_caustics(
     lens,
     *,
@@ -635,6 +658,24 @@ def _find_all_caustics(
     if np.all(invalid):
         raise RuntimeError("The lens-equation Jacobian grid contains no finite values.")
 
+    symmetric_jacobian = 0.5 * (jacobian + jacobian.transpose(-1, -2))
+    eigenvalues = _to_numpy(torch.linalg.eigvalsh(symmetric_jacobian))
+    if eigenvalues.shape != (num_intervals + 1, num_intervals + 1, 2):
+        raise RuntimeError("Caustics returned unexpected lens-equation Jacobian eigenvalue shapes.")
+
+    boundary_invalid = _outer_grid_boundary(invalid)
+    boundary_eigenvalues = _outer_grid_boundary(eigenvalues)
+    valid_boundary = ~boundary_invalid
+    if not np.any(valid_boundary):
+        raise RuntimeError("The lens-equation Jacobian grid boundary contains no finite values.")
+    if not np.all(np.isfinite(boundary_eigenvalues[valid_boundary])):
+        raise RuntimeError("The lens-equation Jacobian grid boundary contains invalid eigenvalues.")
+    if np.any(boundary_eigenvalues[valid_boundary] <= 0.0):
+        raise _CausticFOVError(
+            "The image-plane field-of-view boundary has not reached the "
+            "positive-definite exterior lens-mapping region; increase fov."
+        )
+
     contour_generator = contourpy.contour_generator(
         x=x_coordinates,
         y=y_coordinates,
@@ -642,6 +683,10 @@ def _find_all_caustics(
         line_type=contourpy.LineType.Separate,
     )
     critical_curves = contour_generator.lines(0.0)
+    if not critical_curves:
+        raise _CausticFOVError(
+            "No critical curves were found in the configured image-plane field of view; increase fov."
+        )
     caustic_curves = []
     boundary_tolerance = max(
         actual_pixelscale * 1.0e-6,
@@ -664,7 +709,7 @@ def _find_all_caustics(
             | np.isclose(critical_curve[:, 1], y_coordinates[-1], atol=boundary_tolerance, rtol=0.0)
         )
         if np.any(reaches_boundary):
-            raise RuntimeError(
+            raise _CausticFOVError(
                 "A critical curve reaches the configured image-plane field-of-view boundary; increase fov."
             )
 
@@ -1238,7 +1283,49 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             )
         return initial_fov
 
-    def _region_for_one_lens(self, values):
+    def _find_all_caustics_for_one_lens(
+        self,
+        lens,
+        geometry_adapter,
+        values,
+        *,
+        sample_index,
+    ):
+        """Extract complete caustics with bounded sample-local FOV expansion."""
+        initial_fov = self._initial_fov_for_one_lens(
+            geometry_adapter,
+            values,
+        )
+        current_fov = initial_fov
+        singular_points = geometry_adapter.singular_points(values)
+
+        for expansion_count in range(self.max_fov_expansions + 1):
+            try:
+                return _find_all_caustics(
+                    lens,
+                    center=_lens_plane_origin(values),
+                    fov=current_fov,
+                    pixelscale=self.pixelscale,
+                    geometry_tolerance=self.geometry_tolerance,
+                    singular_points=singular_points,
+                )
+            except _CausticFOVError as err:
+                if expansion_count == self.max_fov_expansions:
+                    raise RuntimeError(
+                        "Critical-curve extraction exhausted adaptive FOV "
+                        f"expansion for {self.lens_model} sample {sample_index} "
+                        f"at node '{self.node_string}'; initial fov={initial_fov} "
+                        f"arcsec, final fov={current_fov} arcsec, "
+                        f"pixelscale={self.pixelscale} arcsec, "
+                        f"max_fov_expansions={self.max_fov_expansions}. "
+                        "Increase max_fov_expansions, provide a larger fov, "
+                        "or reassess pixelscale."
+                    ) from err
+                current_fov *= _FOV_EXPANSION_FACTOR
+
+        raise AssertionError("The bounded FOV expansion loop terminated unexpectedly.")
+
+    def _region_for_one_lens(self, values, *, sample_index):
         """Construct the strong-lensing region for one realized lens system.
 
         Parameters
@@ -1246,6 +1333,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         values : Mapping
             Numeric inputs for exactly one graph sample, including redshifts and
             every registered ``lens_<parameter>`` entry.
+        sample_index : int
+            Zero-based graph sample index used in FOV-exhaustion diagnostics.
 
         Returns
         -------
@@ -1259,18 +1348,11 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             lens_parameter_names=self._lens_parameter_names,
         )
         geometry_adapter = _get_lens_geometry_adapter(self.lens_model)
-        initial_fov = self._initial_fov_for_one_lens(
+        caustic_curves = self._find_all_caustics_for_one_lens(
+            lens,
             geometry_adapter,
             values,
-        )
-        singular_points = geometry_adapter.singular_points(values)
-        caustic_curves = _find_all_caustics(
-            lens,
-            center=_lens_plane_origin(values),
-            fov=initial_fov,
-            pixelscale=self.pixelscale,
-            geometry_tolerance=self.geometry_tolerance,
-            singular_points=singular_points,
+            sample_index=sample_index,
         )
         pseudo_caustic_curves = _find_all_pseudo_caustics(
             lens,
@@ -1328,6 +1410,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         geometry_settings = {
             "fov": self.fov,
             "pixelscale": self.pixelscale,
+            "max_fov_expansions": self.max_fov_expansions,
             "pseudo_caustic_points": self.pseudo_caustic_points,
             "pseudo_caustic_epsilon": self.pseudo_caustic_epsilon,
             "geometry_tolerance": self.geometry_tolerance,
@@ -1337,7 +1420,10 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             values = {
                 name: _sample_value(value, sample_index, num_samples) for name, value in input_values.items()
             }
-            region = self._region_for_one_lens(values)
+            region = self._region_for_one_lens(
+                values,
+                sample_index=sample_index,
+            )
             sample_rng = np.random.default_rng(sample_seed)
             (
                 source_x[sample_index],
