@@ -46,6 +46,8 @@ def _validate_lens_configuration(lens_model, lens_parameters):
         raise TypeError("lens_model must be a non-empty Caustics class name.")
     if not isinstance(lens_parameters, Mapping):
         raise TypeError("lens_parameters must be a mapping.")
+    if any(not isinstance(name, str) for name in lens_parameters):
+        raise TypeError("lens_parameters keys must be strings.")
 
     collisions = _RESERVED_LENS_PARAMETERS.intersection(lens_parameters)
     if collisions:
@@ -338,8 +340,14 @@ def _validate_lens_redshifts(values):
     ValueError
         If a redshift is non-finite or the lens/source ordering is invalid.
     """
-    z_l = float(values["lens_redshift"])
-    z_s = float(values["source_redshift"])
+    try:
+        z_l = float(values["lens_redshift"])
+    except (TypeError, ValueError) as err:
+        raise TypeError("lens_redshift must realize to a scalar numeric value.") from err
+    try:
+        z_s = float(values["source_redshift"])
+    except (TypeError, ValueError) as err:
+        raise TypeError("source_redshift must realize to a scalar numeric value.") from err
     if not np.isfinite(z_l) or not np.isfinite(z_s):
         raise ValueError("Lens and source redshifts must be finite.")
     if z_l < 0.0 or z_s <= z_l:
@@ -460,8 +468,14 @@ def _lens_plane_origin(values):
     ValueError
         If either coordinate is non-finite.
     """
-    x0 = float(values.get("lens_x0", 0.0))
-    y0 = float(values.get("lens_y0", 0.0))
+    try:
+        x0 = float(values.get("lens_x0", 0.0))
+    except (TypeError, ValueError) as err:
+        raise TypeError("lens_x0 must realize to a scalar numeric value in arcseconds.") from err
+    try:
+        y0 = float(values.get("lens_y0", 0.0))
+    except (TypeError, ValueError) as err:
+        raise TypeError("lens_y0 must realize to a scalar numeric value in arcseconds.") from err
     if not np.isfinite(x0) or not np.isfinite(y0):
         raise ValueError("The lens-plane origin must be finite.")
     return x0, y0
@@ -1424,6 +1438,7 @@ def _validate_source_position_configuration(
     pixelscale,
     pixelscale_fraction,
     max_fov_expansions,
+    fov_expansion_factor,
     pseudo_caustic_points,
     pseudo_caustic_epsilon,
     geometry_tolerance,
@@ -1435,6 +1450,12 @@ def _validate_source_position_configuration(
 
     Parameters correspond to the CausticsSourcePositionNode constructor
     arguments. Angular configuration values are measured in arcseconds.
+
+    Returns
+    -------
+    dict
+        Scalar angular settings and the FOV expansion factor normalized to
+        finite floats.
 
     Raises
     ------
@@ -1455,6 +1476,7 @@ def _validate_source_position_configuration(
         "pseudo_caustic_epsilon": pseudo_caustic_epsilon,
         "geometry_tolerance": geometry_tolerance,
         "boundary_tolerance": boundary_tolerance,
+        "fov_expansion_factor": fov_expansion_factor,
     }
     if fov is not None:
         numeric_settings["fov"] = fov
@@ -1465,7 +1487,10 @@ def _validate_source_position_configuration(
             normalized[name] = float(value)
         except (TypeError, ValueError) as err:
             raise TypeError(f"{name} must be a scalar number.") from err
-        if not np.isfinite(normalized[name]) or normalized[name] <= 0.0:
+        if name == "fov_expansion_factor":
+            if not np.isfinite(normalized[name]) or normalized[name] <= 1.0:
+                raise ValueError("fov_expansion_factor must be finite and greater than one.")
+        elif not np.isfinite(normalized[name]) or normalized[name] <= 0.0:
             raise ValueError(f"{name} must be finite and positive.")
 
     if fov is not None and pixelscale_fraction is None and normalized["pixelscale"] >= normalized["fov"]:
@@ -1474,22 +1499,15 @@ def _validate_source_position_configuration(
         raise ValueError("geometry_tolerance must be smaller than pixelscale.")
     if normalized["boundary_tolerance"] < normalized["geometry_tolerance"]:
         raise ValueError("boundary_tolerance must be at least geometry_tolerance.")
-    if (
-        not isinstance(max_fov_expansions, int)
-        or isinstance(max_fov_expansions, bool)
-        or max_fov_expansions < 0
-    ):
+    if not isinstance(max_fov_expansions, int) or max_fov_expansions < 0:
         raise ValueError("max_fov_expansions must be a non-negative integer.")
     if not isinstance(pseudo_caustic_points, int) or pseudo_caustic_points < 3:
         raise ValueError("pseudo_caustic_points must be an integer of at least three.")
-    if (
-        not isinstance(max_boundary_refinements, int)
-        or isinstance(max_boundary_refinements, bool)
-        or max_boundary_refinements < 1
-    ):
+    if not isinstance(max_boundary_refinements, int) or max_boundary_refinements < 1:
         raise ValueError("max_boundary_refinements must be a positive integer.")
     if not isinstance(max_attempts, int) or max_attempts < 1:
         raise ValueError("max_attempts must be a positive integer.")
+    return normalized
 
 
 class CausticsSourcePositionNode(FunctionNode, CiteClass):
@@ -1603,13 +1621,14 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             "pixelscale_fraction",
             pixelscale_fraction,
         )
-        _validate_source_position_configuration(
+        normalized = _validate_source_position_configuration(
             lens_model=lens_model,
             lens_parameters=lens_parameters,
             fov=fov,
             pixelscale=pixelscale,
             pixelscale_fraction=pixelscale_fraction,
             max_fov_expansions=max_fov_expansions,
+            fov_expansion_factor=fov_expansion_factor,
             pseudo_caustic_points=pseudo_caustic_points,
             pseudo_caustic_epsilon=pseudo_caustic_epsilon,
             geometry_tolerance=geometry_tolerance,
@@ -1620,15 +1639,15 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         self.lens_model = lens_model
         self.cosmology = cosmology
-        self.fov = None if fov is None else float(fov)
-        self.pixelscale = float(pixelscale)
+        self.fov = normalized.get("fov")
+        self.pixelscale = normalized["pixelscale"]
         self.pixelscale_fraction = pixelscale_fraction
         self.max_fov_expansions = int(max_fov_expansions)
-        self.fov_expansion_factor = float(fov_expansion_factor)
+        self.fov_expansion_factor = normalized["fov_expansion_factor"]
         self.pseudo_caustic_points = int(pseudo_caustic_points)
-        self.pseudo_caustic_epsilon = float(pseudo_caustic_epsilon)
-        self.geometry_tolerance = float(geometry_tolerance)
-        self.boundary_tolerance = float(boundary_tolerance)
+        self.pseudo_caustic_epsilon = normalized["pseudo_caustic_epsilon"]
+        self.geometry_tolerance = normalized["geometry_tolerance"]
+        self.boundary_tolerance = normalized["boundary_tolerance"]
         self.max_boundary_refinements = int(max_boundary_refinements)
         self.max_attempts = int(max_attempts)
         self._lens_parameter_names = tuple(lens_parameters)
@@ -1647,16 +1666,6 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             outputs=self._OUTPUTS,
             **node_inputs,
         )
-
-    def set_seed(self, seed):
-        """Reset the node-owned fallback random generator.
-
-        Parameters
-        ----------
-        seed : int or None
-            Seed accepted by ``numpy.random.default_rng``.
-        """
-        self._rng = np.random.default_rng(seed)
 
     def _realized_pixelscale_for_one_lens(self, geometry_adapter, values):
         """Return this realization's initial Jacobian-grid spacing in arcseconds."""
@@ -1880,7 +1889,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             computed outputs.
         rng_info : numpy.random.Generator, optional
             Caller-owned random generator. When omitted, the node-owned generator
-            configured by ``seed`` or ``set_seed`` is used.
+            configured by ``seed`` is used.
         **kwargs : dict, optional
             Explicit overrides for registered node inputs.
 
@@ -2088,48 +2097,59 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         )
         _validate_lens_configuration(lens_model, lens_parameters)
         integer_types = (int, np.integer)
-        boolean_types = (bool, np.bool_)
-        if (
-            isinstance(max_images, boolean_types)
-            or not isinstance(max_images, integer_types)
-            or max_images < 2
-        ):
+        if not isinstance(max_images, integer_types) or max_images < 2:
             raise ValueError("max_images must be an integer greater than one.")
-        if (
-            isinstance(min_images, boolean_types)
-            or not isinstance(min_images, integer_types)
-            or not 1 <= min_images <= max_images
-        ):
+        if not isinstance(min_images, integer_types) or not 1 <= min_images <= max_images:
             raise ValueError("min_images must be between one and max_images.")
-        if not np.isfinite(pixelscale) or pixelscale <= 0.0:
-            raise ValueError("Invalid forward-raytrace solver configuration.")
-        if not np.isfinite(epsilon) or epsilon <= 0.0:
-            raise ValueError("Invalid forward-raytrace solver configuration.")
-        if isinstance(max_depth, boolean_types) or not isinstance(max_depth, integer_types) or max_depth < 1:
-            raise ValueError("Invalid forward-raytrace solver configuration.")
-        if not np.isfinite(fov_multiplier) or fov_multiplier <= 0.0:
-            raise ValueError("fov_multiplier must be positive and finite.")
+        scalar_settings = {
+            "fov_multiplier": fov_multiplier,
+            "pixelscale": pixelscale,
+            "epsilon": epsilon,
+            "fov_expansion_factor": fov_expansion_factor,
+            "pixelscale_refinement_factor": pixelscale_refinement_factor,
+        }
+        normalized_scalars = {}
+        for name, value in scalar_settings.items():
+            try:
+                normalized_scalars[name] = float(value)
+            except (TypeError, ValueError) as err:
+                raise TypeError(f"{name} must be a scalar number.") from err
+        for name in ("fov_multiplier", "pixelscale", "epsilon"):
+            if not np.isfinite(normalized_scalars[name]) or normalized_scalars[name] <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+        if (
+            not np.isfinite(normalized_scalars["fov_expansion_factor"])
+            or normalized_scalars["fov_expansion_factor"] <= 1.0
+        ):
+            raise ValueError("fov_expansion_factor must be finite and greater than one.")
+        if (
+            not np.isfinite(normalized_scalars["pixelscale_refinement_factor"])
+            or not 0.0 < normalized_scalars["pixelscale_refinement_factor"] < 1.0
+        ):
+            raise ValueError("pixelscale_refinement_factor must be finite and strictly between zero and one.")
+        if not isinstance(max_depth, integer_types) or max_depth < 1:
+            raise ValueError("max_depth must be a positive integer.")
         for name, limit in (
             ("max_fov_expansions", max_fov_expansions),
             ("max_pixelscale_refinements", max_pixelscale_refinements),
         ):
-            if isinstance(limit, boolean_types) or not isinstance(limit, integer_types) or limit < 0:
+            if not isinstance(limit, integer_types) or limit < 0:
                 raise ValueError(f"{name} must be a non-negative integer.")
 
         self.lens_model = lens_model
         self.cosmology = cosmology
         self.max_images = int(max_images)
         self.min_images = int(min_images)
-        self.fov_multiplier = float(fov_multiplier)
-        self.pixelscale = float(pixelscale)
+        self.fov_multiplier = normalized_scalars["fov_multiplier"]
+        self.pixelscale = normalized_scalars["pixelscale"]
         self.pixelscale_fraction = pixelscale_fraction
-        self.epsilon = float(epsilon)
+        self.epsilon = normalized_scalars["epsilon"]
         self.epsilon_fraction = epsilon_fraction
         self.max_depth = int(max_depth)
         self.max_fov_expansions = int(max_fov_expansions)
-        self.fov_expansion_factor = float(fov_expansion_factor)
+        self.fov_expansion_factor = normalized_scalars["fov_expansion_factor"]
         self.max_pixelscale_refinements = int(max_pixelscale_refinements)
-        self.pixelscale_refinement_factor = float(pixelscale_refinement_factor)
+        self.pixelscale_refinement_factor = normalized_scalars["pixelscale_refinement_factor"]
         self._lens_parameter_names = tuple(lens_parameters)
 
         # Register every lens parameter independently so AttributeIndicatorNode
@@ -2240,6 +2260,17 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             If root residuals, image counts, or active solver outputs fail
             validation.
         """
+        source_coordinates = {}
+        for name in ("source_x", "source_y"):
+            try:
+                source_coordinates[name] = float(values[name])
+            except (TypeError, ValueError) as err:
+                raise TypeError(f"{name} must realize to a scalar numeric value in arcseconds.") from err
+            if not np.isfinite(source_coordinates[name]):
+                raise ValueError(f"{name} must realize to a finite value in arcseconds.")
+        source_x = source_coordinates["source_x"]
+        source_y = source_coordinates["source_y"]
+
         try:
             realized_fov = float(values["fov"])
         except (TypeError, ValueError) as err:
@@ -2261,13 +2292,11 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         expected_num_images = values["expected_num_images"]
         if expected_num_images is not None:
             if (
-                isinstance(expected_num_images, (bool, np.bool_))
-                or not isinstance(expected_num_images, (int, np.integer))
+                not isinstance(expected_num_images, (int, np.integer))
                 or not self.min_images <= expected_num_images <= self.max_images
             ):
                 raise ValueError(
-                    "expected_num_images must be None or a non-Boolean integer "
-                    "between min_images and max_images."
+                    "expected_num_images must be None or an integer between min_images and max_images."
                 )
             expected_num_images = int(expected_num_images)
 
@@ -2290,8 +2319,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                     f"required method '{method_name}'."
                 )
 
-        beta_x = torch.as_tensor(values["source_x"], dtype=torch.float64)
-        beta_y = torch.as_tensor(values["source_y"], dtype=torch.float64)
+        beta_x = torch.as_tensor(source_x, dtype=torch.float64)
+        beta_y = torch.as_tensor(source_y, dtype=torch.float64)
         center_x, center_y = _lens_plane_origin(values)
         target_count = self.min_images if expected_num_images is None else expected_num_images
         retryable_errors = []
@@ -2413,8 +2442,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             seeds = geometry_adapter.singular_image_seeds(
                 lens,
                 values,
-                source_x=values["source_x"],
-                source_y=values["source_y"],
+                source_x=source_x,
+                source_y=source_y,
                 radius=min(realized_epsilon, current_grid_pixelscale),
             )
             seeds = np.asarray(seeds, dtype=float)
