@@ -648,11 +648,12 @@ class _PointSingularityGeometryAdapter:
         Raises
         ------
         TypeError
-            If the softening radius has an unsupported scalar type.
+            If ``float(lens_s)`` raises ``TypeError``, or an unsoftened
+            center coordinate cannot be normalized to a scalar float.
         ValueError
-            If the softening radius cannot be converted to float, is negative
-            or non-finite, or an unsoftened realization omits either center
-            coordinate.
+            If ``float(lens_s)`` raises ``ValueError``, the softening
+            radius is negative or non-finite, an unsoftened realization omits
+            either center coordinate, or a center coordinate is non-finite.
         """
         softening = float(values.get("lens_s", 0.0))
         if not np.isfinite(softening) or softening < 0.0:
@@ -803,10 +804,12 @@ class _PointSingularityGeometryAdapter:
         Raises
         ------
         TypeError
-            If the realized softening radius has an unsupported scalar type.
+            If ``float(lens_s)`` raises ``TypeError``, or an unsoftened
+            center coordinate cannot be normalized to a scalar float.
         ValueError
-            If the realized singularity configuration cannot be converted or
-            violates its domain.
+            If ``float(lens_s)`` raises ``ValueError``, the realized
+            singularity configuration violates its domain, or an unsoftened
+            center coordinate is missing or non-finite.
         RuntimeError
             If the shrinking-loop sequence does not converge within the
             bounded refinement count.
@@ -873,7 +876,9 @@ def _positive_lens_parameter(values, name):
     Raises
     ------
     TypeError
-        If the realized value cannot be converted to a scalar float.
+        If converting the realized value with ``float`` raises
+        ``TypeError`` or ``ValueError``; those two failures are normalized
+        to this contextual exception.
     ValueError
         If the parameter is absent, non-finite, or not strictly positive.
     """
@@ -919,7 +924,9 @@ class _SIEGeometryAdapter(_PointSingularityGeometryAdapter):
         Raises
         ------
         TypeError
-            If ``lens_Rein`` is not scalar and float-convertible.
+            If ``float(lens_Rein)`` raises ``TypeError`` or
+            ``ValueError``; the capability normalizes those failures through
+            ``_positive_lens_parameter``.
         ValueError
             If ``lens_Rein`` is absent, non-finite, or not positive.
         """
@@ -943,7 +950,9 @@ class _SIEGeometryAdapter(_PointSingularityGeometryAdapter):
         Raises
         ------
         TypeError
-            If either parameter is not scalar and float-convertible.
+            If converting either parameter with ``float`` raises
+            ``TypeError`` or ``ValueError``; the capability normalizes
+            those failures through ``_positive_lens_parameter``.
         ValueError
             If either parameter is absent, non-finite, or not positive, or if
             ``lens_q > 1``.
@@ -984,7 +993,9 @@ class _SISGeometryAdapter(_PointSingularityGeometryAdapter):
         Raises
         ------
         TypeError
-            If ``lens_Rein`` is not scalar and float-convertible.
+            If ``float(lens_Rein)`` raises ``TypeError`` or
+            ``ValueError``; the capability normalizes those failures through
+            ``_positive_lens_parameter``.
         ValueError
             If ``lens_Rein`` is absent, non-finite, or not positive.
         """
@@ -1007,7 +1018,9 @@ class _SISGeometryAdapter(_PointSingularityGeometryAdapter):
         Raises
         ------
         TypeError
-            If ``lens_Rein`` is not scalar and float-convertible.
+            If ``float(lens_Rein)`` raises ``TypeError`` or
+            ``ValueError``; the capability normalizes those failures through
+            ``_positive_lens_parameter``.
         ValueError
             If ``lens_Rein`` is absent, non-finite, or not positive.
         """
@@ -1035,10 +1048,14 @@ def _get_lens_geometry_adapter(lens_model):
         Stateless adapter implementing the six trusted capabilities
         ``characteristic_angular_scale``, ``initial_fov``,
         ``singular_points``, ``singular_image_seeds``,
-        ``expected_num_images``, and ``pseudo_caustics``. Their scalar
-        angular outputs are finite floats in arcseconds, singular locations
-        and seeds are ordered image-plane coordinates, and pseudo-caustics are
-        ordered closed source-plane curves in arcseconds.
+        ``expected_num_images``, and ``pseudo_caustics``. The first two
+        return positive finite floats in arcseconds. Singular points are an
+        ordered sequence of finite image-plane ``(x, y)`` coordinates in
+        arcseconds. Singular seeds are an ordered array with shape ``(S, 2)``
+        in image-plane arcseconds, with one seed per active singularity.
+        Expected image count is an integer regular-image count.
+        Pseudo-caustics are ordered closed source-plane curves, each with shape
+        ``(P + 1, 2)`` in arcseconds.
 
     Raises
     ------
@@ -1739,8 +1756,8 @@ def _build_strong_lensing_region(
         Closed pseudo-caustic source-plane boundaries with shape ``(P, 2)``
         in arcseconds.
     geometry_tolerance : float
-        Endpoint closure tolerance and Shapely precision-grid spacing in
-        arcseconds.
+        Consecutive-vertex curve-normalization tolerance and Shapely
+        precision-grid spacing in arcseconds.
 
     Returns
     -------
@@ -2060,8 +2077,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     ``critical_curve_fov`` records the FOV that succeeded for that snapshot
     and ``boundary_uncertainty`` compares consecutive snapshots. Adaptive FOV
     recovery keeps the requested scale fixed and multiplies its FOV by
-    ``fov_expansion_factor``. Doubling FOV at fixed scale approximately
-    quadruples the Jacobian-grid point count.
+    ``fov_expansion_factor``.
 
     A registered adapter is resolved once per realization, threaded through
     certification, and never cached on the node. Results are saved in
@@ -2328,7 +2344,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         Returns
         -------
         caustic_curves : tuple of numpy.ndarray
-            Separate closed source-plane caustic curves in arcseconds.
+            Separate closed source-plane caustic curves, each with shape
+            ``(P, 2)`` in arcseconds.
         critical_curve_fov : float
             Image-plane FOV in arcseconds that produced complete curves.
 
@@ -2832,19 +2849,21 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         Graph setter realizing to ``None`` or an integer between
         ``min_images`` and ``max_images``.
     fov : object, optional
-        Graph setter realizing to a positive image-plane FOV in arcseconds.
+        Graph setter realizing to a positive finite image-plane FOV in
+        arcseconds.
     fov_multiplier : float-convertible scalar, optional
-        Positive dimensionless multiplier applied to each realized ``fov``.
+        Finite positive dimensionless multiplier applied to each realized
+        ``fov``.
     pixelscale : float-convertible scalar, optional
-        Positive configured grid-spacing upper bound in arcseconds.
+        Finite positive configured grid-spacing upper bound in arcseconds.
     pixelscale_fraction : float-convertible scalar or None, optional
-        Positive dimensionless fraction of a registered adapter's realized
-        characteristic scale.
+        Finite positive dimensionless fraction of a registered adapter's
+        realized characteristic scale.
     epsilon : float-convertible scalar, optional
-        Positive configured Caustics residual tolerance in arcseconds.
+        Finite positive configured Caustics residual tolerance in arcseconds.
     epsilon_fraction : float-convertible scalar or None, optional
-        Positive dimensionless fraction of a registered adapter's realized
-        characteristic scale.
+        Finite positive dimensionless fraction of a registered adapter's
+        realized characteristic scale.
     max_depth : int or numpy.integer, optional
         Positive Caustics global-search tree depth.
     max_fov_expansions : int or numpy.integer, optional
@@ -2900,8 +2919,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
     registered geometry adapter retain absolute pixel/epsilon settings and
     skip targeted singular recovery. No adapter is cached on the node.
 
-    FOV expansions complete before requested-scale refinements. Grid parity
-    variants affect actual spacing and global attempt count but not the outer
+    FOV expansions complete before requested-scale refinements. The
+    divisions-plus-one variant changes actual spacing, while the half-cell
+    numerical-center shift retains the base division count and base spacing.
+    Both variants add a global solver attempt, and neither changes the outer
     expansion/refinement counters. Fixed-width GraphState outputs use the
     padding and sentinel conventions documented above.
 
@@ -2975,20 +2996,21 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         expected_num_images : object or None, optional
             Graph setter for an optional realized expected count.
         fov : object, optional
-            Graph setter realizing to an image-plane FOV in arcseconds.
+            Graph setter realizing to a positive finite image-plane FOV in
+            arcseconds.
         fov_multiplier : float-convertible scalar, optional
-            Positive multiplier converting realized ``fov`` to the initial
-            solver FOV.
+            Finite positive multiplier converting realized ``fov`` to the
+            initial solver FOV.
         pixelscale : float-convertible scalar, optional
-            Positive configured grid-spacing upper bound in arcseconds.
+            Finite positive configured grid-spacing upper bound in arcseconds.
         pixelscale_fraction : float-convertible scalar or None, optional
-            Positive dimensionless relative scale; a zero-dimensional NumPy
-            array is accepted.
-        epsilon : float-convertible scalar, optional
-            Positive configured residual tolerance in arcseconds.
-        epsilon_fraction : float-convertible scalar or None, optional
-            Positive dimensionless relative tolerance; a zero-dimensional
+            Finite positive dimensionless relative scale; a zero-dimensional
             NumPy array is accepted.
+        epsilon : float-convertible scalar, optional
+            Finite positive configured residual tolerance in arcseconds.
+        epsilon_fraction : float-convertible scalar or None, optional
+            Finite positive dimensionless relative tolerance; a
+            zero-dimensional NumPy array is accepted.
         max_depth : int or numpy.integer, optional
             Positive Caustics global-search depth.
         max_fov_expansions : int or numpy.integer, optional
@@ -3222,9 +3244,11 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             Inputs for exactly one graph sample. Required entries are
             dimensionless ``lens_redshift`` and ``source_redshift``; finite
             scalar source-plane ``source_x`` and ``source_y`` in arcseconds;
-            positive finite realized ``fov`` in arcseconds; optional
-            ``expected_num_images``; and ``lens_<parameter>`` for every
-            configured Caustics constructor parameter.
+            positive finite realized ``fov`` in arcseconds; required
+            ``expected_num_images``, whose value may be ``None`` or an
+            ordinary integer in the configured range; and
+            ``lens_<parameter>`` for every configured Caustics constructor
+            parameter.
 
         Returns
         -------
@@ -3253,14 +3277,18 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         The configured FOV setter realizes per lens and is multiplied by
         ``fov_multiplier`` to form ``initial_fov``. Realized pixel scale
-        and epsilon are fixed once; epsilon is reused for every global call,
-        singular seed radius, and targeted refinement. Each outer attempt is
-        independent, so its global coordinates replace rather than merge with
-        any earlier attempt. Targeted roots are local to a successful,
-        nonempty, deficient attempt and are skipped without an adapter.
+        and epsilon are fixed once. Every global call and residual
+        certification uses that fixed epsilon; targeted seed radius is
+        ``min(realized_epsilon, actual_grid_spacing)``, while singular
+        neighborhood occupancy and root locality use the actual grid spacing.
+        Each outer attempt is independent, so its global coordinates replace
+        rather than merge with any earlier attempt. Targeted roots are local to
+        a successful, nonempty, deficient attempt and are skipped without an
+        adapter.
 
-        Grid parity and numerical-center variants may change actual spacing and
-        solver-attempt count without changing outer recovery counters. The
+        The divisions-plus-one variant changes actual spacing; the half-cell
+        numerical-center shift retains base divisions and base spacing. Both
+        add global attempts, and neither changes outer recovery counters. The
         numerical shift leaves physical lens values and returned coordinates
         unchanged. All bounded FOV expansions run before requested-scale
         refinements. After retryable exhaustion, ``None`` coordinates are
@@ -3468,16 +3496,20 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             ``solver_attempts``. Each executed singular-seed batch adds one
             more attempt, while its internal root-refinement passes do not.
             Actual spacing is updated to ``current_fov / divisions`` for the
-            invoked variant. Parity or shift variants change that spacing and
-            attempt count but never the outer expansion/refinement counters.
+            invoked variant. The divisions-plus-one variant changes that
+            spacing; the half-cell numerical-center shift uses base divisions
+            and therefore retains base spacing. Both add a global attempt, and
+            neither changes the outer expansion/refinement counters.
 
             Targeted recovery runs only after a successful, nonempty, deficient
             global result with a registered adapter. It selects one seed for
-            each empty singular neighborhood and reuses the fixed realized
-            epsilon for the seed radius and certification. Retryable targeted
-            failures leave the global result deficient. Targeted roots and
-            global coordinates are local to this attempt; every later outer
-            call replaces them.
+            each empty singular neighborhood. Its radius is the smaller of
+            fixed realized epsilon and actual grid spacing. Residual
+            certification uses fixed epsilon, while neighborhood occupancy and
+            root locality use actual grid spacing. Retryable targeted failures
+            leave the global result deficient. Targeted roots and global
+            coordinates are local to this attempt; every later outer call
+            replaces them.
 
             Numerical-center shifts never modify physical lens values or
             translate returned image coordinates. If all outer calls remain
