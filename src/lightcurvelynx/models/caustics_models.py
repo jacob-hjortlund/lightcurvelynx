@@ -97,7 +97,7 @@ def _to_numpy(tensor):
         Detached CPU array with a floating dtype. No copy is made when the
         tensor's existing NumPy representation already has the requested dtype.
     """
-    return tensor.detach().cpu().numpy().astype(float, copy=False)
+    return tensor.detach().cpu().numpy()
 
 
 def _sample_value(value, sample_index, num_samples):
@@ -141,18 +141,6 @@ def _validate_optional_positive_fraction(name, value):
 
 def _singular_neighborhoods_are_empty(coordinates, singular_points, radius):
     """Return which singular points lack a global image within one grid cell."""
-    coordinates = np.asarray(coordinates, dtype=float)
-    singular_points = np.asarray(singular_points, dtype=float)
-    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
-        raise ValueError("Global image coordinates must have shape (N, 2).")
-    if singular_points.ndim != 2 or singular_points.shape[1] != 2:
-        raise ValueError("Singular points must have shape (N, 2).")
-    if not np.isfinite(radius) or radius <= 0.0:
-        raise ValueError("The singular-neighborhood radius must be positive and finite.")
-    if not len(singular_points):
-        return np.empty(0, dtype=bool)
-    if not len(coordinates):
-        return np.ones(len(singular_points), dtype=bool)
     distances = np.linalg.norm(
         coordinates[:, None, :] - singular_points[None, :, :],
         axis=2,
@@ -173,7 +161,6 @@ def _validated_singular_images(
 ):
     """Return finite source-matching roots inside their singular neighborhoods."""
     candidate_coordinates = np.column_stack((_to_numpy(image_x), _to_numpy(image_y)))
-    singular_points = np.asarray(singular_points, dtype=float)
 
     mapped_x, mapped_y = lens.raytrace(
         torch.as_tensor(candidate_coordinates[:, 0], dtype=torch.float64),
@@ -204,8 +191,6 @@ def _refine_image_seeds(
     from caustics.lenses.func import forward_raytrace_rootfind
 
     roots = torch.as_tensor(seeds, dtype=torch.float64)
-    beta_x = torch.as_tensor(beta_x, dtype=torch.float64)
-    beta_y = torch.as_tensor(beta_y, dtype=torch.float64)
     for _ in range(_SINGULAR_ROOT_REFINEMENTS):
         roots = forward_raytrace_rootfind(
             roots[:, 0],
@@ -229,20 +214,15 @@ def _refine_image_seeds(
 
 def _is_singular_forward_raytrace_error(error):
     """Return whether Caustics failed in a recognized singular linear solve."""
+    if not isinstance(error, RuntimeError):
+        return False
     message = str(error).lower()
-    return (
-        isinstance(error, RuntimeError)
-        and "linalg.solve" in message
-        and ("input matrix is singular" in message or "singular u" in message)
-    )
+    return "linalg.solve" in message and ("input matrix is singular" in message or "singular u" in message)
 
 
 def _is_retryable_forward_raytrace_error(error):
-    """Return whether a Caustics image-root search has a known retryable failure."""
-    if isinstance(error, IndexError):
-        message = str(error).lower()
-        return "index 0 is out of bounds" in message
-    return _is_singular_forward_raytrace_error(error)
+    """Return whether Caustics reported its known empty-candidate failure."""
+    return isinstance(error, IndexError) and "index 0 is out of bounds" in str(error).lower()
 
 
 def _validate_lens_redshifts(values):
@@ -589,7 +569,7 @@ class _PointSingularityGeometryAdapter:
 
         for singular_x, singular_y in singular_points:
             center = np.array([singular_x, singular_y], dtype=float)
-            radius = float(epsilon)
+            radius = epsilon
             previous_curve = _raytrace_curve(lens, center + radius * directions)
             last_change = np.inf
 
@@ -704,9 +684,6 @@ class _CausticFOVError(RuntimeError):
 
 def _outer_grid_boundary(values):
     """Return every outer-boundary value from a square grid without duplicates."""
-    values = np.asarray(values)
-    if values.ndim < 2 or values.shape[0] != values.shape[1]:
-        raise ValueError("Expected a square grid with at least two dimensions.")
     return np.concatenate(
         (
             values[0],
@@ -775,12 +752,12 @@ def _find_all_caustics(
     contourpy = _import_contourpy()
     _, torch = _import_caustics_dependencies()
 
-    center_x, center_y = (float(value) for value in center)
+    center_x, center_y = center
     num_intervals = int(np.ceil(fov / pixelscale))
     if num_intervals % 2:
         num_intervals += 1
-    actual_pixelscale = float(fov) / num_intervals
-    half_fov = 0.5 * float(fov)
+    actual_pixelscale = fov / num_intervals
+    half_fov = 0.5 * fov
     x_axis = torch.linspace(
         center_x - half_fov,
         center_x + half_fov,
@@ -939,24 +916,7 @@ def _close_curve(curve, *, tolerance):
         unique vertices after normalization, or have an endpoint gap larger
         than ``tolerance``.
     """
-    tolerance = float(tolerance)
-    if not np.isfinite(tolerance) or tolerance <= 0.0:
-        raise ValueError("Curve closure tolerance must be finite and positive.")
-
     coordinates = np.asarray(curve, dtype=float)
-    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
-        raise RuntimeError("A caustic boundary must have shape (N, 2).")
-    if len(coordinates) < 3 or not np.all(np.isfinite(coordinates)):
-        raise RuntimeError("A caustic boundary must contain at least three finite vertices.")
-
-    endpoint_gap = float(np.linalg.norm(coordinates[0] - coordinates[-1]))
-    if endpoint_gap > tolerance:
-        raise RuntimeError(
-            "A caustic boundary is open; endpoint gap "
-            f"{endpoint_gap} arcsec exceeds tolerance {tolerance} arcsec."
-        )
-    if endpoint_gap > 0.0:
-        coordinates = np.concatenate((coordinates, coordinates[:1]), axis=0)
 
     retained = [coordinates[0]]
     for coordinate in coordinates[1:-1]:
@@ -1040,12 +1000,11 @@ def _extract_polygonal_geometry(geometry):
 
 def _boundary_regions(curves, *, geometry_tolerance):
     """Return one repaired positive-area polygonal region per curve."""
+    shapely = _import_shapely()
     regions = []
     for boundary_index, curve in enumerate(curves):
         coordinates = _close_curve(curve, tolerance=geometry_tolerance)
-        region = _extract_polygonal_geometry(
-            _import_shapely().make_valid(_import_shapely().Polygon(coordinates))
-        )
+        region = _extract_polygonal_geometry(shapely.make_valid(shapely.Polygon(coordinates)))
         area = float(region.area)
         if region.is_empty or not np.isfinite(area) or area <= 0.0:
             raise RuntimeError(
@@ -1149,8 +1108,6 @@ def _compare_boundary_geometry(previous, current, geometry_tolerance):
 def _source_boundary_clearance(source_x, source_y, geometry, geometry_tolerance):
     """Return source distance to the nearest typed boundary in arcseconds."""
     curves = (*geometry.caustic_curves, *geometry.pseudo_caustic_curves)
-    if not curves:
-        return np.inf
     shapely = _import_shapely()
     source = shapely.Point(source_x, source_y)
     return min(
@@ -1200,8 +1157,6 @@ def _build_strong_lensing_region(
     """
     shapely = _import_shapely()
     curves = [*caustic_curves, *pseudo_caustic_curves]
-    if not curves:
-        raise RuntimeError("No caustic or pseudo-caustic boundaries were found.")
 
     enclosed_regions = _boundary_regions(
         curves,
@@ -1214,8 +1169,6 @@ def _build_strong_lensing_region(
     area = float(region.area)
     if region.is_empty or not np.isfinite(area) or area <= 0.0:
         raise RuntimeError("The strong-lensing region has no finite positive area.")
-    if region.geom_type not in {"Polygon", "MultiPolygon"}:
-        raise RuntimeError(f"Expected polygonal strong-lensing geometry, got {region.geom_type}.")
     return region
 
 
@@ -1263,15 +1216,8 @@ def _sample_position(
     shapely = _import_shapely()
     bounds = tuple(float(value) for value in region.bounds)
     area = float(region.area)
-    if len(bounds) != 4 or not np.all(np.isfinite(bounds)):
-        raise RuntimeError(f"Strong-lensing region for {lens_identifier} has invalid bounds.")
     min_x, min_y, max_x, max_y = bounds
     bounding_box_area = (max_x - min_x) * (max_y - min_y)
-    if not np.isfinite(area) or area <= 0.0 or not np.isfinite(bounding_box_area) or bounding_box_area <= 0.0:
-        raise RuntimeError(
-            f"Strong-lensing region for {lens_identifier} has invalid area "
-            f"{area} or bounding-box area {bounding_box_area}."
-        )
 
     for attempt in range(1, max_attempts + 1):
         source_x = float(rng.uniform(min_x, max_x))
@@ -1622,9 +1568,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         return _BoundaryGeometry(
             caustic_curves=tuple(caustic_curves),
             pseudo_caustic_curves=tuple(pseudo_caustic_curves),
-            critical_curve_fov=float(critical_curve_fov),
-            pixelscale=float(pixelscale),
-            pseudo_caustic_points=int(pseudo_caustic_points),
+            critical_curve_fov=critical_curve_fov,
+            pixelscale=pixelscale,
+            pseudo_caustic_points=pseudo_caustic_points,
         )
 
     def _certified_boundary_geometry_for_one_lens(
@@ -2167,7 +2113,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         beta_y = torch.as_tensor(source_y, dtype=torch.float64)
         center_x, center_y = _lens_plane_origin(values)
         target_count = self.min_images if expected_num_images is None else expected_num_images
-        retryable_errors = []
+        latest_retryable_error = None
         solver_attempts = 0
 
         current_fov = initial_fov
@@ -2178,7 +2124,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         pixelscale_refinements = 0
 
         def recovery_context(recovered_count, recovery_stage):
-            latest_retryable_error = retryable_errors[-1] if retryable_errors else None
             return (
                 f"initial_fov={initial_fov}, current_fov={current_fov}, "
                 f"configured_pixelscale={self.pixelscale}, "
@@ -2203,13 +2148,12 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             recovered_count = len(coordinates)
             if expected_num_images is not None and recovered_count > expected_num_images:
                 raise RuntimeError(
-                    f"Found {recovered_count} images, exceeding "
-                    f"expected_num_images={expected_num_images}; "
+                    "Caustics image recovery exceeded expected_num_images; "
                     f"{recovery_context(recovered_count, recovery_stage)}."
                 )
             if recovered_count > self.max_images:
                 raise RuntimeError(
-                    f"Found {recovered_count} images, exceeding max_images={self.max_images}; "
+                    "Caustics image recovery exceeded max_images; "
                     f"{recovery_context(recovered_count, recovery_stage)}."
                 )
             if expected_num_images is not None:
@@ -2218,6 +2162,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         def attempt(current_fov, current_pixelscale, *, recovery_stage):
             nonlocal solver_attempts, current_grid_pixelscale, current_grid_variant
+            nonlocal latest_retryable_error
             base_divisions = int(np.ceil(current_fov / current_pixelscale))
             base_spacing = current_fov / base_divisions
             grid_variants = (
@@ -2253,11 +2198,13 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                         epsilon=realized_epsilon,
                     )
                 except Exception as error:
-                    if _is_singular_forward_raytrace_error(error):
-                        retryable_errors.append(f"{type(error).__name__}: {error}")
+                    is_singular_error = _is_singular_forward_raytrace_error(error)
+                    is_empty_candidate_error = _is_retryable_forward_raytrace_error(error)
+                    if is_singular_error:
+                        latest_retryable_error = f"{type(error).__name__}: {error}"
                         continue
-                    if _is_retryable_forward_raytrace_error(error):
-                        retryable_errors.append(f"{type(error).__name__}: {error}")
+                    if is_empty_candidate_error:
+                        latest_retryable_error = f"{type(error).__name__}: {error}"
                         return None, False
                     raise
                 break
@@ -2307,9 +2254,11 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                     current_grid_pixelscale,
                 )
             except Exception as error:
-                if not _is_retryable_forward_raytrace_error(error):
+                is_singular_error = _is_singular_forward_raytrace_error(error)
+                is_empty_candidate_error = _is_retryable_forward_raytrace_error(error)
+                if not (is_singular_error or is_empty_candidate_error):
                     raise
-                retryable_errors.append(f"{type(error).__name__}: {error}")
+                latest_retryable_error = f"{type(error).__name__}: {error}"
                 return coordinates, False
 
             if len(singular_coordinates):
