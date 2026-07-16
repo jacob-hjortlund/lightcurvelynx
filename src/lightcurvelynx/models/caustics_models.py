@@ -146,45 +146,74 @@ def _pixelscale_to_divisions(fov, pixelscale):
     return int(np.ceil(float(fov) / float(pixelscale)))
 
 
-def _merge_image_candidates(coordinates, residuals, new_coordinates, new_residuals, *, epsilon):
-    """Greedily merge valid roots without ever decreasing the stored count."""
-    merged_coordinates = [np.asarray(point, dtype=float) for point in coordinates]
-    merged_residuals = [float(residual) for residual in residuals]
-    for point, residual in zip(new_coordinates, new_residuals, strict=True):
-        matches = [
-            index
-            for index, existing in enumerate(merged_coordinates)
-            if np.linalg.norm(point - existing) < epsilon
-        ]
-        if not matches:
-            merged_coordinates.append(np.asarray(point, dtype=float))
-            merged_residuals.append(float(residual))
-        else:
-            best = matches[0]
-            if residual < merged_residuals[best]:
-                merged_coordinates[best] = np.asarray(point, dtype=float)
-                merged_residuals[best] = float(residual)
-    if not merged_coordinates:
-        return np.empty((0, 2), dtype=float), np.empty(0, dtype=float)
-    return np.vstack(merged_coordinates), np.asarray(merged_residuals)
+def _global_image_coordinates(image_x, image_y):
+    """Return one Caustics global result as finite paired coordinates."""
+    coordinates_x = _to_numpy(image_x)
+    coordinates_y = _to_numpy(image_y)
+    if coordinates_x.ndim != 1 or coordinates_y.ndim != 1 or coordinates_x.shape != coordinates_y.shape:
+        raise RuntimeError(
+            "Caustics forward_raytrace returned image coordinates with invalid "
+            f"shapes {coordinates_x.shape} and {coordinates_y.shape}."
+        )
+    coordinates = np.column_stack((coordinates_x, coordinates_y))
+    if not np.all(np.isfinite(coordinates)):
+        raise RuntimeError("Caustics forward_raytrace returned non-finite image coordinates.")
+    return coordinates
 
 
-def _validated_image_candidates(lens, torch, image_x, image_y, beta_x, beta_y, epsilon):
-    """Return finite forward-raytrace roots whose source residual is below epsilon."""
+def _singular_neighborhoods_are_empty(coordinates, singular_points, radius):
+    """Return which singular points lack a global image within one grid cell."""
+    coordinates = np.asarray(coordinates, dtype=float)
+    singular_points = np.asarray(singular_points, dtype=float)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+        raise ValueError("Global image coordinates must have shape (N, 2).")
+    if singular_points.ndim != 2 or singular_points.shape[1] != 2:
+        raise ValueError("Singular points must have shape (N, 2).")
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError("The singular-neighborhood radius must be positive and finite.")
+    if not len(singular_points):
+        return np.empty(0, dtype=bool)
+    if not len(coordinates):
+        return np.ones(len(singular_points), dtype=bool)
+    distances = np.linalg.norm(
+        coordinates[:, None, :] - singular_points[None, :, :],
+        axis=2,
+    )
+    return np.all(distances > radius, axis=0)
+
+
+def _validated_singular_images(
+    lens,
+    torch,
+    image_x,
+    image_y,
+    singular_points,
+    beta_x,
+    beta_y,
+    epsilon,
+    neighborhood_radius,
+):
+    """Return finite source-matching roots inside their singular neighborhoods."""
     candidate_x = _to_numpy(image_x)
     candidate_y = _to_numpy(image_y)
+    singular_points = np.asarray(singular_points, dtype=float)
     if candidate_x.ndim != 1 or candidate_y.ndim != 1 or candidate_x.shape != candidate_y.shape:
         raise RuntimeError(
-            "Caustics forward_raytrace returned image coordinates with invalid shapes "
-            f"{candidate_x.shape} and {candidate_y.shape}."
+            "Caustics singular root finder returned image coordinates with invalid "
+            f"shapes {candidate_x.shape} and {candidate_y.shape}."
+        )
+    candidate_coordinates = np.column_stack((candidate_x, candidate_y))
+    if singular_points.shape != candidate_coordinates.shape:
+        raise RuntimeError(
+            "Caustics singular root finder returned a different number of roots "
+            "and originating singular points."
         )
 
-    finite_coordinates = np.isfinite(candidate_x) & np.isfinite(candidate_y)
-    candidate_coordinates = np.column_stack(
-        (candidate_x[finite_coordinates], candidate_y[finite_coordinates])
-    )
+    finite = np.all(np.isfinite(candidate_coordinates), axis=1) & np.all(np.isfinite(singular_points), axis=1)
+    candidate_coordinates = candidate_coordinates[finite]
+    singular_points = singular_points[finite]
     if not len(candidate_coordinates):
-        return np.empty((0, 2), dtype=float), np.empty(0, dtype=float)
+        return np.empty((0, 2), dtype=float)
 
     mapped_x, mapped_y = lens.raytrace(
         torch.as_tensor(candidate_coordinates[:, 0], dtype=torch.float64),
@@ -202,14 +231,29 @@ def _validated_image_candidates(lens, torch, image_x, image_y, beta_x, beta_y, e
 
     source_x = float(_to_numpy(beta_x))
     source_y = float(_to_numpy(beta_y))
-    finite_mappings = np.isfinite(mapped_x) & np.isfinite(mapped_y)
     residuals = np.hypot(mapped_x - source_x, mapped_y - source_y)
-    valid = finite_mappings & np.isfinite(residuals) & (residuals < epsilon)
-    return candidate_coordinates[valid], residuals[valid]
+    distances = np.linalg.norm(candidate_coordinates - singular_points, axis=1)
+    valid = (
+        np.isfinite(mapped_x)
+        & np.isfinite(mapped_y)
+        & np.isfinite(residuals)
+        & (residuals < epsilon)
+        & (distances <= neighborhood_radius)
+    )
+    return candidate_coordinates[valid]
 
 
-def _refine_image_seeds(lens, torch, seeds, beta_x, beta_y, epsilon):
-    """Refine targeted image seeds and validate their source residuals."""
+def _refine_image_seeds(
+    lens,
+    torch,
+    seeds,
+    singular_points,
+    beta_x,
+    beta_y,
+    epsilon,
+    neighborhood_radius,
+):
+    """Refine and validate targeted roots inside their singular neighborhoods."""
     from caustics.lenses.func import forward_raytrace_rootfind
 
     roots = torch.as_tensor(seeds, dtype=torch.float64)
@@ -223,14 +267,16 @@ def _refine_image_seeds(lens, torch, seeds, beta_x, beta_y, epsilon):
             beta_y,
             lens.raytrace,
         )
-    return _validated_image_candidates(
+    return _validated_singular_images(
         lens,
         torch,
         roots[:, 0],
         roots[:, 1],
+        singular_points,
         beta_x,
         beta_y,
         epsilon,
+        neighborhood_radius,
     )
 
 
@@ -2029,7 +2075,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             **node_inputs,
         )
 
-    def _forward_raytrace_candidates(
+    def _forward_raytrace_images(
         self,
         lens,
         torch,
@@ -2041,7 +2087,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         current_fov,
         current_pixelscale,
     ):
-        """Run one global forward-raytrace search and validate its candidate roots."""
+        """Return one independent global result from Caustics forward_raytrace."""
         image_x, image_y = lens.forward_raytrace(
             beta_x,
             beta_y,
@@ -2052,15 +2098,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             divisions=_pixelscale_to_divisions(current_fov, current_pixelscale),
             max_depth=self.max_depth,
         )
-        return _validated_image_candidates(
-            lens,
-            torch,
-            image_x,
-            image_y,
-            beta_x,
-            beta_y,
-            self.epsilon,
-        )
+        return _global_image_coordinates(image_x, image_y)
 
     def _solve_one(self, values):
         """Solve and validate the active macro-images for one lens system.
@@ -2152,10 +2190,15 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         beta_x = torch.as_tensor(values["source_x"], dtype=torch.float64)
         beta_y = torch.as_tensor(values["source_y"], dtype=torch.float64)
         center_x, center_y = _lens_plane_origin(values)
-        coordinates = np.empty((0, 2), dtype=float)
-        residuals = np.empty(0, dtype=float)
+        target_count = self.min_images if expected_num_images is None else expected_num_images
+        geometry_adapter = _LENS_GEOMETRY_ADAPTERS.get(self.lens_model)
         retryable_errors = []
         solver_attempts = 0
+
+        current_fov = initial_fov
+        current_pixelscale = self.pixelscale
+        fov_expansions = 0
+        pixelscale_refinements = 0
 
         def recovery_context(recovered_count, recovery_stage):
             latest_retryable_error = retryable_errors[-1] if retryable_errors else None
@@ -2171,19 +2214,12 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 f"latest_retryable_error={latest_retryable_error}"
             )
 
-        def merge_candidates(new_coordinates, new_residuals, *, recovery_stage):
-            nonlocal coordinates, residuals
-            coordinates, residuals = _merge_image_candidates(
-                coordinates,
-                residuals,
-                new_coordinates,
-                new_residuals,
-                epsilon=self.epsilon,
-            )
+        def result_is_complete(coordinates, *, recovery_stage):
             recovered_count = len(coordinates)
             if expected_num_images is not None and recovered_count > expected_num_images:
                 raise RuntimeError(
-                    f"Found {recovered_count} images, exceeding expected_num_images={expected_num_images}; "
+                    f"Found {recovered_count} images, exceeding "
+                    f"expected_num_images={expected_num_images}; "
                     f"{recovery_context(recovered_count, recovery_stage)}."
                 )
             if recovered_count > self.max_images:
@@ -2195,11 +2231,11 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 return recovered_count == expected_num_images
             return recovered_count >= self.min_images
 
-        def attempt_global(current_fov, current_pixelscale, *, recovery_stage):
+        def attempt(current_fov, current_pixelscale, *, recovery_stage):
             nonlocal solver_attempts
             solver_attempts += 1
             try:
-                new_coordinates, new_residuals = self._forward_raytrace_candidates(
+                coordinates = self._forward_raytrace_images(
                     lens,
                     torch,
                     beta_x,
@@ -2213,26 +2249,27 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 if not _is_retryable_forward_raytrace_error(error):
                     raise
                 retryable_errors.append(f"{type(error).__name__}: {error}")
-                new_coordinates = np.empty((0, 2), dtype=float)
-                new_residuals = np.empty(0, dtype=float)
-            return merge_candidates(
-                new_coordinates,
-                new_residuals,
+                return None, False
+
+            complete = result_is_complete(
+                coordinates,
                 recovery_stage=recovery_stage,
             )
+            if complete or not len(coordinates) or geometry_adapter is None:
+                return coordinates, complete
 
-        current_fov = initial_fov
-        current_pixelscale = self.pixelscale
-        fov_expansions = 0
-        pixelscale_refinements = 0
-        complete = attempt_global(
-            current_fov,
-            current_pixelscale,
-            recovery_stage="initial_global",
-        )
+            singular_points = np.asarray(
+                geometry_adapter.singular_points(values),
+                dtype=float,
+            ).reshape(-1, 2)
+            empty_neighborhoods = _singular_neighborhoods_are_empty(
+                coordinates,
+                singular_points,
+                current_pixelscale,
+            )
+            if not np.any(empty_neighborhoods):
+                return coordinates, False
 
-        geometry_adapter = _LENS_GEOMETRY_ADAPTERS.get(self.lens_model)
-        if not complete and geometry_adapter is not None:
             seeds = geometry_adapter.singular_image_seeds(
                 lens,
                 values,
@@ -2240,35 +2277,53 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 source_y=values["source_y"],
                 radius=min(self.epsilon, current_pixelscale),
             )
-            if len(seeds):
-                solver_attempts += 1
-                try:
-                    new_coordinates, new_residuals = _refine_image_seeds(
-                        lens,
-                        torch,
-                        seeds,
-                        beta_x,
-                        beta_y,
-                        self.epsilon,
-                    )
-                except Exception as error:
-                    if not _is_retryable_forward_raytrace_error(error):
-                        raise
-                    retryable_errors.append(f"{type(error).__name__}: {error}")
-                    new_coordinates = np.empty((0, 2), dtype=float)
-                    new_residuals = np.empty(0, dtype=float)
-                complete = merge_candidates(
-                    new_coordinates,
-                    new_residuals,
-                    recovery_stage="singular_seed",
+            seeds = np.asarray(seeds, dtype=float)
+            if seeds.shape != singular_points.shape:
+                raise RuntimeError(
+                    "The singular geometry adapter returned a different number of seeds and singular points."
                 )
+            seeds = seeds[empty_neighborhoods]
+            unresolved_points = singular_points[empty_neighborhoods]
+            if not len(seeds):
+                return coordinates, False
+
+            solver_attempts += 1
+            try:
+                singular_coordinates = _refine_image_seeds(
+                    lens,
+                    torch,
+                    seeds,
+                    unresolved_points,
+                    beta_x,
+                    beta_y,
+                    self.epsilon,
+                    current_pixelscale,
+                )
+            except Exception as error:
+                if not _is_retryable_forward_raytrace_error(error):
+                    raise
+                retryable_errors.append(f"{type(error).__name__}: {error}")
+                return coordinates, False
+
+            if len(singular_coordinates):
+                coordinates = np.vstack((coordinates, singular_coordinates))
+            return coordinates, result_is_complete(
+                coordinates,
+                recovery_stage="singular_seed",
+            )
+
+        coordinates, complete = attempt(
+            current_fov,
+            current_pixelscale,
+            recovery_stage="initial_global",
+        )
 
         for expansion in range(1, self.max_fov_expansions + 1):
             if complete:
                 break
             fov_expansions = expansion
             current_fov *= _FOV_EXPANSION_FACTOR
-            complete = attempt_global(
+            coordinates, complete = attempt(
                 current_fov,
                 current_pixelscale,
                 recovery_stage="fov_expansion",
@@ -2279,19 +2334,21 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 break
             pixelscale_refinements = refinement
             current_pixelscale *= 0.5
-            complete = attempt_global(
+            coordinates, complete = attempt(
                 current_fov,
                 current_pixelscale,
                 recovery_stage="pixelscale_refinement",
             )
 
+        if coordinates is None:
+            coordinates = np.empty((0, 2), dtype=float)
+
         num_images = len(coordinates)
         if not complete and num_images < self.min_images:
             latest_retryable_error = retryable_errors[-1] if retryable_errors else None
-            expected_count = self.min_images if expected_num_images is None else expected_num_images
             raise RuntimeError(
                 "Caustics image recovery exhausted; "
-                f"expected_count={expected_count}, expected_num_images={expected_num_images}, "
+                f"expected_count={target_count}, expected_num_images={expected_num_images}, "
                 f"recovered_num_images={num_images}, "
                 f"initial_fov={initial_fov}, current_fov={current_fov}, "
                 f"initial_pixelscale={self.pixelscale}, current_pixelscale={current_pixelscale}, "
