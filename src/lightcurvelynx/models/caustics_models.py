@@ -295,16 +295,22 @@ def _refine_image_seeds(
     )
 
 
-def _is_retryable_forward_raytrace_error(error):
-    """Return whether a Caustics image-root search failed for a known retryable reason."""
+def _is_singular_forward_raytrace_error(error):
+    """Return whether Caustics failed in a recognized singular linear solve."""
     message = str(error).lower()
-    if isinstance(error, IndexError):
-        return "index 0 is out of bounds" in message
     return (
         isinstance(error, RuntimeError)
         and "linalg.solve" in message
         and ("input matrix is singular" in message or "singular u" in message)
     )
+
+
+def _is_retryable_forward_raytrace_error(error):
+    """Return whether a Caustics image-root search has a known retryable failure."""
+    if isinstance(error, IndexError):
+        message = str(error).lower()
+        return "index 0 is out of bounds" in message
+    return _is_singular_forward_raytrace_error(error)
 
 
 def _validate_lens_redshifts(values):
@@ -2339,26 +2345,50 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         def attempt(current_fov, current_pixelscale, *, recovery_stage):
             nonlocal solver_attempts, current_grid_pixelscale, current_grid_variant
-            divisions = _pixelscale_to_divisions(current_fov, current_pixelscale)
-            current_grid_pixelscale = current_fov / divisions
-            current_grid_variant = "base"
-            solver_attempts += 1
-            try:
-                coordinates = self._forward_raytrace_images(
-                    lens,
-                    torch,
-                    beta_x,
-                    beta_y,
-                    center_x=center_x,
-                    center_y=center_y,
-                    current_fov=current_fov,
-                    divisions=divisions,
-                    epsilon=realized_epsilon,
-                )
-            except Exception as error:
-                if not _is_retryable_forward_raytrace_error(error):
+            base_divisions = _pixelscale_to_divisions(current_fov, current_pixelscale)
+            base_spacing = current_fov / base_divisions
+            grid_variants = (
+                ("base", center_x, center_y, base_divisions),
+                ("divisions_plus_one", center_x, center_y, base_divisions + 1),
+                (
+                    "half_cell_shift",
+                    center_x + 0.5 * base_spacing,
+                    center_y + 0.5 * base_spacing,
+                    base_divisions,
+                ),
+            )
+
+            for (
+                grid_variant,
+                search_center_x,
+                search_center_y,
+                divisions,
+            ) in grid_variants:
+                current_grid_variant = grid_variant
+                current_grid_pixelscale = current_fov / divisions
+                solver_attempts += 1
+                try:
+                    coordinates = self._forward_raytrace_images(
+                        lens,
+                        torch,
+                        beta_x,
+                        beta_y,
+                        center_x=search_center_x,
+                        center_y=search_center_y,
+                        current_fov=current_fov,
+                        divisions=divisions,
+                        epsilon=realized_epsilon,
+                    )
+                except Exception as error:
+                    if _is_singular_forward_raytrace_error(error):
+                        retryable_errors.append(f"{type(error).__name__}: {error}")
+                        continue
+                    if _is_retryable_forward_raytrace_error(error):
+                        retryable_errors.append(f"{type(error).__name__}: {error}")
+                        return None, False
                     raise
-                retryable_errors.append(f"{type(error).__name__}: {error}")
+                break
+            else:
                 return None, False
 
             complete = result_is_complete(
