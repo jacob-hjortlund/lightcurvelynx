@@ -1010,22 +1010,23 @@ class _BoundaryGeometry:
 
 
 def _close_curve(curve, *, tolerance):
-    """Validate and close one numerical source-plane boundary.
+    """Validate, normalize, and close one numerical source-plane boundary.
 
     Parameters
     ----------
     curve : array-like, shape (N, 2)
         Source-plane x/y coordinates in arcseconds.
     tolerance : float
-        Maximum permitted distance between the first and last vertices in
-        arcseconds.
+        Maximum permitted endpoint gap and minimum retained separation between
+        cyclic consecutive vertices, in arcseconds.
 
     Returns
     -------
     numpy.ndarray, shape (M, 2)
         Finite floating-point coordinates with at least three unique vertices
-        and an exactly repeated first/last vertex. ``M`` equals ``N`` for an
-        already closed curve and ``N + 1`` otherwise.
+        and an exactly repeated first/last vertex. Consecutive vertices within
+        ``tolerance`` of one another are removed, so ``M`` may be smaller than
+        ``N``.
 
     Raises
     ------
@@ -1033,7 +1034,8 @@ def _close_curve(curve, *, tolerance):
         If ``tolerance`` is not finite and positive.
     RuntimeError
         If the coordinates are malformed/non-finite, contain fewer than three
-        unique vertices, or have an endpoint gap larger than ``tolerance``.
+        unique vertices after normalization, or have an endpoint gap larger
+        than ``tolerance``.
     """
     tolerance = float(tolerance)
     if not np.isfinite(tolerance) or tolerance <= 0.0:
@@ -1053,6 +1055,16 @@ def _close_curve(curve, *, tolerance):
         )
     if endpoint_gap > 0.0:
         coordinates = np.concatenate((coordinates, coordinates[:1]), axis=0)
+
+    retained = [coordinates[0]]
+    for coordinate in coordinates[1:-1]:
+        if np.linalg.norm(coordinate - retained[-1]) > tolerance:
+            retained.append(coordinate)
+
+    while len(retained) > 1 and np.linalg.norm(retained[-1] - retained[0]) <= tolerance:
+        retained.pop()
+    retained.append(retained[0])
+    coordinates = np.asarray(retained, dtype=float)
 
     if len(coordinates) < 4 or len(np.unique(coordinates[:-1], axis=0)) < 3:
         raise RuntimeError("A caustic boundary has fewer than three unique vertices.")
