@@ -156,7 +156,7 @@ def _validate_optional_positive_fraction(name, value):
         raise TypeError(f"{name} must be None or a scalar value convertible to float.")
     try:
         normalized = float(value)
-    except (TypeError, ValueError) as err:
+    except (TypeError, ValueError, OverflowError) as err:
         raise TypeError(f"{name} must be None or a scalar value convertible to float.") from err
     if not np.isfinite(normalized) or normalized <= 0.0:
         raise ValueError(f"{name} must be finite and positive.")
@@ -342,11 +342,11 @@ def _validate_lens_redshifts(values):
     """
     try:
         z_l = float(values["lens_redshift"])
-    except (TypeError, ValueError) as err:
+    except (TypeError, ValueError, OverflowError) as err:
         raise TypeError("lens_redshift must realize to a scalar numeric value.") from err
     try:
         z_s = float(values["source_redshift"])
-    except (TypeError, ValueError) as err:
+    except (TypeError, ValueError, OverflowError) as err:
         raise TypeError("source_redshift must realize to a scalar numeric value.") from err
     if not np.isfinite(z_l) or not np.isfinite(z_s):
         raise ValueError("Lens and source redshifts must be finite.")
@@ -470,11 +470,11 @@ def _lens_plane_origin(values):
     """
     try:
         x0 = float(values.get("lens_x0", 0.0))
-    except (TypeError, ValueError) as err:
+    except (TypeError, ValueError, OverflowError) as err:
         raise TypeError("lens_x0 must realize to a scalar numeric value in arcseconds.") from err
     try:
         y0 = float(values.get("lens_y0", 0.0))
-    except (TypeError, ValueError) as err:
+    except (TypeError, ValueError, OverflowError) as err:
         raise TypeError("lens_y0 must realize to a scalar numeric value in arcseconds.") from err
     if not np.isfinite(x0) or not np.isfinite(y0):
         raise ValueError("The lens-plane origin must be finite.")
@@ -1485,7 +1485,7 @@ def _validate_source_position_configuration(
     for name, value in numeric_settings.items():
         try:
             normalized[name] = float(value)
-        except (TypeError, ValueError) as err:
+        except (TypeError, ValueError, OverflowError) as err:
             raise TypeError(f"{name} must be a scalar number.") from err
         if name == "fov_expansion_factor":
             if not np.isfinite(normalized[name]) or normalized[name] <= 1.0:
@@ -2112,7 +2112,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         for name, value in scalar_settings.items():
             try:
                 normalized_scalars[name] = float(value)
-            except (TypeError, ValueError) as err:
+            except (TypeError, ValueError, OverflowError) as err:
                 raise TypeError(f"{name} must be a scalar number.") from err
         for name in ("fov_multiplier", "pixelscale", "epsilon"):
             if not np.isfinite(normalized_scalars[name]) or normalized_scalars[name] <= 0.0:
@@ -2264,7 +2264,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         for name in ("source_x", "source_y"):
             try:
                 source_coordinates[name] = float(values[name])
-            except (TypeError, ValueError) as err:
+            except (TypeError, ValueError, OverflowError) as err:
                 raise TypeError(f"{name} must realize to a scalar numeric value in arcseconds.") from err
             if not np.isfinite(source_coordinates[name]):
                 raise ValueError(f"{name} must realize to a finite value in arcseconds.")
@@ -2273,7 +2273,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         try:
             realized_fov = float(values["fov"])
-        except (TypeError, ValueError) as err:
+        except (TypeError, ValueError, OverflowError) as err:
             raise TypeError("fov must realize to a scalar numeric value.") from err
         if not np.isfinite(realized_fov) or realized_fov <= 0.0:
             raise ValueError("fov must realize to a positive finite value.")
