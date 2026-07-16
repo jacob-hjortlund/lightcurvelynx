@@ -675,7 +675,7 @@ def _positive_lens_parameter(values, name):
     try:
         value = float(values[key])
     except KeyError as err:
-        raise ValueError(f"Automatic FOV estimation requires lens parameter '{name}'.") from err
+        raise ValueError(f"Realized lens parameter '{name}' is required for lens geometry.") from err
     except (TypeError, ValueError) as err:
         raise TypeError(f"Realized lens parameter '{name}' must be a scalar number.") from err
     if not np.isfinite(value) or value <= 0.0:
@@ -1657,39 +1657,18 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         if self.pixelscale_fraction is None:
             return self.pixelscale
         characteristic_scale = geometry_adapter.characteristic_angular_scale(values)
-        realized_pixelscale = min(
+        return min(
             self.pixelscale,
             self.pixelscale_fraction * characteristic_scale,
         )
-        if not np.isfinite(realized_pixelscale) or realized_pixelscale <= 0.0:
-            raise ValueError(f"Realized pixelscale for '{self.lens_model}' must be finite and positive.")
-        return realized_pixelscale
 
     def _initial_fov_for_one_lens(self, geometry_adapter, values, *, pixelscale):
         """Return the explicit or adapter-derived starting FOV in arcseconds."""
         if self.fov is not None:
             initial_fov = self.fov
         else:
-            estimator = getattr(geometry_adapter, "initial_fov", None)
-            if not callable(estimator):
-                raise ValueError(
-                    "Caustics source-position sampling requires an explicit fov "
-                    f"for lens model '{self.lens_model}' because its geometry "
-                    "adapter has no initial_fov estimator."
-                )
-            estimated_fov = estimator(values)
-            try:
-                initial_fov = float(estimated_fov)
-            except (TypeError, ValueError) as err:
-                raise TypeError(
-                    f"Geometry adapter for '{self.lens_model}' must return a scalar initial fov."
-                ) from err
-            if not np.isfinite(initial_fov) or initial_fov <= 0.0:
-                raise ValueError(
-                    f"Geometry adapter for '{self.lens_model}' returned an invalid "
-                    f"initial fov of {initial_fov} arcsec."
-                )
-        if initial_fov <= pixelscale:
+            initial_fov = geometry_adapter.initial_fov(values)
+        if (self.fov is None or self.pixelscale_fraction is not None) and initial_fov <= pixelscale:
             raise ValueError(
                 f"Initial fov {initial_fov} arcsec must be larger than "
                 f"pixelscale={pixelscale} arcsec for lens model '{self.lens_model}'."
@@ -1740,8 +1719,6 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                         "or reassess pixelscale."
                     ) from err
                 current_fov *= self.fov_expansion_factor
-
-        raise AssertionError("The bounded FOV expansion loop terminated unexpectedly.")
 
     def _boundary_geometry_for_one_lens(
         self,
@@ -1813,8 +1790,6 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 if last_topology_stable and last_uncertainty <= self.boundary_tolerance:
                     return previous, current, last_uncertainty, refinement
             previous = current
-        if last_previous is None:
-            raise AssertionError("Boundary certification did not produce two resolution snapshots.")
         raise RuntimeError(
             "Boundary certification exhausted refinement for "
             f"{self.lens_model} sample {sample_index} at node '{self.node_string}'; "
@@ -2045,6 +2020,13 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 class CausticsLensImageNode(FunctionNode, CiteClass):
     """Compute point-source macro-images with the optional Caustics package.
 
+    Notes
+    -----
+    ``pixelscale_fraction`` and ``epsilon_fraction`` optionally scale their
+    corresponding numerical settings to each realized lens's characteristic
+    angular scale. The configured absolute values remain upper bounds. Lens models
+    without a registered geometry adapter retain the absolute settings.
+
     References
     ----------
     * Caustics - https://github.com/Ciela-Institute/caustics
@@ -2080,7 +2062,9 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         fov=5.0,
         fov_multiplier=1.0,
         pixelscale=0.05,
+        pixelscale_fraction=None,
         epsilon=1.0e-3,
+        epsilon_fraction=None,
         max_depth=25,
         max_fov_expansions=5,
         fov_expansion_factor=1.25,
@@ -2088,6 +2072,14 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         pixelscale_refinement_factor=0.5,
         node_label=None,
     ):
+        pixelscale_fraction = _validate_optional_positive_fraction(
+            "pixelscale_fraction",
+            pixelscale_fraction,
+        )
+        epsilon_fraction = _validate_optional_positive_fraction(
+            "epsilon_fraction",
+            epsilon_fraction,
+        )
         _validate_lens_configuration(lens_model, lens_parameters)
         integer_types = (int, np.integer)
         boolean_types = (bool, np.bool_)
@@ -2124,7 +2116,9 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         self.min_images = int(min_images)
         self.fov_multiplier = float(fov_multiplier)
         self.pixelscale = float(pixelscale)
+        self.pixelscale_fraction = pixelscale_fraction
         self.epsilon = float(epsilon)
+        self.epsilon_fraction = epsilon_fraction
         self.max_depth = int(max_depth)
         self.max_fov_expansions = int(max_fov_expansions)
         self.fov_expansion_factor = float(fov_expansion_factor)
@@ -2152,6 +2146,26 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             **node_inputs,
         )
 
+    def _realized_angular_settings(self, geometry_adapter, values):
+        """Return this realization's pixel-scale upper bound and epsilon."""
+        realized_pixelscale = self.pixelscale
+        realized_epsilon = self.epsilon
+        if geometry_adapter is None or (self.pixelscale_fraction is None and self.epsilon_fraction is None):
+            return realized_pixelscale, realized_epsilon
+
+        characteristic_scale = geometry_adapter.characteristic_angular_scale(values)
+        if self.pixelscale_fraction is not None:
+            realized_pixelscale = min(
+                realized_pixelscale,
+                self.pixelscale_fraction * characteristic_scale,
+            )
+        if self.epsilon_fraction is not None:
+            realized_epsilon = min(
+                realized_epsilon,
+                self.epsilon_fraction * characteristic_scale,
+            )
+        return realized_pixelscale, realized_epsilon
+
     def _forward_raytrace_images(
         self,
         lens,
@@ -2162,17 +2176,18 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         center_x,
         center_y,
         current_fov,
-        current_pixelscale,
+        divisions,
+        epsilon,
     ):
-        """Return one independent global result from Caustics forward_raytrace."""
+        """Return one independent global result from one Caustics invocation."""
         image_x, image_y = lens.forward_raytrace(
             beta_x,
             beta_y,
-            epsilon=self.epsilon,
+            epsilon=epsilon,
             x0=torch.as_tensor(center_x, dtype=torch.float64),
             y0=torch.as_tensor(center_y, dtype=torch.float64),
             fov=current_fov,
-            divisions=_pixelscale_to_divisions(current_fov, current_pixelscale),
+            divisions=divisions,
             max_depth=self.max_depth,
         )
         return _global_image_coordinates(image_x, image_y)
@@ -2226,10 +2241,15 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         if not np.isfinite(realized_fov) or realized_fov <= 0.0:
             raise ValueError("fov must realize to a positive finite value.")
         initial_fov = realized_fov * self.fov_multiplier
-        if not np.isfinite(initial_fov) or initial_fov <= self.pixelscale:
+        geometry_adapter = _LENS_GEOMETRY_ADAPTERS.get(self.lens_model)
+        realized_pixelscale, realized_epsilon = self._realized_angular_settings(
+            geometry_adapter,
+            values,
+        )
+        if initial_fov <= realized_pixelscale:
             raise ValueError(
-                f"Initial solver fov={initial_fov} arcsec must be finite and larger "
-                f"than pixelscale={self.pixelscale} arcsec."
+                f"Initial solver fov={initial_fov} arcsec must be larger "
+                f"than pixelscale={realized_pixelscale} arcsec."
             )
 
         expected_num_images = values["expected_num_images"]
@@ -2268,12 +2288,13 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         beta_y = torch.as_tensor(values["source_y"], dtype=torch.float64)
         center_x, center_y = _lens_plane_origin(values)
         target_count = self.min_images if expected_num_images is None else expected_num_images
-        geometry_adapter = _LENS_GEOMETRY_ADAPTERS.get(self.lens_model)
         retryable_errors = []
         solver_attempts = 0
 
         current_fov = initial_fov
-        current_pixelscale = self.pixelscale
+        current_pixelscale = realized_pixelscale
+        current_grid_pixelscale = None
+        current_grid_variant = None
         fov_expansions = 0
         pixelscale_refinements = 0
 
@@ -2281,7 +2302,15 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             latest_retryable_error = retryable_errors[-1] if retryable_errors else None
             return (
                 f"initial_fov={initial_fov}, current_fov={current_fov}, "
-                f"initial_pixelscale={self.pixelscale}, current_pixelscale={current_pixelscale}, "
+                f"configured_pixelscale={self.pixelscale}, "
+                f"pixelscale_fraction={self.pixelscale_fraction}, "
+                f"initial_pixelscale={realized_pixelscale}, "
+                f"current_pixelscale={current_pixelscale}, "
+                f"current_grid_pixelscale={current_grid_pixelscale}, "
+                f"grid_variant={current_grid_variant}, "
+                f"configured_epsilon={self.epsilon}, "
+                f"epsilon_fraction={self.epsilon_fraction}, "
+                f"realized_epsilon={realized_epsilon}, "
                 f"recovery_stage={recovery_stage}, "
                 f"solver_fov_expansions={fov_expansions}, "
                 f"solver_pixelscale_refinements={pixelscale_refinements}, "
@@ -2309,7 +2338,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             return recovered_count >= self.min_images
 
         def attempt(current_fov, current_pixelscale, *, recovery_stage):
-            nonlocal solver_attempts
+            nonlocal solver_attempts, current_grid_pixelscale, current_grid_variant
+            divisions = _pixelscale_to_divisions(current_fov, current_pixelscale)
+            current_grid_pixelscale = current_fov / divisions
+            current_grid_variant = "base"
             solver_attempts += 1
             try:
                 coordinates = self._forward_raytrace_images(
@@ -2320,7 +2352,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                     center_x=center_x,
                     center_y=center_y,
                     current_fov=current_fov,
-                    current_pixelscale=current_pixelscale,
+                    divisions=divisions,
+                    epsilon=realized_epsilon,
                 )
             except Exception as error:
                 if not _is_retryable_forward_raytrace_error(error):
@@ -2342,7 +2375,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             empty_neighborhoods = _singular_neighborhoods_are_empty(
                 coordinates,
                 singular_points,
-                current_pixelscale,
+                current_grid_pixelscale,
             )
             if not np.any(empty_neighborhoods):
                 return coordinates, False
@@ -2352,17 +2385,11 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 values,
                 source_x=values["source_x"],
                 source_y=values["source_y"],
-                radius=min(self.epsilon, current_pixelscale),
+                radius=min(realized_epsilon, current_grid_pixelscale),
             )
             seeds = np.asarray(seeds, dtype=float)
-            if seeds.shape != singular_points.shape:
-                raise RuntimeError(
-                    "The singular geometry adapter returned a different number of seeds and singular points."
-                )
             seeds = seeds[empty_neighborhoods]
             unresolved_points = singular_points[empty_neighborhoods]
-            if not len(seeds):
-                return coordinates, False
 
             solver_attempts += 1
             try:
@@ -2373,8 +2400,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                     unresolved_points,
                     beta_x,
                     beta_y,
-                    self.epsilon,
-                    current_pixelscale,
+                    realized_epsilon,
+                    current_grid_pixelscale,
                 )
             except Exception as error:
                 if not _is_retryable_forward_raytrace_error(error):
@@ -2422,17 +2449,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         num_images = len(coordinates)
         if not complete and num_images < self.min_images:
-            latest_retryable_error = retryable_errors[-1] if retryable_errors else None
             raise RuntimeError(
                 "Caustics image recovery exhausted; "
-                f"expected_count={target_count}, expected_num_images={expected_num_images}, "
-                f"recovered_num_images={num_images}, "
-                f"initial_fov={initial_fov}, current_fov={current_fov}, "
-                f"initial_pixelscale={self.pixelscale}, current_pixelscale={current_pixelscale}, "
-                f"solver_fov_expansions={fov_expansions}, "
-                f"solver_pixelscale_refinements={pixelscale_refinements}, "
-                f"solver_attempts={solver_attempts}, "
-                f"latest_retryable_error={latest_retryable_error}."
+                f"target_count={target_count}; "
+                f"{recovery_context(num_images, 'exhausted')}."
             )
 
         image_x_tensor = torch.as_tensor(coordinates[:, 0], dtype=torch.float64)
@@ -2469,7 +2489,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                     -1 if expected_num_images is None else expected_num_images - num_images
                 ),
                 "solver_fov": current_fov,
-                "solver_pixelscale": current_pixelscale,
+                "solver_pixelscale": current_grid_pixelscale,
                 "solver_attempts": solver_attempts,
                 "solver_fov_expansions": fov_expansions,
                 "solver_pixelscale_refinements": pixelscale_refinements,
