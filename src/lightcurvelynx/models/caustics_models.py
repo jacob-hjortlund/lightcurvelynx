@@ -728,9 +728,6 @@ def _get_lens_geometry_adapter(lens_model):
         ) from err
 
 
-_FOV_EXPANSION_FACTOR = 2.0
-
-
 class _CausticFOVError(RuntimeError):
     """Signal that a larger image-plane FOV is required for completeness."""
 
@@ -1541,6 +1538,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         fov=None,
         pixelscale=0.01,
         max_fov_expansions=3,
+        fov_expansion_factor=2,
         pseudo_caustic_points=2_048,
         pseudo_caustic_epsilon=1.0e-5,
         geometry_tolerance=1.0e-6,
@@ -1569,6 +1567,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         self.fov = None if fov is None else float(fov)
         self.pixelscale = float(pixelscale)
         self.max_fov_expansions = int(max_fov_expansions)
+        self.fov_expansion_factor = float(fov_expansion_factor)
         self.pseudo_caustic_points = int(pseudo_caustic_points)
         self.pseudo_caustic_epsilon = float(pseudo_caustic_epsilon)
         self.geometry_tolerance = float(geometry_tolerance)
@@ -1676,7 +1675,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                         "Increase max_fov_expansions, provide a larger fov, "
                         "or reassess pixelscale."
                     ) from err
-                current_fov *= _FOV_EXPANSION_FACTOR
+                current_fov *= self.fov_expansion_factor
 
         raise AssertionError("The bounded FOV expansion loop terminated unexpectedly.")
 
@@ -2010,7 +2009,9 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         epsilon=1.0e-3,
         max_depth=25,
         max_fov_expansions=3,
+        fov_expansion_factor=2,
         max_pixelscale_refinements=3,
+        pixelscale_refinement_factor=0.5,
         node_label=None,
     ):
         _validate_lens_configuration(lens_model, lens_parameters)
@@ -2052,7 +2053,9 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         self.epsilon = float(epsilon)
         self.max_depth = int(max_depth)
         self.max_fov_expansions = int(max_fov_expansions)
+        self.fov_expansion_factor = float(fov_expansion_factor)
         self.max_pixelscale_refinements = int(max_pixelscale_refinements)
+        self.pixelscale_refinement_factor = float(pixelscale_refinement_factor)
         self._lens_parameter_names = tuple(lens_parameters)
 
         # Register every lens parameter independently so AttributeIndicatorNode
@@ -2322,7 +2325,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             if complete:
                 break
             fov_expansions = expansion
-            current_fov *= _FOV_EXPANSION_FACTOR
+            current_fov *= self.fov_expansion_factor
             coordinates, complete = attempt(
                 current_fov,
                 current_pixelscale,
@@ -2333,7 +2336,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             if complete:
                 break
             pixelscale_refinements = refinement
-            current_pixelscale *= 0.5
+            current_pixelscale *= self.pixelscale_refinement_factor
             coordinates, complete = attempt(
                 current_fov,
                 current_pixelscale,
