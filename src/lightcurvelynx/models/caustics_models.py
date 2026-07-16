@@ -146,6 +146,21 @@ def _pixelscale_to_divisions(fov, pixelscale):
     return int(np.ceil(float(fov) / float(pixelscale)))
 
 
+def _validate_optional_positive_fraction(name, value):
+    """Return a normalized positive finite scalar fraction or None."""
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray) and value.ndim != 0:
+        raise TypeError(f"{name} must be None or a scalar value convertible to float.")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as err:
+        raise TypeError(f"{name} must be None or a scalar value convertible to float.") from err
+    if not np.isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"{name} must be finite and positive.")
+    return normalized
+
+
 def _global_image_coordinates(image_x, image_y):
     """Return one Caustics global result as finite paired coordinates."""
     coordinates_x = _to_numpy(image_x)
@@ -672,6 +687,11 @@ class _SIEGeometryAdapter(_PointSingularityGeometryAdapter):
     """Complete singular geometry and initial-FOV policy for Caustics SIE."""
 
     @staticmethod
+    def characteristic_angular_scale(values):
+        """Return the realized positive Einstein radius in arcseconds."""
+        return _positive_lens_parameter(values, "Rein")
+
+    @staticmethod
     def initial_fov(values):
         """Return a padded analytic critical-curve diameter in arcseconds."""
         einstein_radius = _positive_lens_parameter(values, "Rein")
@@ -683,6 +703,11 @@ class _SIEGeometryAdapter(_PointSingularityGeometryAdapter):
 
 class _SISGeometryAdapter(_PointSingularityGeometryAdapter):
     """Complete singular geometry and initial-FOV policy for Caustics SIS."""
+
+    @staticmethod
+    def characteristic_angular_scale(values):
+        """Return the realized positive Einstein radius in arcseconds."""
+        return _positive_lens_parameter(values, "Rein")
 
     @staticmethod
     def initial_fov(values):
@@ -1391,6 +1416,7 @@ def _validate_source_position_configuration(
     lens_parameters,
     fov,
     pixelscale,
+    pixelscale_fraction,
     max_fov_expansions,
     pseudo_caustic_points,
     pseudo_caustic_epsilon,
@@ -1436,7 +1462,7 @@ def _validate_source_position_configuration(
         if not np.isfinite(normalized[name]) or normalized[name] <= 0.0:
             raise ValueError(f"{name} must be finite and positive.")
 
-    if fov is not None and normalized["pixelscale"] >= normalized["fov"]:
+    if fov is not None and pixelscale_fraction is None and normalized["pixelscale"] >= normalized["fov"]:
         raise ValueError("pixelscale must be smaller than fov.")
     if normalized["geometry_tolerance"] >= normalized["pixelscale"]:
         raise ValueError("geometry_tolerance must be smaller than pixelscale.")
@@ -1489,8 +1515,13 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         None, the registered lens geometry adapter derives a starting width
         from each realized lens configuration.
     pixelscale : float, optional
-        Maximum image-plane Jacobian-grid spacing in arcseconds. This spacing
-        remains fixed while adaptive FOV expansion increases the grid size.
+        Maximum configured image-plane Jacobian-grid spacing in arcseconds.
+        When ``pixelscale_fraction`` is enabled, this becomes an upper bound on
+        the realized per-lens spacing.
+    pixelscale_fraction : float or None, optional
+        Maximum initial Jacobian-grid spacing as a fraction of the realized
+        adapter-provided characteristic angular scale. When enabled, the smaller
+        of this relative scale and ``pixelscale`` is used for each lens.
     max_fov_expansions : int, optional
         Maximum number of factor-of-two FOV expansions after the initial
         attempt. Larger values can increase two-dimensional grid cost rapidly.
@@ -1518,8 +1549,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     ``strong_lensing_area`` is a geometric source-plane cross-section in square
     arcseconds. It does not include magnification bias, detectability, cadence,
     image resolution, or cross-section weighting of the upstream lens sample.
-    Doubling FOV at a fixed pixelscale approximately quadruples the
-    Jacobian-grid point count.
+    Adaptive FOV expansion keeps each realized pixelscale fixed, while boundary
+    refinement starts from that realized value. Doubling FOV at a fixed
+    pixelscale approximately quadruples the Jacobian-grid point count.
 
     References
     ----------
@@ -1549,6 +1581,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         lens_parameters,
         fov=None,
         pixelscale=0.01,
+        pixelscale_fraction=None,
         max_fov_expansions=5,
         fov_expansion_factor=1.25,
         pseudo_caustic_points=2_048,
@@ -1560,11 +1593,16 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         seed=None,
         node_label=None,
     ):
+        pixelscale_fraction = _validate_optional_positive_fraction(
+            "pixelscale_fraction",
+            pixelscale_fraction,
+        )
         _validate_source_position_configuration(
             lens_model=lens_model,
             lens_parameters=lens_parameters,
             fov=fov,
             pixelscale=pixelscale,
+            pixelscale_fraction=pixelscale_fraction,
             max_fov_expansions=max_fov_expansions,
             pseudo_caustic_points=pseudo_caustic_points,
             pseudo_caustic_epsilon=pseudo_caustic_epsilon,
@@ -1578,6 +1616,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         self.cosmology = cosmology
         self.fov = None if fov is None else float(fov)
         self.pixelscale = float(pixelscale)
+        self.pixelscale_fraction = pixelscale_fraction
         self.max_fov_expansions = int(max_fov_expansions)
         self.fov_expansion_factor = float(fov_expansion_factor)
         self.pseudo_caustic_points = int(pseudo_caustic_points)
@@ -1613,35 +1652,47 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         """
         self._rng = np.random.default_rng(seed)
 
-    def _initial_fov_for_one_lens(self, geometry_adapter, values):
+    def _realized_pixelscale_for_one_lens(self, geometry_adapter, values):
+        """Return this realization's initial Jacobian-grid spacing in arcseconds."""
+        if self.pixelscale_fraction is None:
+            return self.pixelscale
+        characteristic_scale = geometry_adapter.characteristic_angular_scale(values)
+        realized_pixelscale = min(
+            self.pixelscale,
+            self.pixelscale_fraction * characteristic_scale,
+        )
+        if not np.isfinite(realized_pixelscale) or realized_pixelscale <= 0.0:
+            raise ValueError(f"Realized pixelscale for '{self.lens_model}' must be finite and positive.")
+        return realized_pixelscale
+
+    def _initial_fov_for_one_lens(self, geometry_adapter, values, *, pixelscale):
         """Return the explicit or adapter-derived starting FOV in arcseconds."""
         if self.fov is not None:
-            return self.fov
-
-        estimator = getattr(geometry_adapter, "initial_fov", None)
-        if not callable(estimator):
+            initial_fov = self.fov
+        else:
+            estimator = getattr(geometry_adapter, "initial_fov", None)
+            if not callable(estimator):
+                raise ValueError(
+                    "Caustics source-position sampling requires an explicit fov "
+                    f"for lens model '{self.lens_model}' because its geometry "
+                    "adapter has no initial_fov estimator."
+                )
+            estimated_fov = estimator(values)
+            try:
+                initial_fov = float(estimated_fov)
+            except (TypeError, ValueError) as err:
+                raise TypeError(
+                    f"Geometry adapter for '{self.lens_model}' must return a scalar initial fov."
+                ) from err
+            if not np.isfinite(initial_fov) or initial_fov <= 0.0:
+                raise ValueError(
+                    f"Geometry adapter for '{self.lens_model}' returned an invalid "
+                    f"initial fov of {initial_fov} arcsec."
+                )
+        if initial_fov <= pixelscale:
             raise ValueError(
-                "Caustics source-position sampling requires an explicit fov "
-                f"for lens model '{self.lens_model}' because its geometry "
-                "adapter has no initial_fov estimator."
-            )
-
-        estimated_fov = estimator(values)
-        try:
-            initial_fov = float(estimated_fov)
-        except (TypeError, ValueError) as err:
-            raise TypeError(
-                f"Geometry adapter for '{self.lens_model}' must return a scalar initial fov."
-            ) from err
-        if not np.isfinite(initial_fov) or initial_fov <= 0.0:
-            raise ValueError(
-                f"Geometry adapter for '{self.lens_model}' returned an invalid "
-                f"initial fov of {initial_fov} arcsec."
-            )
-        if initial_fov <= self.pixelscale:
-            raise ValueError(
-                f"Geometry adapter initial fov {initial_fov} arcsec must be "
-                f"larger than pixelscale={self.pixelscale} arcsec."
+                f"Initial fov {initial_fov} arcsec must be larger than "
+                f"pixelscale={pixelscale} arcsec for lens model '{self.lens_model}'."
             )
         return initial_fov
 
@@ -1660,6 +1711,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             initial_fov = self._initial_fov_for_one_lens(
                 geometry_adapter,
                 values,
+                pixelscale=pixelscale,
             )
         current_fov = initial_fov
         singular_points = geometry_adapter.singular_points(values)
@@ -1734,6 +1786,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         values,
         *,
         sample_index,
+        pixelscale,
     ):
         """Refine typed boundaries until displacement and topology converge."""
         previous = None
@@ -1746,7 +1799,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 geometry_adapter,
                 values,
                 sample_index=sample_index,
-                pixelscale=self.pixelscale / (2**refinement),
+                pixelscale=pixelscale / (2**refinement),
                 pseudo_caustic_points=self.pseudo_caustic_points * (2**refinement),
                 initial_fov=None if previous is None else previous.critical_curve_fov,
             )
@@ -1793,8 +1846,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         -------
         tuple
             Geometry adapter, penultimate and final boundary snapshots,
-            boundary uncertainty in arcseconds, refinement count, and complete
-            supported source-plane strong-lensing region.
+            boundary uncertainty in arcseconds, refinement count, complete
+            supported source-plane strong-lensing region, and realized initial
+            Jacobian-grid spacing in arcseconds.
         """
         lens, _ = _construct_caustics_lens(
             lens_model=self.lens_model,
@@ -1803,12 +1857,17 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             lens_parameter_names=self._lens_parameter_names,
         )
         geometry_adapter = _get_lens_geometry_adapter(self.lens_model)
+        realized_pixelscale = self._realized_pixelscale_for_one_lens(
+            geometry_adapter,
+            values,
+        )
         previous_geometry, geometry, uncertainty, refinements = (
             self._certified_boundary_geometry_for_one_lens(
                 lens,
                 geometry_adapter,
                 values,
                 sample_index=sample_index,
+                pixelscale=realized_pixelscale,
             )
         )
         region = _build_strong_lensing_region(
@@ -1823,6 +1882,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             uncertainty,
             refinements,
             region,
+            realized_pixelscale,
         )
 
     def compute(self, graph_state, rng_info=None, **kwargs):
@@ -1869,17 +1929,6 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         boundary_uncertainty = np.empty(num_samples, dtype=float)
         source_boundary_clearance = np.empty(num_samples, dtype=float)
         boundary_refinements = np.empty(num_samples, dtype=int)
-        geometry_settings = {
-            "fov": self.fov,
-            "pixelscale": self.pixelscale,
-            "max_fov_expansions": self.max_fov_expansions,
-            "pseudo_caustic_points": self.pseudo_caustic_points,
-            "pseudo_caustic_epsilon": self.pseudo_caustic_epsilon,
-            "geometry_tolerance": self.geometry_tolerance,
-            "boundary_tolerance": self.boundary_tolerance,
-            "max_boundary_refinements": self.max_boundary_refinements,
-        }
-
         for sample_index, sample_seed in enumerate(sample_seeds):
             values = {
                 name: _sample_value(value, sample_index, num_samples) for name, value in input_values.items()
@@ -1891,11 +1940,24 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 uncertainty,
                 refinements,
                 region,
+                realized_pixelscale,
             ) = self._region_for_one_lens(
                 values,
                 sample_index=sample_index,
             )
             sample_rng = np.random.default_rng(sample_seed)
+            geometry_settings = {
+                "fov": self.fov,
+                "configured_pixelscale": self.pixelscale,
+                "pixelscale_fraction": self.pixelscale_fraction,
+                "realized_pixelscale": realized_pixelscale,
+                "max_fov_expansions": self.max_fov_expansions,
+                "pseudo_caustic_points": self.pseudo_caustic_points,
+                "pseudo_caustic_epsilon": self.pseudo_caustic_epsilon,
+                "geometry_tolerance": self.geometry_tolerance,
+                "boundary_tolerance": self.boundary_tolerance,
+                "max_boundary_refinements": self.max_boundary_refinements,
+            }
             (
                 source_x[sample_index],
                 source_y[sample_index],
