@@ -124,30 +124,6 @@ def _sample_value(value, sample_index, num_samples):
     return value[sample_index]
 
 
-def _pixelscale_to_divisions(fov, pixelscale):
-    """Convert an image-plane pixel scale to Caustics grid divisions.
-
-    Parameters
-    ----------
-    fov : float
-        Width of the square image-plane search region in arcseconds.
-    pixelscale : float
-        Requested nominal image-plane grid spacing in arcseconds.
-
-    Returns
-    -------
-    divisions : int
-        Integer grid resolution accepted by Caustics ``forward_raytrace``.
-
-    Notes
-    -----
-    Rounding up makes the nominal scale, ``fov / divisions``, no larger than
-    the requested ``pixelscale``. This preserves Caustics' public convention
-    that ``divisions`` is the number of divisions across the field of view.
-    """
-    return int(np.ceil(float(fov) / float(pixelscale)))
-
-
 def _validate_optional_positive_fraction(name, value):
     """Return a normalized positive finite scalar fraction or None."""
     if value is None:
@@ -161,21 +137,6 @@ def _validate_optional_positive_fraction(name, value):
     if not np.isfinite(normalized) or normalized <= 0.0:
         raise ValueError(f"{name} must be finite and positive.")
     return normalized
-
-
-def _global_image_coordinates(image_x, image_y):
-    """Return one Caustics global result as finite paired coordinates."""
-    coordinates_x = _to_numpy(image_x)
-    coordinates_y = _to_numpy(image_y)
-    if coordinates_x.ndim != 1 or coordinates_y.ndim != 1 or coordinates_x.shape != coordinates_y.shape:
-        raise RuntimeError(
-            "Caustics forward_raytrace returned image coordinates with invalid "
-            f"shapes {coordinates_x.shape} and {coordinates_y.shape}."
-        )
-    coordinates = np.column_stack((coordinates_x, coordinates_y))
-    if not np.all(np.isfinite(coordinates)):
-        raise RuntimeError("Caustics forward_raytrace returned non-finite image coordinates.")
-    return coordinates
 
 
 def _singular_neighborhoods_are_empty(coordinates, singular_points, radius):
@@ -211,26 +172,8 @@ def _validated_singular_images(
     neighborhood_radius,
 ):
     """Return finite source-matching roots inside their singular neighborhoods."""
-    candidate_x = _to_numpy(image_x)
-    candidate_y = _to_numpy(image_y)
+    candidate_coordinates = np.column_stack((_to_numpy(image_x), _to_numpy(image_y)))
     singular_points = np.asarray(singular_points, dtype=float)
-    if candidate_x.ndim != 1 or candidate_y.ndim != 1 or candidate_x.shape != candidate_y.shape:
-        raise RuntimeError(
-            "Caustics singular root finder returned image coordinates with invalid "
-            f"shapes {candidate_x.shape} and {candidate_y.shape}."
-        )
-    candidate_coordinates = np.column_stack((candidate_x, candidate_y))
-    if singular_points.shape != candidate_coordinates.shape:
-        raise RuntimeError(
-            "Caustics singular root finder returned a different number of roots "
-            "and originating singular points."
-        )
-
-    finite = np.all(np.isfinite(candidate_coordinates), axis=1) & np.all(np.isfinite(singular_points), axis=1)
-    candidate_coordinates = candidate_coordinates[finite]
-    singular_points = singular_points[finite]
-    if not len(candidate_coordinates):
-        return np.empty((0, 2), dtype=float)
 
     mapped_x, mapped_y = lens.raytrace(
         torch.as_tensor(candidate_coordinates[:, 0], dtype=torch.float64),
@@ -238,25 +181,12 @@ def _validated_singular_images(
     )
     mapped_x = _to_numpy(mapped_x)
     mapped_y = _to_numpy(mapped_y)
-    if mapped_x.ndim != 1 or mapped_y.ndim != 1 or mapped_x.shape != mapped_y.shape:
-        raise RuntimeError(
-            "Caustics raytrace returned source coordinates with invalid shapes "
-            f"{mapped_x.shape} and {mapped_y.shape}."
-        )
-    if mapped_x.shape != candidate_coordinates[:, 0].shape:
-        raise RuntimeError("Caustics raytrace returned a different number of mapped and image coordinates.")
 
     source_x = float(_to_numpy(beta_x))
     source_y = float(_to_numpy(beta_y))
     residuals = np.hypot(mapped_x - source_x, mapped_y - source_y)
     distances = np.linalg.norm(candidate_coordinates - singular_points, axis=1)
-    valid = (
-        np.isfinite(mapped_x)
-        & np.isfinite(mapped_y)
-        & np.isfinite(residuals)
-        & (residuals < epsilon)
-        & (distances <= neighborhood_radius)
-    )
+    valid = (residuals < epsilon) & (distances <= neighborhood_radius)
     return candidate_coordinates[valid]
 
 
@@ -506,17 +436,12 @@ def _raytrace_curve(lens, coordinates):
     """
     _, torch = _import_caustics_dependencies()
     coordinates = np.asarray(coordinates, dtype=float)
-    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
-        raise ValueError("A lens-plane curve must have shape (N, 2).")
 
     source_x, source_y = lens.raytrace(
         torch.as_tensor(coordinates[:, 0], dtype=torch.float64),
         torch.as_tensor(coordinates[:, 1], dtype=torch.float64),
     )
-    source_curve = np.column_stack((_to_numpy(source_x), _to_numpy(source_y)))
-    if source_curve.shape != coordinates.shape or not np.all(np.isfinite(source_curve)):
-        raise RuntimeError("Caustics returned an invalid source-plane boundary.")
-    return source_curve
+    return np.column_stack((_to_numpy(source_x), _to_numpy(source_y)))
 
 
 class _PointSingularityGeometryAdapter:
@@ -850,10 +775,6 @@ def _find_all_caustics(
     contourpy = _import_contourpy()
     _, torch = _import_caustics_dependencies()
 
-    for method_name in ("jacobian_lens_equation", "raytrace"):
-        if not hasattr(lens, method_name):
-            raise TypeError(f"Caustics source-position sampling requires lens method '{method_name}'.")
-
     center_x, center_y = (float(value) for value in center)
     num_intervals = int(np.ceil(fov / pixelscale))
     if num_intervals % 2:
@@ -875,11 +796,7 @@ def _find_all_caustics(
     grid_y, grid_x = torch.meshgrid(y_axis, x_axis, indexing="ij")
 
     jacobian = lens.jacobian_lens_equation(grid_x, grid_y, method="autograd")
-    if not isinstance(jacobian, torch.Tensor) or jacobian.shape[-2:] != (2, 2):
-        raise TypeError("Caustics jacobian_lens_equation must return a tensor with trailing shape (2, 2).")
     determinant = _to_numpy(torch.linalg.det(jacobian))
-    if determinant.shape != (num_intervals + 1, num_intervals + 1):
-        raise RuntimeError("Caustics returned a lens-equation Jacobian with an unexpected grid shape.")
 
     x_coordinates = _to_numpy(x_axis)
     y_coordinates = _to_numpy(y_axis)
@@ -895,16 +812,12 @@ def _find_all_caustics(
 
     symmetric_jacobian = 0.5 * (jacobian + jacobian.transpose(-1, -2))
     eigenvalues = _to_numpy(torch.linalg.eigvalsh(symmetric_jacobian))
-    if eigenvalues.shape != (num_intervals + 1, num_intervals + 1, 2):
-        raise RuntimeError("Caustics returned unexpected lens-equation Jacobian eigenvalue shapes.")
 
     boundary_invalid = _outer_grid_boundary(invalid)
     boundary_eigenvalues = _outer_grid_boundary(eigenvalues)
     valid_boundary = ~boundary_invalid
     if not np.any(valid_boundary):
         raise RuntimeError("The lens-equation Jacobian grid boundary contains no finite values.")
-    if not np.all(np.isfinite(boundary_eigenvalues[valid_boundary])):
-        raise RuntimeError("The lens-equation Jacobian grid boundary contains invalid eigenvalues.")
     if np.any(boundary_eigenvalues[valid_boundary] <= 0.0):
         raise _CausticFOVError(
             "The image-plane field-of-view boundary has not reached the "
@@ -963,62 +876,6 @@ def _find_all_caustics(
         caustic_curves.append(caustic_curve)
 
     return caustic_curves
-
-
-def _find_all_pseudo_caustics(
-    lens,
-    *,
-    lens_model,
-    values,
-    num_points,
-    epsilon,
-    geometry_tolerance,
-):
-    """Extract all certified pseudo-caustics for one lens realization.
-
-    Parameters
-    ----------
-    lens : object
-        Realized Caustics lens used for source-plane raytracing.
-    lens_model : str
-        Caustics class name used to select a complete singular-geometry adapter.
-    values : Mapping
-        Numeric inputs for exactly one lens-system sample, normally produced by
-        selecting one index from ``FunctionNode._build_inputs``. Keys retain
-        their registered graph-input names: ``lens_redshift``,
-        ``source_redshift``, and ``lens_<parameter>`` for each Caustics
-        constructor parameter. The selected adapter reads the subset needed to
-        enumerate singularities, such as ``lens_s``, ``lens_x0``, and
-        ``lens_y0`` for SIE/SIS.
-    num_points : int
-        Number of unique vertices used to trace each singular boundary.
-    epsilon : float
-        Initial image-plane offset from a singular boundary in arcseconds.
-    geometry_tolerance : float
-        Required source-plane convergence tolerance in arcseconds.
-
-    Returns
-    -------
-    list of numpy.ndarray
-        Closed pseudo-caustic boundaries in source-plane arcseconds. Boundary
-        arrays may have different vertex counts for different future adapters.
-
-    Raises
-    ------
-    ValueError
-        If ``lens_model`` has no complete geometry adapter or the realized
-        singular geometry is invalid.
-    RuntimeError
-        If boundary raytracing is invalid or fails to converge.
-    """
-    adapter = _get_lens_geometry_adapter(lens_model)
-    return adapter.pseudo_caustics(
-        lens,
-        values,
-        num_points=num_points,
-        epsilon=epsilon,
-        geometry_tolerance=geometry_tolerance,
-    )
 
 
 def _import_shapely():
@@ -1755,10 +1612,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             pixelscale=pixelscale,
             initial_fov=initial_fov,
         )
-        pseudo_caustic_curves = _find_all_pseudo_caustics(
+        pseudo_caustic_curves = geometry_adapter.pseudo_caustics(
             lens,
-            lens_model=self.lens_model,
-            values=values,
+            values,
             num_points=pseudo_caustic_points,
             epsilon=self.pseudo_caustic_epsilon,
             geometry_tolerance=self.geometry_tolerance,
@@ -2216,7 +2072,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             divisions=divisions,
             max_depth=self.max_depth,
         )
-        return _global_image_coordinates(image_x, image_y)
+        return np.column_stack((_to_numpy(image_x), _to_numpy(image_y)))
 
     def _solve_one(self, values):
         """Solve and validate the active macro-images for one lens system.
@@ -2307,18 +2163,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             lens_parameter_names=self._lens_parameter_names,
         )
 
-        for method_name in (
-            "forward_raytrace",
-            "raytrace",
-            "magnification",
-            "time_delay",
-        ):
-            if not hasattr(lens, method_name):
-                raise TypeError(
-                    f"Caustics lens model '{self.lens_model}' does not implement "
-                    f"required method '{method_name}'."
-                )
-
         beta_x = torch.as_tensor(source_x, dtype=torch.float64)
         beta_y = torch.as_tensor(source_y, dtype=torch.float64)
         center_x, center_y = _lens_plane_origin(values)
@@ -2374,7 +2218,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         def attempt(current_fov, current_pixelscale, *, recovery_stage):
             nonlocal solver_attempts, current_grid_pixelscale, current_grid_variant
-            base_divisions = _pixelscale_to_divisions(current_fov, current_pixelscale)
+            base_divisions = int(np.ceil(current_fov / current_pixelscale))
             base_spacing = current_fov / base_divisions
             grid_variants = (
                 ("base", center_x, center_y, base_divisions),
@@ -2523,17 +2367,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         image_y = coordinates[:, 1]
         magnifications = _to_numpy(magnifications)
         time_delays = _to_numpy(time_delays)
-
-        if not all(
-            np.all(np.isfinite(values_array))
-            for values_array in (
-                image_x,
-                image_y,
-                magnifications,
-                time_delays,
-            )
-        ):
-            raise RuntimeError("Caustics returned non-finite active image values.")
 
         time_delays = time_delays - np.min(time_delays)
         # np.lexsort uses the final key as the primary key: delay, then x, then y.
