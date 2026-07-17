@@ -82,8 +82,9 @@ def _import_caustics_dependencies():
         original import error is retained as the exception cause.
     """
     try:
-        import caustics
         import torch
+        torch.set_default_dtype(torch.float64)
+        import caustics
     except ImportError as err:  # pragma: no cover
         raise ImportError(
             "Caustics-backed lens nodes require the optional 'caustics' package. "
