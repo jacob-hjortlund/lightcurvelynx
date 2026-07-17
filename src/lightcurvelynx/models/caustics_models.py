@@ -547,8 +547,6 @@ def _lens_plane_origin(values):
     ------
     TypeError
         If either coordinate cannot be converted to a scalar float.
-    ValueError
-        If either coordinate is non-finite.
     """
     try:
         x0 = float(values.get("lens_x0", 0.0))
@@ -558,8 +556,6 @@ def _lens_plane_origin(values):
         y0 = float(values.get("lens_y0", 0.0))
     except (TypeError, ValueError, OverflowError) as err:
         raise TypeError("lens_y0 must realize to a scalar numeric value in arcseconds.") from err
-    if not np.isfinite(x0) or not np.isfinite(y0):
-        raise ValueError("The lens-plane origin must be finite.")
     return x0, y0
 
 
@@ -644,16 +640,6 @@ class _PointSingularityGeometryAdapter:
         tuple of tuple of float
             Empty for a softened lens, otherwise ``((x0, y0),)`` containing the
             singular image-plane location in arcseconds.
-
-        Raises
-        ------
-        TypeError
-            If ``float(lens_s)`` raises ``TypeError``, or an unsoftened
-            center coordinate cannot be normalized to a scalar float.
-        ValueError
-            If ``float(lens_s)`` raises ``ValueError``, the softening
-            radius is negative or non-finite, an unsoftened realization omits
-            either center coordinate, or a center coordinate is non-finite.
         """
         softening = float(values.get("lens_s", 0.0))
         if not np.isfinite(softening) or softening < 0.0:
@@ -1942,7 +1928,7 @@ def _validate_source_position_configuration(
         pixel-scale, and tolerance relations are inconsistent.
     """
     _validate_lens_configuration(lens_model, lens_parameters)
-    _get_lens_geometry_adapter(lens_model)
+    _ = _get_lens_geometry_adapter(lens_model)
 
     numeric_settings = {
         "pixelscale": pixelscale,
@@ -3572,6 +3558,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 coordinates,
                 recovery_stage=recovery_stage,
             )
+
+            # TODO: Instead of geometry_adapter is None check, check if adapter is singular.
+            # Relevant when we generalize geometry adapters to none singular models beyond
+            # SIS and SIE.
             if complete or not len(coordinates) or geometry_adapter is None:
                 return coordinates, complete
 
