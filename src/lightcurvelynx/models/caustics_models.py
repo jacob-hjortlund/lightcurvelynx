@@ -1568,21 +1568,15 @@ def _component_name_namespace(caustics):
     )
     node_tuple = caskade.NodeTuple((), name="namespace_tuple")
     namespace = set()
-    for node in (
-        caskade.Node(name="namespace_node"),
-        caskade.NodeCollection(name="namespace_collection"),
-        node_tuple,
-        single_plane,
+    for node_class, node in (
+        (caskade.Node, caskade.Node(name="namespace_node")),
+        (caskade.NodeCollection, caskade.NodeCollection(name="namespace_collection")),
+        (caskade.NodeTuple, node_tuple),
+        (caustics.SinglePlane, single_plane),
     ):
         namespace.update(dir(node))
-    for node_class in (
-        caskade.Node,
-        caskade.NodeCollection,
-        caskade.NodeTuple,
-        caustics.SinglePlane,
-    ):
         namespace.update(dir(node_class))
-        namespace.update(inspect.signature(node_class).parameters)
+        namespace.update(name for name in inspect.signature(node_class).parameters if hasattr(node, name))
     return namespace
 
 
