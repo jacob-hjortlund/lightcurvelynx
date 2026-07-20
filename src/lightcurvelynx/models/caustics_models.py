@@ -451,8 +451,8 @@ class CausticsSinglePlaneSpec:
         object.__setattr__(self, "components", MappingProxyType(component_snapshot))
 
 
-_SINGULAR_SEED_POINTS = 256
-_SINGULAR_ROOT_REFINEMENTS = 8
+_RECOVERY_SEED_POINTS = 256
+_RECOVERY_ROOT_REFINEMENTS = 8
 _INITIAL_FOV_PADDING = 1.1
 
 
@@ -608,49 +608,49 @@ def _validate_optional_positive_fraction(name, value):
     return normalized
 
 
-def _singular_neighborhoods_are_empty(coordinates, singular_points, radius):
-    """Identify singular neighborhoods without a global image.
+def _recovery_neighborhoods_are_empty(coordinates, recovery_points, radius):
+    """Identify recovery neighborhoods without a global image.
 
     Parameters
     ----------
     coordinates : numpy.ndarray, shape (I, 2)
         Trusted global image coordinates in image-plane arcseconds.
-    singular_points : numpy.ndarray, shape (S, 2)
-        Trusted registered singular locations in image-plane arcseconds.
+    recovery_points : numpy.ndarray, shape (R, 2)
+        Trusted registered recovery locations in image-plane arcseconds.
     radius : float
         Positive neighborhood radius in arcseconds.
 
     Returns
     -------
-    numpy.ndarray, shape (S,)
+    numpy.ndarray, shape (R,)
         Boolean mask that is true where every global image is farther than
-        ``radius`` from the corresponding singular point.
+        ``radius`` from the corresponding recovery point.
 
     Notes
     -----
     Production callers establish the shapes and positive radius. With no image
-    coordinates every singular neighborhood is empty; with no singular points
+    coordinates every recovery neighborhood is empty; with no recovery points
     the returned mask has length zero.
     """
     distances = np.linalg.norm(
-        coordinates[:, None, :] - singular_points[None, :, :],
+        coordinates[:, None, :] - recovery_points[None, :, :],
         axis=2,
     )
     return np.all(distances > radius, axis=0)
 
 
-def _validated_singular_images(
+def _validated_recovery_images(
     lens,
     torch,
     image_x,
     image_y,
-    singular_points,
+    recovery_points,
     beta_x,
     beta_y,
     epsilon,
     neighborhood_radius,
 ):
-    """Certify targeted roots by source residual and singular locality.
+    """Certify targeted roots by source residual and recovery-point locality.
 
     Parameters
     ----------
@@ -658,12 +658,12 @@ def _validated_singular_images(
         Realized Caustics lens implementing ``raytrace(x, y)``.
     torch : module
         PyTorch module used by the realized Caustics lens.
-    image_x : torch.Tensor, shape (S,)
+    image_x : torch.Tensor, shape (R,)
         Candidate image-plane x coordinates in arcseconds.
-    image_y : torch.Tensor, shape (S,)
+    image_y : torch.Tensor, shape (R,)
         Candidate image-plane y coordinates in arcseconds.
-    singular_points : numpy.ndarray, shape (S, 2)
-        Originating registered singular locations in image-plane arcseconds,
+    recovery_points : numpy.ndarray, shape (R, 2)
+        Originating registered recovery locations in image-plane arcseconds,
         paired one-to-one with the candidates.
     beta_x : torch.Tensor
         Scalar source-plane x coordinate in arcseconds.
@@ -672,7 +672,7 @@ def _validated_singular_images(
     epsilon : float
         Strict upper bound on the source-plane residual in arcseconds.
     neighborhood_radius : float
-        Inclusive upper bound on distance from the originating singularity in
+        Inclusive upper bound on distance from the originating recovery point in
         image-plane arcseconds.
 
     Returns
@@ -684,7 +684,7 @@ def _validated_singular_images(
     Notes
     -----
     A root is retained only when its source residual is strictly less than
-    ``epsilon`` and its singular-point distance is no greater than
+    ``epsilon`` and its recovery-point distance is no greater than
     ``neighborhood_radius``. Paired shapes, output types, and finiteness are
     trusted Caustics and registered-adapter postconditions.
     """
@@ -700,7 +700,7 @@ def _validated_singular_images(
     source_x = float(_to_numpy(beta_x))
     source_y = float(_to_numpy(beta_y))
     residuals = np.hypot(mapped_x - source_x, mapped_y - source_y)
-    distances = np.linalg.norm(candidate_coordinates - singular_points, axis=1)
+    distances = np.linalg.norm(candidate_coordinates - recovery_points, axis=1)
     valid = (residuals < epsilon) & (distances <= neighborhood_radius)
     return candidate_coordinates[valid]
 
@@ -709,13 +709,13 @@ def _refine_image_seeds(
     lens,
     torch,
     seeds,
-    singular_points,
+    recovery_points,
     beta_x,
     beta_y,
     epsilon,
     neighborhood_radius,
 ):
-    """Refine targeted singular seeds and certify the resulting roots.
+    """Refine targeted recovery seeds and certify the resulting roots.
 
     Parameters
     ----------
@@ -723,10 +723,10 @@ def _refine_image_seeds(
         Realized Caustics lens implementing ``raytrace(x, y)``.
     torch : module
         PyTorch module used by the realized Caustics lens.
-    seeds : numpy.ndarray, shape (S, 2)
-        One image-plane seed per active singularity, in arcseconds.
-    singular_points : numpy.ndarray, shape (S, 2)
-        Corresponding registered singular locations in image-plane arcseconds.
+    seeds : numpy.ndarray, shape (R, 2)
+        One image-plane seed per active recovery point, in arcseconds.
+    recovery_points : numpy.ndarray, shape (R, 2)
+        Corresponding registered recovery locations in image-plane arcseconds.
     beta_x : torch.Tensor
         Scalar source-plane x coordinate in arcseconds.
     beta_y : torch.Tensor
@@ -734,7 +734,7 @@ def _refine_image_seeds(
     epsilon : float
         Strict source-plane residual tolerance in arcseconds.
     neighborhood_radius : float
-        Inclusive singular-neighborhood radius in image-plane arcseconds.
+        Inclusive recovery-neighborhood radius in image-plane arcseconds.
 
     Returns
     -------
@@ -749,14 +749,14 @@ def _refine_image_seeds(
 
     Notes
     -----
-    The one-to-one seed/singularity ordering is preserved through exactly
-    ``_SINGULAR_ROOT_REFINEMENTS`` root-refinement passes before
+    The one-to-one seed/recovery-point ordering is preserved through exactly
+    ``_RECOVERY_ROOT_REFINEMENTS`` root-refinement passes before
     certification.
     """
     from caustics.lenses.func import forward_raytrace_rootfind
 
     roots = torch.as_tensor(seeds, dtype=torch.float64)
-    for _ in range(_SINGULAR_ROOT_REFINEMENTS):
+    for _ in range(_RECOVERY_ROOT_REFINEMENTS):
         roots = forward_raytrace_rootfind(
             roots[:, 0],
             roots[:, 1],
@@ -764,12 +764,12 @@ def _refine_image_seeds(
             beta_y,
             lens.raytrace,
         )
-    return _validated_singular_images(
+    return _validated_recovery_images(
         lens,
         torch,
         roots[:, 0],
         roots[:, 1],
-        singular_points,
+        recovery_points,
         beta_x,
         beta_y,
         epsilon,
@@ -1032,132 +1032,107 @@ def _raytrace_curve(lens, coordinates):
     return np.column_stack((_to_numpy(source_x), _to_numpy(source_y)))
 
 
-class _PointSingularityGeometryAdapter:
-    """Provide shared geometry capabilities for one point singularity.
+def _recovery_image_seeds(lens, recovery_points, *, source_x, source_y, radius):
+    """Select one targeted image seed per recovery point.
 
-    This private adapter describes the singular geometry shared by the Caustics
-    SIE and SIS implementations. An unsoftened lens (``lens_s == 0``) has one
-    singular point at ``(lens_x0, lens_y0)``. Its pseudo-caustic is obtained by
-    raytracing successively smaller image-plane circles around that point until
-    the source-plane boundary changes by no more than ``geometry_tolerance``.
-    A softened lens (``lens_s > 0``) is continuous at its center and therefore
-    contributes no pseudo-caustic through this adapter.
+    Parameters
+    ----------
+    lens : object
+        Realized Caustics lens implementing ``raytrace(x, y)``.
+    recovery_points : iterable of tuple of float
+        Image-plane recovery locations in arcseconds.
+    source_x : float
+        Source-plane x position in arcseconds.
+    source_y : float
+        Source-plane y position in arcseconds.
+    radius : float
+        Image-plane circle radius around each recovery point in arcseconds.
 
-    Notes
-    -----
-    Every non-None registry entry is a stateless singleton required to provide
-    six capabilities: ``characteristic_angular_scale``, ``initial_fov``,
-    ``singular_points``, ``singular_image_seeds``,
-    ``expected_num_images``, and ``pseudo_caustics``. Their documented
-    finite values, ordering, shapes, and units are trusted by callers.
+    Returns
+    -------
+    numpy.ndarray, shape (R, 2)
+        One image-plane seed in arcseconds per recovery point.
+    """
+    angles = 2.0 * np.pi * np.arange(_RECOVERY_SEED_POINTS) / _RECOVERY_SEED_POINTS
+    directions = np.column_stack((np.cos(angles), np.sin(angles)))
+    source_position = np.array([source_x, source_y], dtype=float)
+    seeds = []
+    for recovery_point in recovery_points:
+        circle = np.asarray(recovery_point, dtype=float) + radius * directions
+        mapped_circle = _raytrace_curve(lens, circle)
+        nearest = np.argmin(np.linalg.norm(mapped_circle - source_position, axis=1))
+        seeds.append(circle[nearest])
+    return np.asarray(seeds, dtype=float).reshape(-1, 2)
 
-    The adapter receives numeric values for one graph sample, is resolved once
-    for each realization, and never reads a ``GraphState`` or retains a lens,
-    boundary, or other mutable realization state. Concrete registered
-    subclasses provide the characteristic-scale and initial-FOV capabilities;
-    this base supplies the remaining four.
+
+_PSEUDO_CAUSTIC_SEPARATION_FRACTION = 0.25
+
+
+@dataclass(frozen=True)
+class _PseudoCausticGenerator:
+    """Describe one pseudo-caustic loop generator.
+
+    The center is an image-plane (x, y) position in arcseconds.
+    max_initial_radius is an optional image-plane radius cap in arcseconds for
+    the first loop traced around that center.
     """
 
-    _MAX_REFINEMENTS = 32
+    center: tuple[float, float]
+    max_initial_radius: float | None = None
 
-    @staticmethod
-    def singular_points(values):
-        """Return singular image-plane locations for one lens realization.
 
-        Parameters
-        ----------
-        values : Mapping[str, object]
-            Realized inputs for one lens-system sample. ``lens_s`` is an
-            angular softening radius in arcseconds and defaults to zero.
-            Unsoftened lenses must provide ``lens_x0`` and ``lens_y0`` in
-            arcseconds.
+class _GeometryAdapter:
+    """Expose independent geometry capabilities for one realized lens system.
 
-        Returns
-        -------
-        tuple of tuple of float
-            Empty for a softened lens, otherwise ``((x0, y0),)`` containing the
-            singular image-plane location in arcseconds.
-        """
-        softening = float(values.get("lens_s", 0.0))
-        if not np.isfinite(softening) or softening < 0.0:
-            raise ValueError("The lens softening radius must be finite and non-negative.")
-        if softening > 0.0:
-            return ()
-        if "lens_x0" not in values or "lens_y0" not in values:
-            raise ValueError("Point-singularity geometry requires lens_parameters entries for 'x0' and 'y0'.")
-        return (_lens_plane_origin(values),)
+    search_center gives the image-plane center in arcseconds. initial_fov gives
+    a full image-plane search extent in arcseconds, whereas resolution_scale
+    gives a characteristic angular resolution in arcseconds. Jacobian mask
+    points identify image-plane locations in arcseconds omitted from contour
+    calculations. Root recovery points identify image-plane locations in
+    arcseconds that receive targeted image searches. Pseudo-caustic generators
+    identify centers and optional initial-radius caps in image-plane arcseconds
+    for loops mapped into source-plane boundaries.
+    """
 
-    def singular_image_seeds(self, lens, values, *, source_x, source_y, radius):
-        """Select one targeted image seed per active singularity.
+    def search_center(self, values):
+        """Return the image-plane search center in arcseconds."""
+        raise NotImplementedError
 
-        Parameters
-        ----------
-        lens : object
-            Realized Caustics lens implementing ``raytrace(x, y)``.
-        values : Mapping[str, object]
-            Realized values for the same lens system.
-        source_x : float
-            Source-plane x position in arcseconds.
-        source_y : float
-            Source-plane y position in arcseconds.
-        radius : float
-            Image-plane circle radius around each singularity in arcseconds.
+    def initial_fov(self, values):
+        """Return the full initial image-plane search extent in arcseconds."""
+        raise NotImplementedError
 
-        Returns
-        -------
-        numpy.ndarray, shape (S, 2)
-            One image-plane seed in arcseconds per active singularity, ordered
-            as ``singular_points(values)``. A softened lens returns an empty
-            array with shape ``(0, 2)``.
+    def resolution_scale(self, values):
+        """Return the characteristic image-plane resolution in arcseconds."""
+        raise NotImplementedError
 
-        Notes
-        -----
-        Each seed is the sampled circle point whose raytraced position is
-        nearest the requested source. Registered singular geometry and
-        Caustics output structure are trusted rather than revalidated.
-        """
-        singular_points = self.singular_points(values)
-        if not singular_points:
-            return np.empty((0, 2), dtype=float)
-        angles = 2.0 * np.pi * np.arange(_SINGULAR_SEED_POINTS) / _SINGULAR_SEED_POINTS
-        directions = np.column_stack((np.cos(angles), np.sin(angles)))
-        source_position = np.array([source_x, source_y], dtype=float)
-        seeds = []
-        for singular_point in singular_points:
-            circle = np.asarray(singular_point, dtype=float) + radius * directions
-            mapped_circle = _raytrace_curve(lens, circle)
-            nearest = np.argmin(np.linalg.norm(mapped_circle - source_position, axis=1))
-            seeds.append(circle[nearest])
-        return np.asarray(seeds, dtype=float)
+    def jacobian_mask_points(self, values):
+        """Return image-plane points in arcseconds masked from the Jacobian."""
+        raise NotImplementedError
 
-    def reference_num_images(self, values, *args, **kwargs):
-        """
-        Number of images created by the realized lens system for
-        a reference point placed outside the strong lensing region
-        
-        Parameters
-        ----------
-        values : Mapping[str, object]
-            Realized values for the lens system.
-        
-        Returns
-        -------
-        int
-            The number of reference images for a source outside the strong-lensing region.
+    def root_recovery_points(self, values):
+        """Return image-plane points in arcseconds used for targeted recovery."""
+        raise NotImplementedError
 
-        """
-        return 1
+    def pseudo_caustic_generators(self, values):
+        """Return image-plane loop generators for pseudo-caustic boundaries."""
+        raise NotImplementedError
 
     @staticmethod
     def winding_number(curve, x, y):
-
-        point = np.column_stack([x, y])
-        v  = np.asarray(curve, float) - point
-        v2 = np.roll(v, -1, axis=0)
-        ang = np.arctan2(
-            v[:, 0]*v2[:, 1] - v[:, 1]*v2[:, 0], (v * v2).sum(axis=1)
+        """Return the signed winding number around a source-plane point."""
+        point = np.array([x, y], dtype=float)
+        vectors = np.asarray(curve, dtype=float) - point
+        following = np.roll(vectors, -1, axis=0)
+        angles = np.arctan2(
+            vectors[:, 0] * following[:, 1] - vectors[:, 1] * following[:, 0],
+            np.sum(vectors * following, axis=1),
         )
-        return int(round(ang.sum() / (2*np.pi)))
+        return int(round(float(np.sum(angles)) / (2.0 * np.pi)))
+
+    def reference_num_images(self, values):
+        """Return the regular-image count outside all typed boundaries."""
+        raise NotImplementedError
 
     def expected_num_images(
         self,
@@ -1168,349 +1143,373 @@ class _PointSingularityGeometryAdapter:
         caustic_curves,
         pseudo_caustic_curves,
     ):
-        """Count regular images from typed source-boundary containment.
-
-        Parameters
-        ----------
-        source_x : float
-            Source-plane x position in arcseconds.
-        source_y : float
-            Source-plane y position in arcseconds.
-        caustic_curves : sequence of numpy.ndarray
-            Closed true-caustic curves, each with shape ``(P + 1, 2)`` in
-            source-plane arcseconds.
-        pseudo_caustic_curves : sequence of numpy.ndarray
-            Closed pseudo-caustic curves, each with shape ``(P + 1, 2)`` in
-            source-plane arcseconds.
-
-        Returns
-        -------
-        int
-            Expected number of regular images for the source position.
-
-        Notes
-        -----
-        The count starts at the number of images given by a reference point outside
-        the true- / pseudo-caustics. The count gains two for each true-caustic winding,
-        and gains one for each pseudo-caustic winding.
-        """
+        """Return the signed-boundary regular-image count."""
         count = self.reference_num_images(values)
-        for curve in caustic_curves:
-            count += 2 * self.winding_number(curve, source_x, source_y)
-        for curve in pseudo_caustic_curves:
-            count += self.winding_number(curve, source_x, source_y)
-
+        count += 2 * sum(self.winding_number(curve, source_x, source_y) for curve in caustic_curves)
+        count += sum(self.winding_number(curve, source_x, source_y) for curve in pseudo_caustic_curves)
         return count
 
-    def pseudo_caustics(
-        self,
-        lens,
-        values,
-        *,
-        num_points,
-        epsilon,
-        geometry_tolerance,
-    ):
-        """Trace every converged pseudo-caustic for one lens realization.
 
-        Parameters
-        ----------
-        lens : object
-            Realized Caustics lens implementing ``raytrace(x, y)``.
-        values : Mapping
-            Numeric inputs for the same single lens-system realization used to
-            construct ``lens``. The adapter reads ``lens_s``, ``lens_x0``, and
-            ``lens_y0`` to determine its singular geometry; other realized
-            entries may remain in the mapping and are ignored here.
-        num_points : int
-            Number of unique, evenly spaced vertices on each image-plane loop.
-        epsilon : float
-            Initial loop radius around each singularity in arcseconds.
-        geometry_tolerance : float
-            Maximum allowed pointwise source-plane change, in arcseconds,
-            between successive loop refinements.
+@dataclass(frozen=True)
+class _PointSingularityGeometryAdapter(_GeometryAdapter):
+    """Realized finite geometry with independently enabled point capabilities."""
 
-        Returns
-        -------
-        list of numpy.ndarray
-            One closed source-plane boundary per singularity. Each array has
-            shape ``(num_points + 1, 2)`` in arcseconds, with the first vertex
-            repeated at the end. A softened lens returns an empty list.
+    center: tuple[float, float]
+    resolution: float
+    extent: float
+    mask_center: bool
+    recover_center: bool
+    generate_pseudo_caustic: bool
 
-        Raises
-        ------
-        TypeError
-            If ``float(lens_s)`` raises ``TypeError``, or an unsoftened
-            center coordinate cannot be normalized to a scalar float.
-        ValueError
-            If ``float(lens_s)`` raises ``ValueError``, the realized
-            singularity configuration violates its domain, or an unsoftened
-            center coordinate is missing or non-finite.
-        RuntimeError
-            If the shrinking-loop sequence does not converge within the
-            bounded refinement count.
+    def search_center(self, values):
+        """Return the stored image-plane center in arcseconds."""
+        return self.center
 
-        Notes
-        -----
-        Registered singular-point ordering and Caustics paired output
-        structure are trusted. Each loop radius is halved until maximum
-        pointwise source-plane displacement is within
-        ``geometry_tolerance``.
-        """
-        singular_points = self.singular_points(values)
-        if not singular_points:
-            return []
+    def initial_fov(self, values):
+        """Return the stored full image-plane extent in arcseconds."""
+        return self.extent
 
-        angles = 2.0 * np.pi * np.arange(num_points, dtype=float) / num_points
-        directions = np.column_stack((np.cos(angles), np.sin(angles)))
-        pseudo_caustics = []
+    def resolution_scale(self, values):
+        """Return the stored image-plane resolution scale in arcseconds."""
+        return self.resolution
 
-        for singular_x, singular_y in singular_points:
-            center = np.array([singular_x, singular_y], dtype=float)
-            radius = epsilon
-            previous_curve = _raytrace_curve(lens, center + radius * directions)
-            last_change = np.inf
+    def jacobian_mask_points(self, values):
+        """Return the center when it must be masked from the Jacobian."""
+        return (self.center,) if self.mask_center else ()
 
-            for _ in range(self._MAX_REFINEMENTS):
-                radius *= 0.5
-                current_curve = _raytrace_curve(lens, center + radius * directions)
-                last_change = float(np.max(np.linalg.norm(current_curve - previous_curve, axis=1)))
-                if last_change <= geometry_tolerance:
-                    pseudo_caustics.append(np.concatenate((current_curve, current_curve[:1]), axis=0))
-                    break
-                previous_curve = current_curve
-            else:
-                raise RuntimeError(
-                    "Pseudo-caustic extraction did not converge after "
-                    f"{self._MAX_REFINEMENTS} refinements; final boundary change "
-                    f"was {last_change} arcsec."
+    def root_recovery_points(self, values):
+        """Return the center when it requires targeted root recovery."""
+        return (self.center,) if self.recover_center else ()
+
+    def pseudo_caustic_generators(self, values):
+        """Return the center when it generates a pseudo-caustic boundary."""
+        if self.generate_pseudo_caustic:
+            return (_PseudoCausticGenerator(self.center),)
+        return ()
+
+    def reference_num_images(self, values):
+        """Return the one-image reference count for an atomic lens."""
+        return 1
+
+
+@dataclass(frozen=True)
+class _SmoothCuspGeometryAdapter(_GeometryAdapter):
+    """Realized finite geometry for a cusp without a pseudo-caustic."""
+
+    center: tuple[float, float]
+    resolution: float
+    extent: float
+    mask_center: bool
+    recover_center: bool
+
+    def search_center(self, values):
+        """Return the stored image-plane center in arcseconds."""
+        return self.center
+
+    def initial_fov(self, values):
+        """Return the stored full image-plane extent in arcseconds."""
+        return self.extent
+
+    def resolution_scale(self, values):
+        """Return the stored image-plane resolution scale in arcseconds."""
+        return self.resolution
+
+    def jacobian_mask_points(self, values):
+        """Return the center when it must be masked from the Jacobian."""
+        return (self.center,) if self.mask_center else ()
+
+    def root_recovery_points(self, values):
+        """Return the center when it requires targeted root recovery."""
+        return (self.center,) if self.recover_center else ()
+
+    def pseudo_caustic_generators(self, values):
+        """Return no pseudo-caustic generators for a smooth cusp."""
+        return ()
+
+    def reference_num_images(self, values):
+        """Return the one-image reference count for an atomic lens."""
+        return 1
+
+
+@dataclass(frozen=True)
+class _AffinePerturbationGeometryAdapter(_GeometryAdapter):
+    """Geometry capabilities for an affine lens-plane perturbation."""
+
+    def search_center(self, values):
+        """Return the realized affine center in image-plane arcseconds."""
+        return float(values["x0"]), float(values["y0"])
+
+    def initial_fov(self, values):
+        """Return no independent search extent for an affine perturbation."""
+        return None
+
+    def resolution_scale(self, values):
+        """Return no independent resolution for an affine perturbation."""
+        return None
+
+    def jacobian_mask_points(self, values):
+        """Return no Jacobian mask points for an affine perturbation."""
+        return ()
+
+    def root_recovery_points(self, values):
+        """Return no targeted root-recovery points for an affine perturbation."""
+        return ()
+
+    def pseudo_caustic_generators(self, values):
+        """Return no pseudo-caustic generators for an affine perturbation."""
+        return ()
+
+    def reference_num_images(self, values):
+        """Return zero excess over the single-plane reference image."""
+        return 1
+
+
+@dataclass(frozen=True)
+class _GeometryComponent:
+    """Associate one named component with its realized geometry adapter."""
+
+    name: str
+    adapter: _GeometryAdapter
+    affine: bool
+
+
+@dataclass(frozen=True)
+class _SinglePlaneGeometryAdapter(_GeometryAdapter):
+    """Aggregate ordered atomic capabilities across one lens plane."""
+
+    components: tuple[_GeometryComponent, ...]
+
+    def reference_num_images(self, values):
+        """Return one image plus every component's reference-image excess."""
+        return 1 + sum(
+            component.adapter.reference_num_images(values[component.name]) - 1
+            for component in self.components
+        )
+
+    def jacobian_mask_points(self, values):
+        """Concatenate component Jacobian mask points in supplied order."""
+        return tuple(
+            point
+            for component in self.components
+            for point in component.adapter.jacobian_mask_points(values[component.name])
+        )
+
+    def root_recovery_points(self, values):
+        """Concatenate component root-recovery points in supplied order."""
+        return tuple(
+            point
+            for component in self.components
+            for point in component.adapter.root_recovery_points(values[component.name])
+        )
+
+    def resolution_scale(self, values):
+        """Return the smallest positive non-affine resolution in arcseconds."""
+        return min(
+            resolution
+            for component in self.components
+            if not component.affine
+            if (resolution := component.adapter.resolution_scale(values[component.name])) > 0.0
+        )
+
+    def _search_envelope(self, values):
+        bounds = []
+        for component in self.components:
+            if component.affine:
+                continue
+            component_values = values[component.name]
+            center_x, center_y = component.adapter.search_center(component_values)
+            extent = component.adapter.initial_fov(component_values)
+            half_extent = 0.5 * extent
+            bounds.append(
+                (
+                    center_x - half_extent,
+                    center_x + half_extent,
+                    center_y - half_extent,
+                    center_y + half_extent,
                 )
+            )
+        return (
+            min(bound[0] for bound in bounds),
+            max(bound[1] for bound in bounds),
+            min(bound[2] for bound in bounds),
+            max(bound[3] for bound in bounds),
+        )
 
-        return pseudo_caustics
+    def search_center(self, values):
+        """Return the midpoint of the non-affine envelope in arcseconds."""
+        min_x, max_x, min_y, max_y = self._search_envelope(values)
+        return 0.5 * (min_x + max_x), 0.5 * (min_y + max_y)
 
+    def initial_fov(self, values):
+        """Return the larger full width of the non-affine envelope."""
+        min_x, max_x, min_y, max_y = self._search_envelope(values)
+        return max(max_x - min_x, max_y - min_y)
 
-def _positive_lens_parameter(values, name):
-    """Normalize one required positive realized lens parameter.
-
-    Parameters
-    ----------
-    values : Mapping[str, object]
-        Realized inputs containing ``lens_<name>``.
-    name : str
-        Unprefixed Caustics parameter name. Units depend on the capability:
-        ``Rein`` is in arcseconds and ``q`` is dimensionless.
-
-    Returns
-    -------
-    float
-        Finite, strictly positive parameter value in its capability-specific
-        unit.
-
-    Raises
-    ------
-    TypeError
-        If converting the realized value with ``float`` raises
-        ``TypeError`` or ``ValueError``; those two failures are normalized
-        to this contextual exception.
-    ValueError
-        If the parameter is absent, non-finite, or not strictly positive.
-    """
-    key = f"lens_{name}"
-    try:
-        value = float(values[key])
-    except KeyError as err:
-        raise ValueError(f"Realized lens parameter '{name}' is required for lens geometry.") from err
-    except (TypeError, ValueError) as err:
-        raise TypeError(f"Realized lens parameter '{name}' must be a scalar number.") from err
-    if not np.isfinite(value) or value <= 0.0:
-        raise ValueError(f"Realized lens parameter '{name}' must be finite and positive.")
-    return value
-
-
-class _SIEGeometryAdapter(_PointSingularityGeometryAdapter):
-    """Implement the complete registered geometry contract for Caustics SIE.
-
-    Notes
-    -----
-    This stateless singleton inherits point-singularity locations, targeted
-    seeds, regular-image counts, and pseudo-caustic extraction. It explicitly
-    provides characteristic angular scale and initial FOV, completing all six
-    trusted registry capabilities. Realizations require positive ``Rein`` in
-    arcseconds and dimensionless ``q`` satisfying ``0 < q <= 1``. The
-    adapter is never cached on a node.
-    """
-
-    @staticmethod
-    def characteristic_angular_scale(values):
-        """Return the realized SIE characteristic angular scale.
-
-        Parameters
-        ----------
-        values : Mapping[str, object]
-            Realized lens inputs containing ``lens_Rein``.
-
-        Returns
-        -------
-        float
-            Positive finite Einstein radius in arcseconds.
-
-        Raises
-        ------
-        TypeError
-            If ``float(lens_Rein)`` raises ``TypeError`` or
-            ``ValueError``; the capability normalizes those failures through
-            ``_positive_lens_parameter``.
-        ValueError
-            If ``lens_Rein`` is absent, non-finite, or not positive.
-        """
-        return _positive_lens_parameter(values, "Rein")
-
-    @staticmethod
-    def initial_fov(values):
-        """Return the padded analytic SIE critical-curve diameter.
-
-        Parameters
-        ----------
-        values : Mapping[str, object]
-            Realized lens inputs containing Einstein radius ``lens_Rein`` in
-            arcseconds and dimensionless axis ratio ``lens_q``.
-
-        Returns
-        -------
-        float
-            Initial square image-plane FOV in arcseconds.
-
-        Raises
-        ------
-        TypeError
-            If converting either parameter with ``float`` raises
-            ``TypeError`` or ``ValueError``; the capability normalizes
-            those failures through ``_positive_lens_parameter``.
-        ValueError
-            If either parameter is absent, non-finite, or not positive, or if
-            ``lens_q > 1``.
-        """
-        einstein_radius = _positive_lens_parameter(values, "Rein")
-        axis_ratio = _positive_lens_parameter(values, "q")
-        if axis_ratio > 1.0:
-            raise ValueError("Realized SIE lens parameter 'q' must be no greater than one.")
-        return 2.0 * _INITIAL_FOV_PADDING * einstein_radius / np.sqrt(axis_ratio)
+    def pseudo_caustic_generators(self, values):
+        """Return ordered generators capped by their nearest peer center."""
+        owners = tuple(
+            (
+                component,
+                component.adapter.search_center(values[component.name]),
+            )
+            for component in self.components
+            if not component.affine
+        )
+        generators = []
+        for owner_index, (component, owner_center) in enumerate(owners):
+            for generator in component.adapter.pseudo_caustic_generators(values[component.name]):
+                if len(owners) > 1:
+                    nearest_distance = min(
+                        hypot(
+                            owner_center[0] - other_center[0],
+                            owner_center[1] - other_center[1],
+                        )
+                        for other_index, (_, other_center) in enumerate(owners)
+                        if other_index != owner_index
+                    )
+                    generator = _PseudoCausticGenerator(
+                        center=generator.center,
+                        max_initial_radius=(_PSEUDO_CAUSTIC_SEPARATION_FRACTION * nearest_distance),
+                    )
+                generators.append(generator)
+        return tuple(generators)
 
 
-class _SISGeometryAdapter(_PointSingularityGeometryAdapter):
-    """Implement the complete registered geometry contract for Caustics SIS.
+def _caustics_scalar(value):
+    """Convert one scalar Caustics tensor to an immutable Python float."""
+    return float(np.asarray(_to_numpy(value)).item())
 
-    Notes
-    -----
-    This stateless singleton inherits point-singularity locations, targeted
-    seeds, regular-image counts, and pseudo-caustic extraction. It supplies
-    characteristic angular scale and initial FOV, completing all six trusted
-    registry capabilities for a positive Einstein radius in arcseconds. The
-    adapter is never cached on a node.
-    """
 
-    @staticmethod
-    def characteristic_angular_scale(values):
-        """Return the realized SIS characteristic angular scale.
+def _sis_geometry_adapter(lens, values):
+    center = (
+        _caustics_scalar(lens.x0.value),
+        _caustics_scalar(lens.y0.value),
+    )
+    einstein_radius = _caustics_scalar(lens.Rein.value)
+    unsoftened = float(values["s"]) == 0.0
+    return _PointSingularityGeometryAdapter(
+        center=center,
+        resolution=einstein_radius,
+        extent=2.0 * _INITIAL_FOV_PADDING * einstein_radius,
+        mask_center=unsoftened,
+        recover_center=unsoftened,
+        generate_pseudo_caustic=unsoftened,
+    )
 
-        Parameters
-        ----------
-        values : Mapping[str, object]
-            Realized lens inputs containing ``lens_Rein``.
 
-        Returns
-        -------
-        float
-            Positive finite Einstein radius in arcseconds.
+def _sie_geometry_adapter(lens, values):
+    center = (
+        _caustics_scalar(lens.x0.value),
+        _caustics_scalar(lens.y0.value),
+    )
+    einstein_radius = _caustics_scalar(lens.Rein.value)
+    axis_ratio = _caustics_scalar(lens.q.value)
+    unsoftened = float(values["s"]) == 0.0
+    return _PointSingularityGeometryAdapter(
+        center=center,
+        resolution=einstein_radius,
+        extent=(2.0 * _INITIAL_FOV_PADDING * einstein_radius / np.sqrt(axis_ratio)),
+        mask_center=unsoftened,
+        recover_center=unsoftened,
+        generate_pseudo_caustic=unsoftened,
+    )
 
-        Raises
-        ------
-        TypeError
-            If ``float(lens_Rein)`` raises ``TypeError`` or
-            ``ValueError``; the capability normalizes those failures through
-            ``_positive_lens_parameter``.
-        ValueError
-            If ``lens_Rein`` is absent, non-finite, or not positive.
-        """
-        return _positive_lens_parameter(values, "Rein")
 
-    @staticmethod
-    def initial_fov(values):
-        """Return the padded analytic SIS critical-curve diameter.
+def _epl_geometry_adapter(lens, values):
+    center = (
+        _caustics_scalar(lens.x0.value),
+        _caustics_scalar(lens.y0.value),
+    )
+    einstein_radius = _caustics_scalar(lens.Rein.value)
+    axis_ratio = _caustics_scalar(lens.q.value)
+    slope = _caustics_scalar(lens.t.value)
+    return _PointSingularityGeometryAdapter(
+        center=center,
+        resolution=einstein_radius,
+        extent=(2.0 * _INITIAL_FOV_PADDING * einstein_radius / np.sqrt(axis_ratio)),
+        mask_center=slope <= 1.0,
+        recover_center=slope <= 1.0,
+        generate_pseudo_caustic=slope == 1.0,
+    )
 
-        Parameters
-        ----------
-        values : Mapping[str, object]
-            Realized lens inputs containing ``lens_Rein`` in arcseconds.
 
-        Returns
-        -------
-        float
-            Initial square image-plane FOV in arcseconds.
+def _nfw_geometry_adapter(lens, values):
+    from caustics.constants import rad_to_arcsec
 
-        Raises
-        ------
-        TypeError
-            If ``float(lens_Rein)`` raises ``TypeError`` or
-            ``ValueError``; the capability normalizes those failures through
-            ``_positive_lens_parameter``.
-        ValueError
-            If ``lens_Rein`` is absent, non-finite, or not positive.
-        """
-        einstein_radius = _positive_lens_parameter(values, "Rein")
-        return 2.0 * _INITIAL_FOV_PADDING * einstein_radius
+    center = (
+        _caustics_scalar(lens.x0.value),
+        _caustics_scalar(lens.y0.value),
+    )
+    scale_radius_mpc = _caustics_scalar(lens.get_scale_radius())
+    distance_mpc = _caustics_scalar(lens.cosmology.angular_diameter_distance(lens.z_l.value))
+    angular_scale = float(scale_radius_mpc / distance_mpc * rad_to_arcsec)
+    unsoftened = float(values["s"]) == 0.0
+    return _SmoothCuspGeometryAdapter(
+        center=center,
+        resolution=angular_scale,
+        extent=2.0 * _INITIAL_FOV_PADDING * angular_scale,
+        mask_center=unsoftened,
+        recover_center=unsoftened,
+    )
+
+
+def _tnfw_geometry_adapter(lens, values):
+    center = (
+        _caustics_scalar(lens.x0.value),
+        _caustics_scalar(lens.y0.value),
+    )
+    scale_radius = _caustics_scalar(lens.Rs.value)
+    truncation = _caustics_scalar(lens.tau.value)
+    unsoftened = float(values["s"]) == 0.0
+    return _PointSingularityGeometryAdapter(
+        center=center,
+        resolution=scale_radius,
+        extent=(2.0 * _INITIAL_FOV_PADDING * truncation * scale_radius),
+        mask_center=unsoftened,
+        recover_center=unsoftened,
+        generate_pseudo_caustic=not unsoftened,
+    )
+
+
+def _pseudo_jaffe_geometry_adapter(lens, values):
+    center = (
+        _caustics_scalar(lens.x0.value),
+        _caustics_scalar(lens.y0.value),
+    )
+    core_radius = _caustics_scalar(lens.Rc.value)
+    scale_radius = _caustics_scalar(lens.Rs.value)
+    return _SmoothCuspGeometryAdapter(
+        center=center,
+        resolution=core_radius,
+        extent=2.0 * _INITIAL_FOV_PADDING * scale_radius,
+        mask_center=True,
+        recover_center=True,
+    )
+
+
+def _external_shear_geometry_adapter(lens, values):
+    return _AffinePerturbationGeometryAdapter()
+
+
+def _mass_sheet_geometry_adapter(lens, values):
+    return _AffinePerturbationGeometryAdapter()
 
 
 _LENS_GEOMETRY_ADAPTERS = {
-    "SIE": _SIEGeometryAdapter(),
-    "SIS": _SISGeometryAdapter(),
+    "SIS": _sis_geometry_adapter,
+    "SIE": _sie_geometry_adapter,
+    "EPL": _epl_geometry_adapter,
+    "NFW": _nfw_geometry_adapter,
+    "TNFW": _tnfw_geometry_adapter,
+    "PseudoJaffe": _pseudo_jaffe_geometry_adapter,
+    "ExternalShear": _external_shear_geometry_adapter,
+    "MassSheet": _mass_sheet_geometry_adapter,
 }
 
 
 def _get_lens_geometry_adapter(lens_model):
-    """Look up the certified singular-geometry adapter for a lens class.
-
-    Parameters
-    ----------
-    lens_model : str
-        Name of the Caustics lens class used to construct the realized lens.
-
-    Returns
-    -------
-    _PointSingularityGeometryAdapter
-        Stateless adapter implementing the six trusted capabilities
-        ``characteristic_angular_scale``, ``initial_fov``,
-        ``singular_points``, ``singular_image_seeds``,
-        ``expected_num_images``, and ``pseudo_caustics``. The first two
-        return positive finite floats in arcseconds. Singular points are an
-        ordered sequence of finite image-plane ``(x, y)`` coordinates in
-        arcseconds. Singular seeds are an ordered array with shape ``(S, 2)``
-        in image-plane arcseconds, with one seed per active singularity.
-        Expected image count is an integer regular-image count.
-        Pseudo-caustics are ordered closed source-plane curves, each with shape
-        ``(P + 1, 2)`` in arcseconds.
-
-    Raises
-    ------
-    ValueError
-        If no complete geometry adapter is registered. Explicit source
-        positions may still use such a model through ``CausticsLensImageNode``.
-
-    Notes
-    -----
-    Callers resolve the registry entry once per realization and do not cache it
-    on a node. Registry replacement between realizations is therefore visible;
-    mutation during a realization is unsupported.
-    """
-    try:
-        return _LENS_GEOMETRY_ADAPTERS[lens_model]
-    except KeyError as err:
-        supported = ", ".join(sorted(_LENS_GEOMETRY_ADAPTERS))
-        raise ValueError(
-            "Source-position sampling has no complete pseudo-caustic geometry "
-            f"adapter for Caustics lens model '{lens_model}'. Supported models: "
-            f"{supported}."
-        ) from err
+    """Return the registered realized-adapter factory for a lens model."""
+    return _LENS_GEOMETRY_ADAPTERS[lens_model]
 
 
 class _CausticFOVError(RuntimeError):
@@ -3932,7 +3931,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 geometry_adapter.singular_points(values),
                 dtype=float,
             ).reshape(-1, 2)
-            empty_neighborhoods = _singular_neighborhoods_are_empty(
+            empty_neighborhoods = _recovery_neighborhoods_are_empty(
                 coordinates,
                 singular_points,
                 current_grid_pixelscale,
