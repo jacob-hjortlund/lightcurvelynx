@@ -19,6 +19,7 @@ _RESERVED_LENS_PARAMETERS = {
 }
 _SINGULAR_SEED_POINTS = 256
 _SINGULAR_ROOT_REFINEMENTS = 8
+_INITIAL_FOV_PADDING = 1.1
 
 
 def _validate_lens_configuration(lens_model, lens_parameters):
@@ -694,14 +695,42 @@ class _PointSingularityGeometryAdapter:
             seeds.append(circle[nearest])
         return np.asarray(seeds, dtype=float)
 
+    def reference_num_images(self, values, *args, **kwargs):
+        """
+        Number of images created by the realized lens system for
+        a reference point placed outside the strong lensing region
+        
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Realized values for the lens system.
+        
+        Returns
+        -------
+        int
+            The number of reference images for a source outside the strong-lensing region.
+
+        """
+        return 1
+
     @staticmethod
+    def winding_number(curve, x, y):
+
+        point = np.column_stack([x, y])
+        v  = np.asarray(curve, float) - point
+        v2 = np.roll(v, -1, axis=0)
+        ang = np.arctan2(
+            v[:, 0]*v2[:, 1] - v[:, 1]*v2[:, 0], (v * v2).sum(axis=1)
+        )
+        return int(round(ang.sum() / (2*np.pi)))
+
     def expected_num_images(
+        self,
         source_x,
         source_y,
         *,
         caustic_curves,
         pseudo_caustic_curves,
-        geometry_tolerance,
     ):
         """Count regular images from typed source-boundary containment.
 
@@ -717,40 +746,24 @@ class _PointSingularityGeometryAdapter:
         pseudo_caustic_curves : sequence of numpy.ndarray
             Closed pseudo-caustic curves, each with shape ``(P + 1, 2)`` in
             source-plane arcseconds.
-        geometry_tolerance : float
-            Curve-normalization tolerance in arcseconds.
 
         Returns
         -------
         int
             Expected number of regular images for the source position.
 
-        Raises
-        ------
-        ImportError
-            If the optional Shapely dependency is unavailable.
-        RuntimeError
-            If a boundary collapses or cannot form a positive-area polygonal
-            region during LightCurveLynx-owned geometry normalization.
-
         Notes
         -----
-        The count starts at one, gains two for each containing true-caustic
-        region, and gains one for each containing pseudo-caustic region.
-        Boundary types remain distinct.
+        The count starts at the number of images given by a reference point outside
+        the true- / pseudo-caustics. The count gains two for each true-caustic winding,
+        and gains one for each pseudo-caustic winding.
         """
-        shapely = _import_shapely()
-        true_regions = _boundary_regions(
-            caustic_curves,
-            geometry_tolerance=geometry_tolerance,
-        )
-        pseudo_regions = _boundary_regions(
-            pseudo_caustic_curves,
-            geometry_tolerance=geometry_tolerance,
-        )
-        count = 1
-        count += 2 * sum(bool(shapely.contains_xy(region, source_x, source_y)) for region in true_regions)
-        count += sum(bool(shapely.contains_xy(region, source_x, source_y)) for region in pseudo_regions)
+        count = self.reference_num_images
+        for curve in caustic_curves:
+            count += 2 * self.winding_number(curve, source_x, source_y)
+        for curve in pseudo_caustic_curves:
+            count += self.winding_number(curve, source_x, source_y)
+
         return count
 
     def pseudo_caustics(
@@ -838,9 +851,6 @@ class _PointSingularityGeometryAdapter:
                 )
 
         return pseudo_caustics
-
-
-_INITIAL_FOV_PADDING = 1.1
 
 
 def _positive_lens_parameter(values, name):
