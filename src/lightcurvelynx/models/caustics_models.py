@@ -1410,7 +1410,7 @@ def _boundary_regions(curves, *, geometry_tolerance):
     regions = []
     for boundary_index, curve in enumerate(curves):
         coordinates = _close_curve(curve, tolerance=geometry_tolerance)
-        region = shapely.make_valid(shapely.Polygon(coordinates))
+        region = shapely.make_valid(shapely.Polygon(coordinates), method='structure')
         area = float(region.area)
         if region.is_empty or not np.isfinite(area) or area <= 0.0:
             raise RuntimeError(
@@ -1696,7 +1696,7 @@ def _build_strong_lensing_region(
     )
 
     region = shapely.union_all(enclosed_regions, grid_size=geometry_tolerance)
-    region = shapely.make_valid(region)
+    region = shapely.make_valid(region, method='structure')
     area = float(region.area)
     if region.is_empty or not np.isfinite(area) or area <= 0.0:
         raise RuntimeError("The strong-lensing region has no finite positive area.")
