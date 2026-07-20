@@ -1,7 +1,11 @@
 """Caustics-backed nodes for strong-lens image configurations."""
 
+import keyword
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import hypot
+from numbers import Real
+from types import MappingProxyType
 
 import numpy as np
 from citation_compass import CiteClass
@@ -9,7 +13,12 @@ from scipy.optimize import linear_sum_assignment
 
 from lightcurvelynx.base_models import FunctionNode
 
-__all__ = ["CausticsLensImageNode", "CausticsSourcePositionNode"]
+__all__ = [
+    "CausticsLensImageNode",
+    "CausticsLensSpec",
+    "CausticsSinglePlaneSpec",
+    "CausticsSourcePositionNode",
+]
 
 _RESERVED_LENS_PARAMETERS = {
     "cosmology",
@@ -17,6 +26,431 @@ _RESERVED_LENS_PARAMETERS = {
     "z_l",
     "z_s",
 }
+_RESERVED_LENS_SPEC_FIELDS = _RESERVED_LENS_PARAMETERS | {"lenses"}
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class _LensFieldSchema:
+    default: object = _MISSING
+    kind: str = "finite"
+
+
+@dataclass(frozen=True)
+class _LensModelSchema:
+    model: str
+    fields: Mapping[str, _LensFieldSchema]
+    always_required: tuple[str, ...]
+    selector_branches: Mapping[str, Mapping[object, tuple[str, ...]]]
+    mutually_exclusive_fields: Mapping[str, tuple[str, ...]]
+    affine: bool = False
+
+
+_LENS_MODEL_SCHEMAS = MappingProxyType(
+    {
+        "SIS": _LensModelSchema(
+            model="SIS",
+            fields=MappingProxyType(
+                {
+                    "x0": _LensFieldSchema(),
+                    "y0": _LensFieldSchema(),
+                    "Rein": _LensFieldSchema(kind="positive"),
+                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
+                }
+            ),
+            always_required=("x0", "y0", "Rein"),
+            selector_branches=MappingProxyType({}),
+            mutually_exclusive_fields=MappingProxyType({}),
+        ),
+        "SIE": _LensModelSchema(
+            model="SIE",
+            fields=MappingProxyType(
+                {
+                    "x0": _LensFieldSchema(),
+                    "y0": _LensFieldSchema(),
+                    "q": _LensFieldSchema(kind="q"),
+                    "phi": _LensFieldSchema(),
+                    "Rein": _LensFieldSchema(kind="positive"),
+                    "parametrization": _LensFieldSchema(default="Rein", kind="selector"),
+                    "sigma_v": _LensFieldSchema(kind="positive"),
+                    "angle_system": _LensFieldSchema(default="q_phi", kind="selector"),
+                    "e1": _LensFieldSchema(kind="ellipticity_pair"),
+                    "e2": _LensFieldSchema(kind="ellipticity_pair"),
+                    "c1": _LensFieldSchema(),
+                    "c2": _LensFieldSchema(),
+                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
+                }
+            ),
+            always_required=("x0", "y0"),
+            selector_branches=MappingProxyType(
+                {
+                    "parametrization": MappingProxyType(
+                        {
+                            "Rein": ("Rein",),
+                            "velocity_dispersion": ("sigma_v",),
+                        }
+                    ),
+                    "angle_system": MappingProxyType(
+                        {
+                            "q_phi": ("q", "phi"),
+                            "e1_e2": ("e1", "e2"),
+                            "c1_c2": ("c1", "c2"),
+                        }
+                    ),
+                }
+            ),
+            mutually_exclusive_fields=MappingProxyType(
+                {
+                    "parametrization": ("Rein", "sigma_v"),
+                    "angle_system": ("q", "phi", "e1", "e2", "c1", "c2"),
+                }
+            ),
+        ),
+        "EPL": _LensModelSchema(
+            model="EPL",
+            fields=MappingProxyType(
+                {
+                    "x0": _LensFieldSchema(),
+                    "y0": _LensFieldSchema(),
+                    "q": _LensFieldSchema(kind="q"),
+                    "phi": _LensFieldSchema(),
+                    "e1": _LensFieldSchema(kind="ellipticity_pair"),
+                    "e2": _LensFieldSchema(kind="ellipticity_pair"),
+                    "c1": _LensFieldSchema(),
+                    "c2": _LensFieldSchema(),
+                    "Rein": _LensFieldSchema(kind="positive"),
+                    "t": _LensFieldSchema(kind="t"),
+                    "angle_system": _LensFieldSchema(default="q_phi", kind="selector"),
+                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
+                    "n_iter": _LensFieldSchema(default=18, kind="positive_int"),
+                    "chunk_size": _LensFieldSchema(default=None, kind="chunk_size"),
+                }
+            ),
+            always_required=("x0", "y0", "Rein", "t"),
+            selector_branches=MappingProxyType(
+                {
+                    "angle_system": MappingProxyType(
+                        {
+                            "q_phi": ("q", "phi"),
+                            "e1_e2": ("e1", "e2"),
+                            "c1_c2": ("c1", "c2"),
+                        }
+                    )
+                }
+            ),
+            mutually_exclusive_fields=MappingProxyType(
+                {"angle_system": ("q", "phi", "e1", "e2", "c1", "c2")}
+            ),
+        ),
+        "NFW": _LensModelSchema(
+            model="NFW",
+            fields=MappingProxyType(
+                {
+                    "x0": _LensFieldSchema(),
+                    "y0": _LensFieldSchema(),
+                    "mass": _LensFieldSchema(kind="positive"),
+                    "c": _LensFieldSchema(kind="positive"),
+                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
+                }
+            ),
+            always_required=("x0", "y0", "mass", "c"),
+            selector_branches=MappingProxyType({}),
+            mutually_exclusive_fields=MappingProxyType({}),
+        ),
+        "TNFW": _LensModelSchema(
+            model="TNFW",
+            fields=MappingProxyType(
+                {
+                    "x0": _LensFieldSchema(),
+                    "y0": _LensFieldSchema(),
+                    "mass": _LensFieldSchema(kind="positive"),
+                    "Rs": _LensFieldSchema(kind="positive"),
+                    "tau": _LensFieldSchema(kind="positive"),
+                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
+                    "interpret_m_total_mass": _LensFieldSchema(default=True, kind="bool"),
+                }
+            ),
+            always_required=("x0", "y0", "mass", "Rs", "tau"),
+            selector_branches=MappingProxyType({}),
+            mutually_exclusive_fields=MappingProxyType({}),
+        ),
+        "PseudoJaffe": _LensModelSchema(
+            model="PseudoJaffe",
+            fields=MappingProxyType(
+                {
+                    "x0": _LensFieldSchema(),
+                    "y0": _LensFieldSchema(),
+                    "mass": _LensFieldSchema(kind="positive"),
+                    "Rc": _LensFieldSchema(kind="positive"),
+                    "Rs": _LensFieldSchema(kind="positive"),
+                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
+                }
+            ),
+            always_required=("x0", "y0", "mass", "Rc", "Rs"),
+            selector_branches=MappingProxyType({}),
+            mutually_exclusive_fields=MappingProxyType({}),
+        ),
+        "ExternalShear": _LensModelSchema(
+            model="ExternalShear",
+            fields=MappingProxyType(
+                {
+                    "x0": _LensFieldSchema(),
+                    "y0": _LensFieldSchema(),
+                    "gamma_1": _LensFieldSchema(),
+                    "gamma_2": _LensFieldSchema(),
+                    "parametrization": _LensFieldSchema(default="cartesian", kind="selector"),
+                    "gamma": _LensFieldSchema(kind="nonnegative"),
+                    "phi": _LensFieldSchema(),
+                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
+                }
+            ),
+            always_required=("x0", "y0"),
+            selector_branches=MappingProxyType(
+                {
+                    "parametrization": MappingProxyType(
+                        {
+                            "cartesian": ("gamma_1", "gamma_2"),
+                            "angular": ("gamma", "phi"),
+                        }
+                    )
+                }
+            ),
+            mutually_exclusive_fields=MappingProxyType(
+                {"parametrization": ("gamma_1", "gamma_2", "gamma", "phi")}
+            ),
+            affine=True,
+        ),
+        "MassSheet": _LensModelSchema(
+            model="MassSheet",
+            fields=MappingProxyType(
+                {
+                    "x0": _LensFieldSchema(),
+                    "y0": _LensFieldSchema(),
+                    "kappa": _LensFieldSchema(),
+                }
+            ),
+            always_required=("x0", "y0", "kappa"),
+            selector_branches=MappingProxyType({}),
+            mutually_exclusive_fields=MappingProxyType({}),
+            affine=True,
+        ),
+    }
+)
+
+
+def _snapshot_string_mapping(name, mapping):
+    if not isinstance(mapping, Mapping):
+        raise TypeError(f"{name} must be a mapping.")
+    snapshot = dict(mapping)
+    if any(not isinstance(key, str) for key in snapshot):
+        raise TypeError(f"{name} keys must be strings.")
+    return snapshot
+
+
+def _get_lens_model_schema(model):
+    if not isinstance(model, str) or not model:
+        raise TypeError("model must be a non-empty string.")
+    try:
+        return _LENS_MODEL_SCHEMAS[model]
+    except KeyError as err:
+        raise ValueError(f"Unregistered Caustics lens model {model!r}.") from err
+
+
+def _validate_option_literal(name, value):
+    if value is None or isinstance(value, (str, bool, np.bool_, Real)):
+        return
+    if isinstance(value, tuple):
+        for index, item in enumerate(value):
+            _validate_option_literal(f"{name}[{index}]", item)
+        return
+    raise TypeError(f"{name} must be a recursively immutable literal value.")
+
+
+def _validate_finite(name, value):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real scalar excluding booleans.")
+    if not -np.inf < value < np.inf:
+        raise ValueError(f"{name} must be finite.")
+    return value
+
+
+def _validate_field_value(schema, name, value):
+    field = schema.fields[name]
+    if field.kind in {"finite", "positive", "nonnegative", "q", "t", "ellipticity_pair"}:
+        normalized = _validate_finite(name, value)
+        if field.kind == "positive" and normalized <= 0:
+            raise ValueError(f"{name} must be positive.")
+        if field.kind == "nonnegative" and normalized < 0:
+            raise ValueError(f"{name} must be nonnegative.")
+        if field.kind == "q" and not 0 < normalized <= 1:
+            raise ValueError(f"{name} must satisfy 0 < {name} <= 1.")
+        if field.kind == "t" and not 0 < normalized < 2:
+            raise ValueError(f"{name} must satisfy 0 < {name} < 2.")
+        return normalized
+    if field.kind == "positive_int":
+        if isinstance(value, (bool, np.bool_)) or (
+            type(value) is not int and not isinstance(value, np.integer)
+        ):
+            raise TypeError(f"{name} must be an integer excluding booleans.")
+        if value < 1:
+            raise ValueError(f"{name} must be at least 1.")
+        return value
+    if field.kind == "chunk_size":
+        if value is None:
+            return None
+        if isinstance(value, (bool, np.bool_)) or (
+            type(value) is not int and not isinstance(value, np.integer)
+        ):
+            raise TypeError(f"{name} must be None or an integer excluding booleans.")
+        if value != 1:
+            raise ValueError(f"{name} must be None or the integer 1.")
+        return value
+    if field.kind == "bool":
+        if not isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{name} must be a boolean.")
+        return bool(value)
+    if field.kind == "selector":
+        branches = schema.selector_branches[name]
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a string selector.")
+        if value not in branches:
+            choices = ", ".join(repr(choice) for choice in branches)
+            raise ValueError(f"{name} must be one of {choices}.")
+        return value
+
+
+def _validate_ellipticity_pair(schema, values):
+    pair = tuple(name for name, field in schema.fields.items() if field.kind == "ellipticity_pair")
+    if pair and all(name in values for name in pair):
+        first, second = pair
+        first_value = values[first]
+        second_value = values[second]
+        if abs(first_value) >= 1 or abs(second_value) >= 1 or hypot(first_value, second_value) >= 1:
+            raise ValueError(f"{first} and {second} must satisfy hypot({first}, {second}) < 1.")
+
+
+def _validate_pseudo_jaffe_radii(schema, values):
+    if schema.model == "PseudoJaffe" and "Rc" in values and "Rs" in values and values["Rc"] >= values["Rs"]:
+        raise ValueError("PseudoJaffe requires Rc < Rs.")
+
+
+def _validate_selector_fields(schema, values):
+    for selector, branches in schema.selector_branches.items():
+        selected = values[selector]
+        active_fields = branches[selected]
+        missing = tuple(name for name in active_fields if name not in values)
+        if missing:
+            names = ", ".join(missing)
+            raise ValueError(f"{schema.model} selector {selector}={selected!r} requires: {names}.")
+        inactive_fields = set(schema.mutually_exclusive_fields[selector]).difference(active_fields)
+        supplied_inactive = tuple(name for name in inactive_fields if name in values)
+        if supplied_inactive:
+            names = ", ".join(sorted(supplied_inactive))
+            raise ValueError(f"{schema.model} selector {selector}={selected!r} does not accept: {names}.")
+
+
+def _validate_realized_fields(schema, values):
+    unknown = tuple(name for name in values if name not in schema.fields)
+    if unknown:
+        names = ", ".join(unknown)
+        raise ValueError(f"Unknown {schema.model} field(s): {names}.")
+    missing = tuple(name for name in schema.always_required if name not in values)
+    if missing:
+        names = ", ".join(missing)
+        raise ValueError(f"Missing required {schema.model} field(s): {names}.")
+    for name in schema.fields:
+        if name in values:
+            values[name] = _validate_field_value(schema, name, values[name])
+    _validate_selector_fields(schema, values)
+    _validate_ellipticity_pair(schema, values)
+    _validate_pseudo_jaffe_radii(schema, values)
+
+
+def _validate_spec_fields(schema, parameters, options):
+    supplied = set(parameters).union(options)
+    reserved = _RESERVED_LENS_SPEC_FIELDS.intersection(supplied)
+    if reserved:
+        names = ", ".join(sorted(reserved))
+        raise ValueError(f"Reserved lens field name(s): {names}.")
+    unknown = supplied.difference(schema.fields)
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"Unknown {schema.model} field(s): {names}.")
+    missing = set(schema.always_required).difference(supplied)
+    if missing:
+        names = ", ".join(name for name in schema.always_required if name in missing)
+        raise ValueError(f"Missing required {schema.model} field(s): {names}.")
+
+    for name, value in options.items():
+        _validate_field_value(schema, name, value)
+
+    fixed_options = {name: value for name, value in options.items() if name not in parameters}
+    _validate_ellipticity_pair(schema, fixed_options)
+    _validate_pseudo_jaffe_radii(schema, fixed_options)
+
+    for selector, branches in schema.selector_branches.items():
+        if selector in parameters:
+            continue
+        selected = options.get(selector, schema.fields[selector].default)
+        selected = _validate_field_value(schema, selector, selected)
+        active_fields = branches[selected]
+        missing = tuple(name for name in active_fields if name not in supplied)
+        if missing:
+            names = ", ".join(missing)
+            raise ValueError(f"{schema.model} selector {selector}={selected!r} requires: {names}.")
+        inactive_fields = set(schema.mutually_exclusive_fields[selector]).difference(active_fields)
+        supplied_inactive = tuple(name for name in inactive_fields if name in supplied)
+        if supplied_inactive:
+            names = ", ".join(sorted(supplied_inactive))
+            raise ValueError(f"{schema.model} selector {selector}={selected!r} does not accept: {names}.")
+
+
+def _realize_component_values(schema, parameter_values, options):
+    values = {name: field.default for name, field in schema.fields.items() if field.default is not _MISSING}
+    values.update(options)
+    values.update(parameter_values)
+    _validate_realized_fields(schema, values)
+    return MappingProxyType(values)
+
+
+@dataclass(frozen=True, init=False)
+class CausticsLensSpec:
+    """Immutable specification of one registered Caustics lens component."""
+
+    model: str
+    parameters: Mapping[str, object]
+    options: Mapping[str, object]
+
+    def __init__(self, model, parameters, options=None):
+        schema = _get_lens_model_schema(model)
+        parameter_snapshot = _snapshot_string_mapping("parameters", parameters)
+        option_snapshot = _snapshot_string_mapping("options", {} if options is None else options)
+        for name, value in option_snapshot.items():
+            _validate_option_literal(f"options[{name!r}]", value)
+        _validate_spec_fields(schema, parameter_snapshot, option_snapshot)
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "parameters", MappingProxyType(parameter_snapshot))
+        object.__setattr__(self, "options", MappingProxyType(option_snapshot))
+
+
+@dataclass(frozen=True, init=False)
+class CausticsSinglePlaneSpec:
+    """Immutable ordered collection of lens components on one plane."""
+
+    components: Mapping[str, CausticsLensSpec]
+
+    def __init__(self, components):
+        component_snapshot = _snapshot_string_mapping("components", components)
+        if not component_snapshot:
+            raise ValueError("CausticsSinglePlaneSpec components must be nonempty.")
+        for name, component in component_snapshot.items():
+            if not name.isidentifier() or keyword.iskeyword(name):
+                raise ValueError(f"Component name {name!r} must be a non-keyword Python identifier.")
+            if not isinstance(component, CausticsLensSpec):
+                raise TypeError(f"Component {name!r} must be a CausticsLensSpec.")
+        object.__setattr__(self, "components", MappingProxyType(component_snapshot))
+
+
 _SINGULAR_SEED_POINTS = 256
 _SINGULAR_ROOT_REFINEMENTS = 8
 _INITIAL_FOV_PADDING = 1.1
@@ -84,6 +518,7 @@ def _import_caustics_dependencies():
     """
     try:
         import torch
+
         torch.set_default_dtype(torch.float64)
         import caustics
     except ImportError as err:  # pragma: no cover
