@@ -1374,89 +1374,6 @@ def _close_curve(curve, *, tolerance):
     return coordinates
 
 
-def _extract_polygonal_geometry(geometry):
-    """Retain every polygonal part of a repaired Shapely geometry.
-
-    Parameters
-    ----------
-    geometry : shapely.Geometry
-        Geometry returned by a Shapely construction or validity-repair
-        operation.
-
-    Returns
-    -------
-    shapely.Polygon or shapely.MultiPolygon or shapely.GeometryCollection
-        All polygonal components, merged without replacing concavities or holes.
-        An empty input returns an empty ``GeometryCollection``.
-
-    Raises
-    ------
-    RuntimeError
-        If a non-empty point or line component remains after validity repair,
-        or if merging polygonal components produces a non-polygonal result.
-
-    Notes
-    -----
-    Rejecting non-polygonal remnants is deliberately conservative. Such parts
-    can indicate collapsed or ambiguous input linework, which must not silently
-    reduce the inferred strong-lensing cross-section.
-    """
-    shapely = _import_shapely()
-    if geometry.is_empty:
-        return shapely.GeometryCollection()
-    if geometry.geom_type == "Polygon":
-        return geometry
-    if geometry.geom_type == "MultiPolygon":
-        return geometry
-
-    polygons = []
-    non_polygonal_types = []
-
-    def collect_parts(current_geometry):
-        """Collect polygonal leaves from one Shapely geometry.
-
-        Parameters
-        ----------
-        current_geometry : shapely.Geometry
-            Geometry or nested geometry collection to inspect.
-
-        Returns
-        -------
-        None
-            Results are recorded in the enclosing closure.
-
-        Notes
-        -----
-        Empty parts are ignored. Recursive traversal mutates the enclosing
-        ``polygons`` and ``non_polygonal_types`` lists; this nested helper
-        is not a public geometry API.
-        """
-        if current_geometry.is_empty:
-            return
-        if current_geometry.geom_type == "Polygon":
-            polygons.append(current_geometry)
-        elif current_geometry.geom_type in {"MultiPolygon", "GeometryCollection"}:
-            for part in current_geometry.geoms:
-                collect_parts(part)
-        else:
-            non_polygonal_types.append(current_geometry.geom_type)
-
-    collect_parts(geometry)
-    if non_polygonal_types:
-        names = ", ".join(sorted(set(non_polygonal_types)))
-        raise RuntimeError(f"Validity repair left non-polygonal caustic geometry component(s): {names}.")
-    if not polygons:
-        return shapely.GeometryCollection()
-
-    polygonal_geometry = shapely.union_all(polygons)
-    if polygonal_geometry.geom_type not in {"Polygon", "MultiPolygon"}:
-        raise RuntimeError(
-            "Expected polygonal geometry after merging repaired components, got "
-            f"{polygonal_geometry.geom_type}."
-        )
-    return polygonal_geometry
-
-
 def _boundary_regions(curves, *, geometry_tolerance):
     """Convert typed source-boundary curves to polygonal regions.
 
@@ -1493,7 +1410,7 @@ def _boundary_regions(curves, *, geometry_tolerance):
     regions = []
     for boundary_index, curve in enumerate(curves):
         coordinates = _close_curve(curve, tolerance=geometry_tolerance)
-        region = _extract_polygonal_geometry(shapely.make_valid(shapely.Polygon(coordinates)))
+        region = shapely.make_valid(shapely.Polygon(coordinates))
         area = float(region.area)
         if region.is_empty or not np.isfinite(area) or area <= 0.0:
             raise RuntimeError(
@@ -1780,7 +1697,6 @@ def _build_strong_lensing_region(
 
     region = shapely.union_all(enclosed_regions, grid_size=geometry_tolerance)
     region = shapely.make_valid(region)
-    region = _extract_polygonal_geometry(region)
     area = float(region.area)
     if region.is_empty or not np.isfinite(area) or area <= 0.0:
         raise RuntimeError("The strong-lensing region has no finite positive area.")
