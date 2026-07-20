@@ -729,6 +729,7 @@ class _PointSingularityGeometryAdapter:
         source_x,
         source_y,
         *,
+        values,
         caustic_curves,
         pseudo_caustic_curves,
     ):
@@ -758,7 +759,7 @@ class _PointSingularityGeometryAdapter:
         the true- / pseudo-caustics. The count gains two for each true-caustic winding,
         and gains one for each pseudo-caustic winding.
         """
-        count = self.reference_num_images
+        count = self.reference_num_images(values)
         for curve in caustic_curves:
             count += 2 * self.winding_number(curve, source_x, source_y)
         for curve in pseudo_caustic_curves:
@@ -2664,16 +2665,16 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             previous_count = geometry_adapter.expected_num_images(
                 source_x[sample_index],
                 source_y[sample_index],
+                values=values,
                 caustic_curves=previous_geometry.caustic_curves,
                 pseudo_caustic_curves=previous_geometry.pseudo_caustic_curves,
-                geometry_tolerance=self.geometry_tolerance,
             )
             final_count = geometry_adapter.expected_num_images(
                 source_x[sample_index],
                 source_y[sample_index],
+                values=values,
                 caustic_curves=geometry.caustic_curves,
                 pseudo_caustic_curves=geometry.pseudo_caustic_curves,
-                geometry_tolerance=self.geometry_tolerance,
             )
             clearance = _source_boundary_clearance(
                 source_x[sample_index],
