@@ -1381,6 +1381,84 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
         return tuple(generators)
 
 
+def _trace_pseudo_caustics(
+    lens,
+    geometry_adapter,
+    values,
+    *,
+    num_points,
+    epsilon,
+    geometry_tolerance,
+):
+    """Trace every registered pseudo-caustic through the total lens.
+
+    Parameters
+    ----------
+    lens : object
+        Realized total Caustics lens implementing ``raytrace(x, y)``.
+    geometry_adapter : _GeometryAdapter
+        Realized total-lens adapter supplying ordered component-owned loop
+        generators.
+    values : Mapping
+        Numeric inputs for the same total-lens realization.
+    num_points : int
+        Number of unique, evenly spaced vertices on each image-plane loop.
+    epsilon : float
+        Initial loop radius in image-plane arcseconds before any
+        generator-owned cap is applied.
+    geometry_tolerance : float
+        Maximum allowed pointwise source-plane change, in arcseconds,
+        between successive loop refinements.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        One closed source-plane boundary per registered generator, in
+        generator order. Each array has shape ``(num_points + 1, 2)`` in
+        arcseconds, with the first vertex repeated at the end.
+
+    Raises
+    ------
+    RuntimeError
+        If a shrinking-loop sequence does not converge within 32
+        refinements.
+
+    Notes
+    -----
+    Every loop is mapped through ``lens`` rather than through its owning
+    component. Increasing-angle producer order is retained in the returned
+    source-plane boundary.
+    """
+    angles = 2.0 * np.pi * np.arange(num_points) / num_points
+    directions = np.column_stack((np.cos(angles), np.sin(angles)))
+    pseudo_caustics = []
+
+    for generator in geometry_adapter.pseudo_caustic_generators(values):
+        center = np.asarray(generator.center, dtype=float)
+        if generator.max_initial_radius is None:
+            radius = epsilon
+        else:
+            radius = min(epsilon, generator.max_initial_radius)
+        previous_curve = _raytrace_curve(lens, center + radius * directions)
+        last_change = np.inf
+
+        for _ in range(32):
+            radius *= 0.5
+            current_curve = _raytrace_curve(lens, center + radius * directions)
+            last_change = float(np.max(np.linalg.norm(current_curve - previous_curve, axis=1)))
+            if last_change <= geometry_tolerance:
+                pseudo_caustics.append(np.concatenate((current_curve, current_curve[:1]), axis=0))
+                break
+            previous_curve = current_curve
+        else:
+            raise RuntimeError(
+                "Pseudo-caustic extraction did not converge after 32 refinements; "
+                f"final boundary change was {last_change} arcsec."
+            )
+
+    return tuple(pseudo_caustics)
+
+
 def _caustics_scalar(value):
     """Convert one scalar Caustics tensor to an immutable Python float."""
     return float(np.asarray(_to_numpy(value)).item())
@@ -1834,7 +1912,7 @@ def _find_all_caustics(
     fov,
     pixelscale,
     geometry_tolerance,
-    singular_points=(),
+    jacobian_mask_points=(),
 ):
     """Locate all complete critical curves and map them into the source plane.
 
@@ -1856,10 +1934,10 @@ def _find_all_caustics(
     geometry_tolerance : float
         Maximum allowed endpoint gap for a mapped source-plane caustic, in
         arcseconds.
-    singular_points : iterable of tuple of float, optional
-        Image-plane singular locations in arcseconds. One grid-spacing radius
-        around each point is masked so a discontinuity is not misidentified as
-        a true critical curve.
+    jacobian_mask_points : iterable of tuple of float, optional
+        Image-plane locations in arcseconds requiring a one-grid-spacing
+        determinant mask so a discontinuity is not misidentified as a true
+        critical curve.
 
     Returns
     -------
@@ -1886,9 +1964,9 @@ def _find_all_caustics(
     The interval count is rounded up to an even value, so the actual grid
     spacing is no larger than the requested ``pixelscale``. Caustics
     Jacobian types, shapes, and finiteness are trusted except at registered
-    physical singularities: non-finite determinant samples and a one-spacing
-    neighborhood around each singular point are deliberately masked as part of
-    critical-curve extraction. The post-mask grid and outer-boundary
+    Jacobian mask points: non-finite determinant samples and a one-spacing
+    neighborhood around each registered point are deliberately masked as part
+    of critical-curve extraction. The post-mask grid and outer-boundary
     non-emptiness checks remain algorithmic completeness guards. ContourPy
     output is independently validated.
     """
@@ -1921,9 +1999,9 @@ def _find_all_caustics(
     x_coordinates = _to_numpy(x_axis)
     y_coordinates = _to_numpy(y_axis)
     invalid = ~np.isfinite(determinant)
-    for singular_x, singular_y in singular_points:
-        squared_distance = (x_coordinates[np.newaxis, :] - singular_x) ** 2 + (
-            y_coordinates[:, np.newaxis] - singular_y
+    for mask_x, mask_y in jacobian_mask_points:
+        squared_distance = (x_coordinates[np.newaxis, :] - mask_x) ** 2 + (
+            y_coordinates[:, np.newaxis] - mask_y
         ) ** 2
         invalid |= squared_distance <= actual_pixelscale**2
 
@@ -2104,8 +2182,64 @@ def _close_curve(curve, *, tolerance):
     return coordinates
 
 
+def _resample_closed_curve(curve, num_points=64):
+    """Resample a normalized closed curve at equal arclength intervals.
+
+    Parameters
+    ----------
+    curve : numpy.ndarray, shape (N, 2)
+        Normalized source-plane boundary whose last vertex exactly repeats its
+        first.
+    num_points : int, optional
+        Number of unique equally spaced points to return.
+
+    Returns
+    -------
+    numpy.ndarray, shape (num_points, 2)
+        Source-plane coordinates sampled without repeating the endpoint.
+    """
+    coordinates = np.asarray(curve, dtype=float)
+    segment_lengths = np.linalg.norm(np.diff(coordinates, axis=0), axis=1)
+    cumulative_arclength = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    sample_arclength = np.linspace(
+        0.0,
+        cumulative_arclength[-1],
+        num_points,
+        endpoint=False,
+    )
+    return np.column_stack(
+        (
+            np.interp(sample_arclength, cumulative_arclength, coordinates[:, 0]),
+            np.interp(sample_arclength, cumulative_arclength, coordinates[:, 1]),
+        )
+    )
+
+
+def _curve_orientation_is_preserved(reference, candidate):
+    """Return whether a matched curve retains its producer direction."""
+    reference_points = _resample_closed_curve(reference)
+    candidate_points = _resample_closed_curve(candidate)
+
+    def minimum_cyclic_distance(points):
+        return min(
+            float(
+                np.mean(
+                    np.sum(
+                        (reference_points - np.roll(points, shift, axis=0)) ** 2,
+                        axis=1,
+                    )
+                )
+            )
+            for shift in range(len(points))
+        )
+
+    forward_distance = minimum_cyclic_distance(candidate_points)
+    reverse_distance = minimum_cyclic_distance(candidate_points[::-1])
+    return forward_distance <= reverse_distance
+
+
 def _boundary_regions(curves, *, geometry_tolerance):
-    """Convert typed source-boundary curves to polygonal regions.
+    """Convert typed source-boundary curves to repaired regions.
 
     Parameters
     ----------
@@ -2117,18 +2251,17 @@ def _boundary_regions(curves, *, geometry_tolerance):
 
     Returns
     -------
-    tuple of shapely.Polygon or shapely.MultiPolygon
-        Repaired finite positive-area polygonal region corresponding to each
-        input curve, in input order.
+    tuple of shapely geometry
+        Repaired finite positive-area region corresponding to each input curve,
+        in input order.
 
     Raises
     ------
     ImportError
         If the optional Shapely dependency is unavailable.
     RuntimeError
-        If curve normalization collapses a boundary, validity repair leaves
-        non-polygonal geometry, or a repaired region is empty, non-finite, or
-        has non-positive area.
+        If curve normalization collapses a boundary or a repaired region is
+        empty, non-finite, or has non-positive area.
 
     Notes
     -----
@@ -2140,7 +2273,7 @@ def _boundary_regions(curves, *, geometry_tolerance):
     regions = []
     for boundary_index, curve in enumerate(curves):
         coordinates = _close_curve(curve, tolerance=geometry_tolerance)
-        region = shapely.make_valid(shapely.Polygon(coordinates), method='structure')
+        region = shapely.make_valid(shapely.Polygon(coordinates), method="structure")
         area = float(region.area)
         if region.is_empty or not np.isfinite(area) or area <= 0.0:
             raise RuntimeError(
@@ -2174,6 +2307,10 @@ def _match_boundary_curves(reference_curves, candidate_curves, *, geometry_toler
     counts_stable : bool
         Whether the two typed sets have equal counts. Two empty sequences are
         stable.
+    orientation_stable : bool
+        Whether every assigned candidate retains its reference producer
+        direction. Unequal counts are unstable; two empty sequences are
+        stable.
 
     Raises
     ------
@@ -2183,16 +2320,14 @@ def _match_boundary_curves(reference_curves, candidate_curves, *, geometry_toler
         If normalization collapses a curve below three unique vertices.
     """
     if len(reference_curves) != len(candidate_curves):
-        return tuple(candidate_curves), np.inf, False
+        return tuple(candidate_curves), np.inf, False, False
     if not reference_curves:
-        return (), 0.0, True
+        return (), 0.0, True, True
     shapely = _import_shapely()
-    reference_lines = [
-        shapely.LineString(_close_curve(curve, tolerance=geometry_tolerance)) for curve in reference_curves
-    ]
-    candidate_lines = [
-        shapely.LineString(_close_curve(curve, tolerance=geometry_tolerance)) for curve in candidate_curves
-    ]
+    reference_coordinates = [_close_curve(curve, tolerance=geometry_tolerance) for curve in reference_curves]
+    candidate_coordinates = [_close_curve(curve, tolerance=geometry_tolerance) for curve in candidate_curves]
+    reference_lines = [shapely.LineString(coordinates) for coordinates in reference_coordinates]
+    candidate_lines = [shapely.LineString(coordinates) for coordinates in candidate_coordinates]
     costs = np.array(
         [
             [float(reference.hausdorff_distance(candidate)) for candidate in candidate_lines]
@@ -2203,7 +2338,14 @@ def _match_boundary_curves(reference_curves, candidate_curves, *, geometry_toler
     assignment = dict(zip(rows.tolist(), columns.tolist(), strict=True))
     ordered = tuple(candidate_curves[assignment[index]] for index in range(len(reference_curves)))
     displacement = max(float(costs[index, assignment[index]]) for index in range(len(reference_curves)))
-    return ordered, displacement, True
+    orientation_stable = all(
+        _curve_orientation_is_preserved(
+            reference_coordinates[index],
+            candidate_coordinates[assignment[index]],
+        )
+        for index in range(len(reference_curves))
+    )
+    return ordered, displacement, True, orientation_stable
 
 
 def _boundary_topology_signature(geometry, *, geometry_tolerance):
@@ -2232,8 +2374,7 @@ def _boundary_topology_signature(geometry, *, geometry_tolerance):
     ImportError
         If the optional Shapely dependency is unavailable.
     RuntimeError
-        If a boundary cannot be normalized into positive-area polygonal
-        geometry.
+        If a boundary cannot be normalized into positive-area geometry.
     """
     true_regions = _boundary_regions(
         geometry.caustic_curves,
@@ -2301,19 +2442,27 @@ def _compare_boundary_geometry(previous, current, geometry_tolerance):
     displacement : float
         Maximum true-or-pseudo matched Hausdorff displacement in arcseconds.
     topology_stable : bool
-        Whether typed curve counts and the complete topology signature match.
+        Whether typed curve counts, producer directions, and the complete
+        topology signature match.
 
     Notes
     -----
     Matching never crosses true/pseudo boundary types. Reordered arrays remain
     realization-local and are not cached on a node or across snapshots.
     """
-    caustic_curves, caustic_displacement, caustic_counts_stable = _match_boundary_curves(
-        previous.caustic_curves,
-        current.caustic_curves,
-        geometry_tolerance=geometry_tolerance,
+    caustic_curves, caustic_displacement, caustic_counts_stable, caustic_orientation_stable = (
+        _match_boundary_curves(
+            previous.caustic_curves,
+            current.caustic_curves,
+            geometry_tolerance=geometry_tolerance,
+        )
     )
-    pseudo_caustic_curves, pseudo_displacement, pseudo_counts_stable = _match_boundary_curves(
+    (
+        pseudo_caustic_curves,
+        pseudo_displacement,
+        pseudo_counts_stable,
+        pseudo_orientation_stable,
+    ) = _match_boundary_curves(
         previous.pseudo_caustic_curves,
         current.pseudo_caustic_curves,
         geometry_tolerance=geometry_tolerance,
@@ -2327,12 +2476,18 @@ def _compare_boundary_geometry(previous, current, geometry_tolerance):
     )
     displacement = max(caustic_displacement, pseudo_displacement)
     typed_counts_stable = caustic_counts_stable and pseudo_counts_stable
-    topology_stable = typed_counts_stable and _boundary_topology_signature(
-        previous,
-        geometry_tolerance=geometry_tolerance,
-    ) == _boundary_topology_signature(
-        current,
-        geometry_tolerance=geometry_tolerance,
+    orientation_stable = caustic_orientation_stable and pseudo_orientation_stable
+    topology_stable = (
+        typed_counts_stable
+        and orientation_stable
+        and _boundary_topology_signature(
+            previous,
+            geometry_tolerance=geometry_tolerance,
+        )
+        == _boundary_topology_signature(
+            current,
+            geometry_tolerance=geometry_tolerance,
+        )
     )
     return current, displacement, topology_stable
 
@@ -2395,7 +2550,7 @@ def _build_strong_lensing_region(
 
     Returns
     -------
-    shapely.Polygon or shapely.MultiPolygon
+    shapely geometry
         Valid, finite, positive-area strong-lensing geometry. Disconnected
         components, concavities, and holes are retained.
 
@@ -2404,9 +2559,9 @@ def _build_strong_lensing_region(
     ImportError
         If Shapely is unavailable.
     RuntimeError
-        If normalization or validity repair cannot retain polygonal geometry,
-        or precision snapping, union, and final repair produce an empty,
-        non-finite, or non-positive-area result.
+        If normalization collapses a boundary, or precision snapping, union,
+        and final repair produce an empty, non-finite, or non-positive-area
+        result.
 
     Notes
     -----
@@ -2426,7 +2581,7 @@ def _build_strong_lensing_region(
     )
 
     region = shapely.union_all(enclosed_regions, grid_size=geometry_tolerance)
-    region = shapely.make_valid(region, method='structure')
+    region = shapely.make_valid(region, method="structure")
     area = float(region.area)
     if region.is_empty or not np.isfinite(area) or area <= 0.0:
         raise RuntimeError("The strong-lensing region has no finite positive area.")
