@@ -1,10 +1,10 @@
 """Caustics-backed lens specifications and strong-lensing graph nodes.
 
-``CausticsLensSpec`` mirrors one explicitly registered Caustics constructor.
+``CausticsLensSpec`` describes one explicitly registered Caustics constructor.
 Its parameters become graph inputs, except that a ``SinglePlane`` spec's
-``lenses`` sequence contains nested specifications. The root spec owns its
-cosmology and lens redshift (``z_l``); the consuming node supplies the source
-redshift as ``z_s`` when each sampled lens is realized.
+``lenses`` sequence contains nested specifications. The root spec owns its lens
+redshift (``z_l``); the consuming node owns the fixed cosmology and supplies
+sampled source redshift as ``z_s`` when each lens is realized.
 """
 
 import inspect
@@ -27,7 +27,8 @@ __all__ = [
     "CausticsSourcePositionNode",
 ]
 
-_INHERITED_LENS_PARAMETERS = {"cosmology", "z_l"}
+_REALIZATION_SUPPLIED_LENS_PARAMETERS = {"cosmology", "z_l"}
+_ROOT_LENS_PARAMETERS = {"z_l"}
 
 
 def _is_required_parameter(parameter):
@@ -55,9 +56,10 @@ class CausticsLensSpec:
     model : str
         Explicit registry key, including ``SinglePlane`` for a composition.
     parameters : Mapping[str, object]
-        Constructor arguments. Values remain graph dependencies. For
-        ``SinglePlane``, ``lenses`` is a sequence of nested lens specs rather
-        than a graph input.
+        Constructor arguments other than the node-owned ``cosmology`` and
+        ``z_s``. Values remain graph dependencies. For ``SinglePlane``,
+        ``lenses`` is a sequence of nested lens specs rather than a graph
+        input.
 
     Attributes
     ----------
@@ -69,10 +71,12 @@ class CausticsLensSpec:
     Notes
     -----
     Validation is deliberately structural: the model must be registered,
-    required constructor arguments must be available here or inherited from a
-    parent plane, and explicit parameter names must occur in the constructor
-    signature. Realized parameter values are passed to Caustics without local
-    physical-domain validation.
+    required constructor arguments must be available here, supplied by the
+    consuming node, or inherited from a parent plane, and explicit parameter
+    names must occur in the constructor signature. Realized parameter values
+    are passed to Caustics without local physical-domain validation.
+    The root specification defines ``z_l``; nested specifications inherit it
+    and must omit it. The consuming node supplies ``cosmology`` and ``z_s``.
     """
 
     model: str
@@ -84,6 +88,8 @@ class CausticsLensSpec:
         parameter_snapshot = dict(parameters)
         if any(not isinstance(name, str) for name in parameter_snapshot):
             raise TypeError("parameters keys must be strings.")
+        if "cosmology" in parameter_snapshot:
+            raise ValueError("cosmology is supplied by the consuming node.")
         if "z_s" in parameter_snapshot:
             raise ValueError("z_s is supplied by the consuming node as source_redshift.")
 
@@ -105,7 +111,7 @@ class CausticsLensSpec:
             if (
                 _is_required_parameter(parameter)
                 and name not in parameter_snapshot
-                and name not in _INHERITED_LENS_PARAMETERS
+                and name not in _REALIZATION_SUPPLIED_LENS_PARAMETERS
             ):
                 raise ValueError(f"{name} is required by the chosen {model} lens model.")
         unsupported = set(parameter_snapshot).difference(supported)
@@ -1196,14 +1202,14 @@ def _lens_spec_is_affine(lens):
 
 
 def _validate_root_lens_spec(lens):
-    missing = _INHERITED_LENS_PARAMETERS.difference(lens.parameters)
+    missing = _ROOT_LENS_PARAMETERS.difference(lens.parameters)
     if missing:
         names = ", ".join(sorted(missing))
         raise ValueError(f"The root lens specification requires: {names}.")
 
     def validate_children(spec):
         for child in spec.parameters.get("lenses", ()):
-            inherited = _INHERITED_LENS_PARAMETERS.intersection(child.parameters)
+            inherited = _ROOT_LENS_PARAMETERS.intersection(child.parameters)
             if inherited:
                 names = ", ".join(sorted(inherited))
                 raise ValueError(f"Nested lens specifications inherit rather than define: {names}.")
@@ -1234,7 +1240,7 @@ def _construct_lens_tree(
     torch,
     prefix,
     name,
-    cosmology=None,
+    cosmology,
     z_l=None,
     z_s=None,
     root=False,
@@ -1246,14 +1252,12 @@ def _construct_lens_tree(
         if parameter_name != "lenses"
     }
     if root:
-        cosmology = lens_values.pop("cosmology")
         z_l = torch.as_tensor(lens_values.pop("z_l"), dtype=torch.float64)
 
     lens_name = lens_values.pop("name", name)
     lens_class = getattr(caustics, lens_spec.model)
 
     if lens_spec.model == "SinglePlane":
-
         children = tuple(
             _construct_lens_tree(
                 child_spec,
@@ -1295,7 +1299,6 @@ def _realize_lens_geometry(lens_spec, lens, values, *, torch, prefix, name, root
         if parameter_name != "lenses"
     }
     if root:
-        lens_values.pop("cosmology")
         lens_values.pop("z_l")
     lens_values.pop("name", None)
 
@@ -1353,8 +1356,8 @@ def _realize_lens_geometry(lens_spec, lens, values, *, torch, prefix, name, root
     )
 
 
-def _build_lens_system(lens_spec, *, values):
-    """Realize one fresh registered lens tree for a graph sample."""
+def _build_lens_system(lens_spec, *, cosmology, values):
+    """Realize one fresh registered lens tree with fixed node-owned cosmology."""
     caustics, torch = _import_caustics_dependencies()
     lens = _construct_lens_tree(
         lens_spec,
@@ -1363,6 +1366,7 @@ def _build_lens_system(lens_spec, *, values):
         torch=torch,
         prefix="lens",
         name="lens",
+        cosmology=cosmology,
         z_s=torch.as_tensor(values["source_redshift"], dtype=torch.float64),
         root=True,
     )
@@ -2418,7 +2422,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     ----------
     lens : CausticsLensSpec
         Registered atomic or recursive lens specification. The root parameters
-        include ``cosmology`` and the lens-redshift setter ``z_l``.
+        include the lens-redshift setter ``z_l``.
+    cosmology : caustics.Cosmology
+        Fixed cosmology inherited by every realized lens.
     source_redshift : parameter
         Dimensionless source-redshift setter.
     fov : float or None, optional
@@ -2461,6 +2467,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
     Attributes
     ----------
+    cosmology : caustics.Cosmology
+        Fixed node-owned cosmology excluded from the sampled ``GraphState``.
     source_x : AttributeIndicator
         Graph output for sampled source-plane x position in arcseconds.
     source_y : AttributeIndicator
@@ -2543,6 +2551,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         self,
         lens,
         *,
+        cosmology,
         source_redshift,
         fov=None,
         pixelscale=0.01,
@@ -2564,7 +2573,10 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         ----------
         lens : CausticsLensSpec
             Registered atomic or recursive lens specification. The root owns
-            ``cosmology`` and the dimensionless lens-redshift setter ``z_l``.
+            the dimensionless lens-redshift setter ``z_l``.
+        cosmology : caustics.Cosmology
+            Fixed cosmology inherited by every realized lens and excluded from
+            graph parameters.
         source_redshift : object
             Graph setter for dimensionless source redshift.
         fov : float-convertible scalar or None, optional
@@ -2617,7 +2629,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         Notes
         -----
-        ``source_redshift`` is registered directly. Lens parameters use
+        ``source_redshift`` is registered directly. The fixed ``cosmology`` is
+        stored on the node rather than registered. Lens parameters use
         ``lens_<field>`` at the root and positional path segments inside nested
         planes. All nine public outputs are registered in ``_OUTPUTS`` order.
         The seeded node-owned generator is used only when ``compute`` receives
@@ -2647,6 +2660,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         )
 
         self.lens = lens
+        self.cosmology = cosmology
         self.fov = normalized.get("fov")
         self.pixelscale = normalized["pixelscale"]
         self.pixelscale_fraction = pixelscale_fraction
@@ -3101,6 +3115,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         """
         lens, geometry_adapter, adapter_values = _build_lens_system(
             self.lens,
+            cosmology=self.cosmology,
             values=values,
         )
         _validate_source_geometry_support(self.lens, lens)
@@ -3329,7 +3344,9 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
     ----------
     lens : CausticsLensSpec
         Registered atomic or recursive lens specification. The root parameters
-        include ``cosmology`` and the lens-redshift setter ``z_l``.
+        include the lens-redshift setter ``z_l``.
+    cosmology : caustics.Cosmology
+        Fixed cosmology inherited by every realized lens.
     source_redshift : object
         Graph setter for dimensionless source redshift.
     source_x : object
@@ -3379,6 +3396,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
     Attributes
     ----------
+    cosmology : caustics.Cosmology
+        Fixed node-owned cosmology excluded from the sampled ``GraphState``.
     num_images : AttributeIndicator
         Graph output for active image count.
     image_x : AttributeIndicator
@@ -3456,6 +3475,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         self,
         lens,
         *,
+        cosmology,
         source_redshift,
         source_x,
         source_y,
@@ -3481,7 +3501,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         ----------
         lens : CausticsLensSpec
             Registered atomic or recursive lens specification. The root owns
-            ``cosmology`` and the dimensionless lens-redshift setter ``z_l``.
+            the dimensionless lens-redshift setter ``z_l``.
+        cosmology : caustics.Cosmology
+            Fixed cosmology inherited by every realized lens and excluded from
+            graph parameters.
         source_redshift : object
             Graph setter for dimensionless source redshift.
         source_x : object
@@ -3541,7 +3564,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         Notes
         -----
         Source coordinates, source redshift, FOV, and optional expected count
-        are registered directly. Lens parameters use ``lens_<field>`` at the
+        are registered directly. The fixed ``cosmology`` is stored on the node
+        rather than registered. Lens parameters use ``lens_<field>`` at the
         root and positional path segments inside nested planes. All eleven
         public outputs are registered in ``_OUTPUTS`` order.
         """
@@ -3599,6 +3623,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 raise ValueError(f"{name} must be a non-negative integer.")
 
         self.lens = lens
+        self.cosmology = cosmology
         self.max_images = int(max_images)
         self.min_images = int(min_images)
         self.fov_multiplier = normalized_scalars["fov_multiplier"]
@@ -3833,6 +3858,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         lens, geometry_adapter, adapter_values = _build_lens_system(
             self.lens,
+            cosmology=self.cosmology,
             values=values,
         )
         _, torch = _import_caustics_dependencies()
