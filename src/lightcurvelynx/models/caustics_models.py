@@ -3643,8 +3643,11 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     source-plane interiors, samples one position uniformly from their union,
     and certifies the regular-image count with signed boundary winding. The
     realized point, geometric cross-section, rejection-attempt count, image
-    count, and boundary diagnostics are persisted in the node's ``GraphState``
-    entries.
+    count, and boundary diagnostics form nine newly computed results. After
+    every sample succeeds, they are passed to ``_save_results``; its
+    ``GraphState.set`` calls update eligible nonfixed output entries and
+    preserve any pre-fixed output entries. ``compute`` nevertheless returns
+    the newly computed value for every output.
 
     Parameters
     ----------
@@ -3799,12 +3802,16 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     NumPy scalar for one graph sample and has shape ``(S,)`` for ``S > 1``;
     ``strong_lensing_area`` is in square arcseconds,
     ``sampling_attempts`` is one-based, and ``boundary_refinements`` counts
-    completed factor-of-two steps. Results are saved in ``GraphState`` only
-    after every graph sample succeeds. A caller RNG takes precedence over the
-    seeded fallback, and exactly one unsigned 64-bit sub-seed per graph sample
-    is drawn up front before any per-sample work. Sample-local generators
-    isolate variable rejection counts, while persisted coordinates and
-    diagnostics make downstream use deterministic from the sampled state.
+    completed factor-of-two steps. Only after every graph sample succeeds are
+    these newly computed results passed in order to ``_save_results``. Its
+    ``GraphState.set`` calls update eligible nonfixed output entries and leave
+    pre-fixed output entries unchanged. A successful return still contains all
+    newly computed values, including those corresponding to preserved
+    pre-fixed entries. A caller RNG takes precedence over the seeded fallback,
+    and exactly one unsigned 64-bit sub-seed per graph sample is drawn up front
+    before any per-sample work. Sample-local generators isolate variable
+    rejection counts; downstream use of the ``GraphState`` sees each output's
+    resulting updated or pre-fixed value.
 
     References
     ----------
@@ -4510,8 +4517,10 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         Parameters
         ----------
         graph_state : GraphState
-            State containing the realized node inputs and receiving the nine
-            computed outputs.
+            State containing the realized node inputs. Only after every sample
+            succeeds is it offered the nine computed outputs through
+            ``_save_results``; eligible nonfixed entries are updated and
+            pre-fixed output entries are preserved.
         rng_info : numpy.random.Generator, optional
             Caller-owned random generator. When omitted, the node-owned generator
             configured by ``seed`` is used.
@@ -4566,21 +4575,26 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         Notes
         -----
         Registered ``**kwargs`` input overrides apply only to this call and are
-        not persisted to the ``GraphState``. Only the nine outputs are saved,
-        and they are saved after every sample succeeds. The caller generator
-        takes precedence over the fallback generator. Exactly ``S`` unsigned
-        64-bit sub-seeds in ``[0, 2**63)`` are drawn before any per-sample
-        geometry or rejection work, then one independent generator is created
-        per sample so variable rejection counts cannot perturb later samples.
-        The chosen parent generator has therefore consumed all ``S`` seeds even
-        if a later sample raises.
+        not persisted to the ``GraphState``. Only after every sample succeeds
+        are the nine newly computed outputs passed to ``_save_results``. Its
+        ``GraphState.set`` calls update eligible nonfixed output entries while
+        preserving pre-fixed ones. The returned ``results`` still contains the
+        newly computed value for every output, including an output whose
+        pre-fixed graph entry was preserved. The caller generator takes
+        precedence over the fallback generator. Exactly ``S`` unsigned 64-bit
+        sub-seeds in ``[0, 2**63)`` are drawn before any per-sample geometry or
+        rejection work, then one independent generator is created per sample
+        so variable rejection counts cannot perturb later samples. The chosen
+        parent generator has therefore consumed all ``S`` seeds even if a later
+        sample raises.
 
         The proposal must lie strictly inside the repaired union and must not
         equal a certified point caustic exactly. It is not redrawn after
         certification: the penultimate and final signed-winding image counts
         must agree, and final regular-boundary clearance must be strictly
-        greater than boundary uncertainty, or the method raises before saving
-        any of this call's results. Sampling-exhaustion context includes
+        greater than boundary uncertainty, or the method raises before any of
+        this call's results are passed to ``_save_results``.
+        Sampling-exhaustion context includes
         ``fov``, configured/fractional/realized pixel-scale settings,
         ``max_fov_expansions``, pseudo-caustic settings, both tolerances, and
         ``max_boundary_refinements``. The sampler reports ``max_attempts``
@@ -4876,7 +4890,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
     divisions-plus-one variant changes actual spacing, while the half-cell
     numerical-center shift retains the base division count and base spacing.
     Both variants add a global solver attempt, and neither changes the outer
-    expansion/refinement counters. Fixed-width GraphState outputs use the
+    expansion/refinement counters. Newly computed fixed-width outputs use the
     padding and sentinel conventions documented above. Active images retain no
     local deduplication and are ordered by increasing delay, then x, then y.
 
@@ -4889,7 +4903,11 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
     count and diagnostic outputs are NumPy scalars for one sample while the
     four image outputs have shape ``(M,)``, where ``M = max_images``. For
     ``S > 1`` those shapes become ``(S,)`` and ``(S, M)`` respectively. All
-    eleven outputs are persisted in that order; image solving is deterministic
+    eleven newly computed results are passed in that order to ``_save_results``
+    only after every sample succeeds. Its ``GraphState.set`` calls update
+    eligible nonfixed output entries and preserve pre-fixed output entries. A
+    successful return still contains every newly computed value, including one
+    whose pre-fixed graph entry was preserved. Image solving is deterministic
     for realized inputs and does not consume caller RNG state.
 
     References
@@ -5733,17 +5751,20 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         )
 
     def compute(self, graph_state, rng_info=None, **kwargs):
-        """Solve every sampled lens and save fixed-width numeric outputs.
+        """Solve every sampled lens and return fixed-width numeric outputs.
 
         Parameters
         ----------
         graph_state : GraphState
-            State containing realized node inputs and receiving all eleven
-            computed outputs.
+            State containing realized node inputs. Only after every sample
+            succeeds is it offered all eleven computed outputs through
+            ``_save_results``; eligible nonfixed entries are updated and
+            pre-fixed output entries are preserved.
         rng_info : object, optional
             Ignored. Image solving is deterministic for realized inputs.
         **kwargs : dict, optional
-            Explicit overrides keyed by registered node input name.
+            Call-local overrides keyed by registered node input name. These
+            input overrides are not persisted to ``graph_state``.
 
         Returns
         -------
@@ -5811,9 +5832,13 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         multi-sample count/counter arrays have integer dtype and angular
         diagnostics have floating dtype. Registered-name ``kwargs`` override
         input values for this call but are not written back as graph inputs.
-        All eleven output values are saved in ``_OUTPUTS`` order only after
-        every sample solves successfully. Other unclassified exceptions from
-        construction, adapters, Torch, Caustics, NumPy conversion,
+        Only after every sample solves successfully are all eleven newly
+        computed values passed to ``_save_results`` in ``_OUTPUTS`` order. Its
+        ``GraphState.set`` calls update eligible nonfixed output entries while
+        preserving pre-fixed ones. The returned ``results`` still contains the
+        newly computed value for every output, including an output whose
+        pre-fixed graph entry was preserved. Other unclassified exceptions
+        from construction, adapters, Torch, Caustics, NumPy conversion,
         magnification, or delay evaluation propagate unchanged.
         """
         del rng_info  # The solver is deterministic for realized input parameters.
