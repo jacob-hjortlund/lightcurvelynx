@@ -465,50 +465,6 @@ _RECOVERY_ROOT_REFINEMENTS = 8
 _INITIAL_FOV_PADDING = 1.1
 
 
-def _validate_lens_configuration(lens_model, lens_parameters):
-    """Validate constructor inputs shared by Caustics-backed lens nodes.
-
-    Parameters
-    ----------
-    lens_model : str
-        Name of a lens class exposed by the top-level ``caustics`` package.
-    lens_parameters : Mapping[str, object]
-        Mapping from Caustics constructor parameter names to LightCurveLynx
-        parameter setters. Values are not required to be numeric until graph
-        sampling realizes them.
-
-    Returns
-    -------
-    None
-        The inputs are valid at the shared LightCurveLynx boundary.
-
-    Raises
-    ------
-    TypeError
-        If ``lens_model`` is not a non-empty string or ``lens_parameters`` is
-        not a mapping with string keys.
-    ValueError
-        If a lens parameter would collide with a constructor argument managed
-        internally by the adapter.
-
-    Notes
-    -----
-    Caustics-model-specific physical parameter domains are owned by Caustics or
-    the selected registered geometry adapter and are not checked here.
-    """
-    if not isinstance(lens_model, str) or not lens_model:
-        raise TypeError("lens_model must be a non-empty Caustics class name.")
-    if not isinstance(lens_parameters, Mapping):
-        raise TypeError("lens_parameters must be a mapping.")
-    if any(not isinstance(name, str) for name in lens_parameters):
-        raise TypeError("lens_parameters keys must be strings.")
-
-    collisions = _RESERVED_LENS_PARAMETERS.intersection(lens_parameters)
-    if collisions:
-        names = ", ".join(sorted(collisions))
-        raise ValueError(f"Reserved lens parameter name(s): {names}.")
-
-
 def _import_caustics_dependencies():
     """Lazily import the optional Caustics runtime dependencies.
 
@@ -748,7 +704,7 @@ def _refine_image_seeds(
     Returns
     -------
     numpy.ndarray, shape (K, 2)
-        Refined roots passing source-residual and singular-locality
+        Refined roots passing source-residual and recovery-point locality
         certification, in image-plane arcseconds.
 
     Raises
@@ -876,76 +832,6 @@ def _validate_lens_redshifts(values):
     return z_l, z_s
 
 
-def _construct_caustics_lens(
-    *,
-    lens_model,
-    cosmology,
-    values,
-    lens_parameter_names,
-):
-    """Construct one Caustics lens from a single graph realization.
-
-    Parameters
-    ----------
-    lens_model : str
-        Name of the Caustics lens class to instantiate.
-    cosmology : caustics.Cosmology
-        Fixed cosmology object supplied to the Caustics lens constructor.
-    values : Mapping
-        Numeric inputs for one lens-system sample. It must contain
-        ``lens_redshift``, ``source_redshift``, and one ``lens_<name>`` entry
-        for every name in ``lens_parameter_names``.
-    lens_parameter_names : iterable of str
-        Caustics constructor parameter names without the ``lens_`` graph-input
-        prefix.
-
-    Returns
-    -------
-    lens : object
-        Newly constructed Caustics lens for this realization. The object is not
-        cached on a LightCurveLynx node.
-    torch : module
-        Imported PyTorch module, returned so callers can create compatible
-        ``float64`` inputs without importing it eagerly.
-
-    Raises
-    ------
-    ImportError
-        If the optional Caustics runtime dependencies are unavailable.
-    KeyError
-        If a required realized input is missing from ``values``.
-    TypeError
-        If a realized redshift cannot be converted to a scalar float.
-    ValueError
-        If redshifts are invalid or ``lens_model`` is not exposed by Caustics.
-
-    Notes
-    -----
-    A fresh lens is constructed for every realization and is never cached on a
-    LightCurveLynx node.
-    """
-    caustics, torch = _import_caustics_dependencies()
-    z_l, z_s = _validate_lens_redshifts(values)
-
-    try:
-        lens_class = _LENS_MODEL_REGISTRY[lens_model].lens_class(caustics)
-    except KeyError as err:
-        raise ValueError(f"Unknown Caustics lens model '{lens_model}'.") from err
-
-    dtype = torch.float64
-    lens_kwargs = {
-        name: torch.as_tensor(values[f"lens_{name}"], dtype=dtype) for name in lens_parameter_names
-    }
-    lens = lens_class(
-        name="lens",
-        cosmology=cosmology,
-        z_l=torch.as_tensor(z_l, dtype=dtype),
-        z_s=torch.as_tensor(z_s, dtype=dtype),
-        **lens_kwargs,
-    )
-    return lens, torch
-
-
 def _import_contourpy():
     """Lazily import the contour implementation used for critical curves.
 
@@ -968,39 +854,6 @@ def _import_contourpy():
             "package. Install it with `pip install contourpy`."
         ) from err
     return contourpy
-
-
-def _lens_plane_origin(values):
-    """Read the image-plane search origin from one realized input mapping.
-
-    Parameters
-    ----------
-    values : Mapping
-        Numeric inputs for one lens-system sample. ``lens_x0`` and ``lens_y0``
-        are interpreted as angular offsets in arcseconds and each defaults to
-        zero when absent.
-
-    Returns
-    -------
-    x0 : float
-        Image-plane x origin in arcseconds.
-    y0 : float
-        Image-plane y origin in arcseconds.
-
-    Raises
-    ------
-    TypeError
-        If either coordinate cannot be converted to a scalar float.
-    """
-    try:
-        x0 = float(values.get("lens_x0", 0.0))
-    except (TypeError, ValueError, OverflowError) as err:
-        raise TypeError("lens_x0 must realize to a scalar numeric value in arcseconds.") from err
-    try:
-        y0 = float(values.get("lens_y0", 0.0))
-    except (TypeError, ValueError, OverflowError) as err:
-        raise TypeError("lens_y0 must realize to a scalar numeric value in arcseconds.") from err
-    return x0, y0
 
 
 def _raytrace_curve(lens, coordinates):
@@ -1665,11 +1518,6 @@ _LENS_MODEL_REGISTRY = {
 }
 
 
-def _get_lens_geometry_adapter(lens_model):
-    """Return the registered realized-adapter factory for a lens model."""
-    return _LENS_MODEL_REGISTRY[lens_model].geometry_factory
-
-
 @dataclass(frozen=True)
 class _CompiledLensComponent:
     name: str
@@ -1874,6 +1722,7 @@ def _build_lens_system(compiled, *, cosmology, values):
             z_s=z_s,
             name="lens",
         )
+        lens.to_static()
         geometry_adapter = component.registry.geometry_factory(lens, component_values)
         realized_component = _RealizedLensComponent(
             name=component.name,
@@ -1909,6 +1758,8 @@ def _build_lens_system(compiled, *, cosmology, values):
         z_l=z_l,
         z_s=z_s,
     )
+    for child in children:
+        child.to_static()
     realized_components = tuple(
         _RealizedLensComponent(
             name=component.name,
@@ -3926,10 +3777,14 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
     Parameters
     ----------
-    lens_model : str
-        Non-empty name of a top-level Caustics lens class.
+    lens : CausticsLensSpec | CausticsSinglePlaneSpec
+        Immutable registered atomic or ordered single-plane lens
+        specification. Parameter fields become graph inputs named
+        ``lens_<field>`` for an atomic lens or
+        ``lens_<component>_<field>`` for a single plane. Fixed options and
+        registry defaults remain immutable realization metadata.
     cosmology : caustics.Cosmology
-        Fixed cosmology supplied to every realized lens.
+        Fixed cosmology supplied to every realized total lens.
     lens_redshift : object
         Graph setter for dimensionless lens redshift.
     source_redshift : object
@@ -3940,19 +3795,19 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
     source_y : object
         Graph setter realizing to a finite source-plane y coordinate in
         arcseconds.
-    lens_parameters : Mapping[str, object]
-        String Caustics constructor parameter names mapped to graph setters.
     max_images : int or numpy.integer
         Fixed output width and maximum accepted image count; at least two.
     min_images : int or numpy.integer, optional
-        Minimum count accepted after bounded recovery, between one and
-        ``max_images``.
+        Minimum count accepted after bounded recovery, from one through
+        ``max_images``. A value of one permits an isolated image to complete
+        the configured contract when no expectation is supplied.
     expected_num_images : object or None, optional
         Graph setter realizing to ``None`` or an integer between
         ``min_images`` and ``max_images``.
     fov : object, optional
-        Graph setter realizing to a positive finite image-plane FOV in
-        arcseconds.
+        Graph setter realizing to ``None`` or a positive finite image-plane
+        FOV in arcseconds. ``None`` uses the realized total-lens adapter's
+        component-envelope extent.
     fov_multiplier : float-convertible scalar, optional
         Finite positive dimensionless multiplier applied to each realized
         ``fov``.
@@ -4000,7 +3855,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         Graph output for actual accepted spacing in arcseconds.
     solver_attempts : AttributeIndicator
         Graph output counting every global Caustics invocation and every
-        executed singular-seed batch.
+        executed targeted-recovery batch.
     solver_fov_expansions : AttributeIndicator
         Graph output counting outer FOV expansion steps only.
     solver_pixelscale_refinements : AttributeIndicator
@@ -4015,11 +3870,18 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
     an upper bound on the actual accepted spacing
     ``current_fov / divisions``.
 
-    The physical lens center is distinct from the numerical grid center. A
-    half-cell recovery shift changes only the numerical search grid and never
-    translates returned physical image coordinates. Lens models without a
-    registered geometry adapter retain absolute pixel/epsilon settings and
-    skip targeted singular recovery. No adapter is cached on the node.
+    One shared registered lens system and its total geometry adapter are
+    realized per graph sample. For composites, the adapter derives the
+    numerical search center, starting extent, and characteristic resolution
+    from all realized non-affine components. Explicit recovery points gate
+    targeted searches; every active point is seeded against the total lens,
+    and certified supplemental roots are retained without deduplication.
+
+    The physical component centers are distinct from the numerical grid
+    center. A half-cell recovery shift changes only the numerical search grid
+    and never translates returned physical image coordinates. No realized
+    adapter or lens is cached on the node. Magnifications and time delays are
+    evaluated once on the realized total lens after count recovery finishes.
 
     FOV expansions complete before requested-scale refinements. The
     divisions-plus-one variant changes actual spacing, while the half-cell
@@ -4049,18 +3911,17 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
     def __init__(
         self,
-        lens_model,
+        lens,
         *,
         cosmology,
         lens_redshift,
         source_redshift,
         source_x,
         source_y,
-        lens_parameters,
         max_images,
         min_images=2,
         expected_num_images=None,
-        fov=5.0,
+        fov=None,
         fov_multiplier=1.0,
         pixelscale=0.05,
         pixelscale_fraction=None,
@@ -4077,10 +3938,13 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         Parameters
         ----------
-        lens_model : str
-            Non-empty top-level Caustics lens-class name.
+        lens : CausticsLensSpec | CausticsSinglePlaneSpec
+            Immutable atomic or ordered single-plane specification containing
+            only explicitly registered lens models. Parameter fields are
+            graph-visible; fixed options and registry defaults remain
+            immutable realization metadata.
         cosmology : caustics.Cosmology
-            Fixed cosmology supplied to each realized lens.
+            Fixed cosmology supplied to each realized total lens.
         lens_redshift : object
             Graph setter for dimensionless lens redshift.
         source_redshift : object
@@ -4089,8 +3953,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             Graph setter for source-plane x position in arcseconds.
         source_y : object
             Graph setter for source-plane y position in arcseconds.
-        lens_parameters : Mapping[str, object]
-            String Caustics parameter names mapped to graph setters.
         max_images : int or numpy.integer
             Fixed output width and maximum active count; at least two.
         min_images : int or numpy.integer, optional
@@ -4098,8 +3960,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         expected_num_images : object or None, optional
             Graph setter for an optional realized expected count.
         fov : object, optional
-            Graph setter realizing to a positive finite image-plane FOV in
-            arcseconds.
+            Graph setter realizing to ``None`` for adapter-derived extent or a
+            positive finite image-plane FOV in arcseconds.
         fov_multiplier : float-convertible scalar, optional
             Finite positive multiplier converting realized ``fov`` to the
             initial solver FOV.
@@ -4134,20 +3996,43 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         Raises
         ------
         TypeError
-            If lens configuration, parameter keys, fractions, or normalized
-            scalar settings have invalid types.
+            If ``lens``, fractions, or normalized scalar settings have invalid
+            types.
         ValueError
-            If a reserved lens parameter is used, or counts, depths, recovery
-            limits, factors, or positive scalar settings violate their ranges
-            or relations.
+            If the lens specification or counts, depths, recovery limits,
+            factors, or positive scalar settings violate their ranges or
+            relations.
 
         Notes
         -----
-        Redshifts, source coordinates, FOV, optional expected count, and every
-        lens parameter are registered as graph inputs. All eleven public
-        outputs are registered in ``_OUTPUTS`` order. Geometry adapters are
-        resolved per realization and are never stored on the node.
+        Redshifts, source coordinates, FOV, and optional expected count are
+        registered first. Compiled parameter fields then use
+        ``lens_<field>`` for an atomic lens or
+        ``lens_<component>_<field>`` for a single plane. Fixed options and
+        registry defaults are not graph inputs. All eleven public outputs are
+        registered in ``_OUTPUTS`` order. The public specification and its
+        immutable compilation are stored on the node, while realized total
+        lenses and adapters remain sample-local.
         """
+        if not isinstance(lens, (CausticsLensSpec, CausticsSinglePlaneSpec)):
+            raise TypeError("lens must be a CausticsLensSpec or CausticsSinglePlaneSpec.")
+
+        reserved_names = {
+            "lens_redshift",
+            "source_redshift",
+            "source_x",
+            "source_y",
+            "fov",
+            "expected_num_images",
+            *self._OUTPUTS,
+            *dir(type(self)),
+            *dir(self),
+        }
+        compiled_lens = _compile_lens_spec(
+            lens,
+            reserved_parameter_names=reserved_names,
+        )
+
         pixelscale_fraction = _validate_optional_positive_fraction(
             "pixelscale_fraction",
             pixelscale_fraction,
@@ -4156,7 +4041,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             "epsilon_fraction",
             epsilon_fraction,
         )
-        _validate_lens_configuration(lens_model, lens_parameters)
         integer_types = (int, np.integer)
         if not isinstance(max_images, integer_types) or max_images < 2:
             raise ValueError("max_images must be an integer greater than one.")
@@ -4197,7 +4081,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             if not isinstance(limit, integer_types) or limit < 0:
                 raise ValueError(f"{name} must be a non-negative integer.")
 
-        self.lens_model = lens_model
+        self.lens = lens
+        self._compiled_lens = compiled_lens
         self.cosmology = cosmology
         self.max_images = int(max_images)
         self.min_images = int(min_images)
@@ -4211,10 +4096,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         self.fov_expansion_factor = normalized_scalars["fov_expansion_factor"]
         self.max_pixelscale_refinements = int(max_pixelscale_refinements)
         self.pixelscale_refinement_factor = normalized_scalars["pixelscale_refinement_factor"]
-        self._lens_parameter_names = tuple(lens_parameters)
 
-        # Register every lens parameter independently so AttributeIndicatorNode
-        # dependencies inside the mapping remain visible to the graph.
         node_inputs = {
             "lens_redshift": lens_redshift,
             "source_redshift": source_redshift,
@@ -4223,8 +4105,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             "fov": fov,
             "expected_num_images": expected_num_images,
         }
-        for name, setter in lens_parameters.items():
-            node_inputs[f"lens_{name}"] = setter
+        for name, setter in self._compiled_lens.graph_inputs:
+            node_inputs[name] = setter
 
         super().__init__(
             self._non_func,
@@ -4238,11 +4120,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         Parameters
         ----------
-        geometry_adapter : _PointSingularityGeometryAdapter or None
-            Registry adapter held stable for this realization, or ``None``
-            for an unsupported geometry model.
+        geometry_adapter : _GeometryAdapter
+            Realized total-lens adapter held stable for this realization.
         values : Mapping[str, object]
-            Realized inputs for one lens system.
+            Adapter-owned realized inputs for one lens system.
 
         Returns
         -------
@@ -4255,15 +4136,16 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         -----
         Configured absolute values remain upper bounds. When either fraction is
         enabled, one trusted characteristic scale is obtained and each enabled
-        setting becomes the smaller of its absolute and relative value. A
-        missing adapter retains both absolute settings.
+        setting becomes the smaller of its absolute and relative value. For a
+        composite, the adapter's resolution is derived from every non-affine
+        component.
         """
         realized_pixelscale = self.pixelscale
         realized_epsilon = self.epsilon
-        if geometry_adapter is None or (self.pixelscale_fraction is None and self.epsilon_fraction is None):
+        if self.pixelscale_fraction is None and self.epsilon_fraction is None:
             return realized_pixelscale, realized_epsilon
 
-        characteristic_scale = geometry_adapter.characteristic_angular_scale(values)
+        characteristic_scale = geometry_adapter.resolution_scale(values)
         if self.pixelscale_fraction is not None:
             realized_pixelscale = min(
                 realized_pixelscale,
@@ -4346,11 +4228,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             Inputs for exactly one graph sample. Required entries are
             dimensionless ``lens_redshift`` and ``source_redshift``; finite
             scalar source-plane ``source_x`` and ``source_y`` in arcseconds;
-            positive finite realized ``fov`` in arcseconds; required
-            ``expected_num_images``, whose value may be ``None`` or an
-            ordinary integer in the configured range; and
-            ``lens_<parameter>`` for every configured Caustics constructor
-            parameter.
+            realized ``fov``, which may be ``None`` or a positive finite value
+            in arcseconds; required ``expected_num_images``, whose value may be
+            ``None`` or an ordinary integer in the configured range; and every
+            compiled atomic or component-qualified lens graph input.
 
         Returns
         -------
@@ -4377,16 +4258,17 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         then image x, then image y. Padding to ``max_images`` is performed by
         ``compute``.
 
-        The configured FOV setter realizes per lens and is multiplied by
-        ``fov_multiplier`` to form ``initial_fov``. Realized pixel scale
-        and epsilon are fixed once. Every global call and residual
-        certification uses that fixed epsilon; targeted seed radius is
-        ``min(realized_epsilon, actual_grid_spacing)``, while singular
+        A ``None`` FOV uses the realized adapter's total-lens extent; an
+        explicit realized FOV overrides that extent. Either value is multiplied
+        by ``fov_multiplier`` to form ``initial_fov``. Realized pixel scale and
+        epsilon are fixed once from the total adapter. Every global call and
+        residual certification uses that fixed epsilon; targeted seed radius
+        is ``min(realized_epsilon, actual_grid_spacing)``, while recovery-point
         neighborhood occupancy and root locality use the actual grid spacing.
         Each outer attempt is independent, so its global coordinates replace
-        rather than merge with any earlier attempt. Targeted roots are local to
-        a successful, nonempty, deficient attempt and are skipped without an
-        adapter.
+        rather than merge with any earlier attempt. Supplemental roots are
+        local to a successful, nonempty, deficient attempt and run only when
+        the adapter supplies explicit recovery points.
 
         The divisions-plus-one variant changes actual spacing; the half-cell
         numerical-center shift retains base divisions and base spacing. Both
@@ -4408,7 +4290,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             not scalar.
         ValueError
             If source coordinates, FOV, expected count, redshifts, or the
-            selected lens model violate their owned domains.
+            realized lens specification violate their owned domains.
         RuntimeError
             If a recovered count exceeds its expectation or ``max_images``,
             or bounded recovery exhausts below ``min_images``.
@@ -4424,24 +4306,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         source_x = source_coordinates["source_x"]
         source_y = source_coordinates["source_y"]
 
-        try:
-            realized_fov = float(values["fov"])
-        except (TypeError, ValueError, OverflowError) as err:
-            raise TypeError("fov must realize to a scalar numeric value.") from err
-        if not np.isfinite(realized_fov) or realized_fov <= 0.0:
-            raise ValueError("fov must realize to a positive finite value.")
-        initial_fov = realized_fov * self.fov_multiplier
-        geometry_adapter = _LENS_MODEL_REGISTRY[self.lens_model].geometry_factory
-        realized_pixelscale, realized_epsilon = self._realized_angular_settings(
-            geometry_adapter,
-            values,
-        )
-        if initial_fov <= realized_pixelscale:
-            raise ValueError(
-                f"Initial solver fov={initial_fov} arcsec must be larger "
-                f"than pixelscale={realized_pixelscale} arcsec."
-            )
-
         expected_num_images = values["expected_num_images"]
         if expected_num_images is not None:
             if (
@@ -4453,16 +4317,37 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 )
             expected_num_images = int(expected_num_images)
 
-        lens, torch = _construct_caustics_lens(
-            lens_model=self.lens_model,
+        system = _build_lens_system(
+            self._compiled_lens,
             cosmology=self.cosmology,
             values=values,
-            lens_parameter_names=self._lens_parameter_names,
         )
+        _, torch = _import_caustics_dependencies()
+
+        realized_fov = values["fov"]
+        if realized_fov is None:
+            realized_fov = system.geometry_adapter.initial_fov(system.values)
+        else:
+            try:
+                realized_fov = float(realized_fov)
+            except (TypeError, ValueError, OverflowError) as err:
+                raise TypeError("fov must realize to None or a scalar numeric value.") from err
+            if not np.isfinite(realized_fov) or realized_fov <= 0.0:
+                raise ValueError("fov must realize to None or a positive finite value.")
+        initial_fov = realized_fov * self.fov_multiplier
+        realized_pixelscale, realized_epsilon = self._realized_angular_settings(
+            system.geometry_adapter,
+            system.values,
+        )
+        if initial_fov <= realized_pixelscale:
+            raise ValueError(
+                f"Initial solver fov={initial_fov} arcsec must be larger "
+                f"than pixelscale={realized_pixelscale} arcsec."
+            )
 
         beta_x = torch.as_tensor(source_x, dtype=torch.float64)
         beta_y = torch.as_tensor(source_y, dtype=torch.float64)
-        center_x, center_y = _lens_plane_origin(values)
+        center_x, center_y = system.geometry_adapter.search_center(system.values)
         target_count = self.min_images if expected_num_images is None else expected_num_images
         latest_retryable_error = None
         solver_attempts = 0
@@ -4595,7 +4480,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             propagate unchanged.
 
             Every actual global Caustics invocation increments
-            ``solver_attempts``. Each executed singular-seed batch adds one
+            ``solver_attempts``. Each executed recovery-seed batch adds one
             more attempt, while its internal root-refinement passes do not.
             Actual spacing is updated to ``current_fov / divisions`` for the
             invoked variant. The divisions-plus-one variant changes that
@@ -4604,14 +4489,14 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             neither changes the outer expansion/refinement counters.
 
             Targeted recovery runs only after a successful, nonempty, deficient
-            global result with a registered adapter. It selects one seed for
-            each empty singular neighborhood. Its radius is the smaller of
-            fixed realized epsilon and actual grid spacing. Residual
-            certification uses fixed epsilon, while neighborhood occupancy and
-            root locality use actual grid spacing. Retryable targeted failures
-            leave the global result deficient. Targeted roots and global
-            coordinates are local to this attempt; every later outer call
-            replaces them.
+            global result with explicit adapter recovery points. It selects one
+            seed for each empty recovery neighborhood over the total lens. Its
+            radius is the smaller of fixed realized epsilon and actual grid
+            spacing. Residual certification uses fixed epsilon, while
+            neighborhood occupancy and root locality use actual grid spacing.
+            Retryable targeted failures leave the global result deficient.
+            Targeted roots and global coordinates are local to this attempt;
+            every later outer call replaces them.
 
             Numerical-center shifts never modify physical lens values or
             translate returned image coordinates. If all outer calls remain
@@ -4646,7 +4531,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 solver_attempts += 1
                 try:
                     coordinates = self._forward_raytrace_images(
-                        lens,
+                        system.lens,
                         torch,
                         beta_x,
                         beta_y,
@@ -4675,39 +4560,35 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 recovery_stage=recovery_stage,
             )
 
-            # TODO: Instead of geometry_adapter is None check, check if adapter is singular.
-            # Relevant when we generalize geometry adapters to none singular models beyond
-            # SIS and SIE.
-            if complete or not len(coordinates) or geometry_adapter is None:
-                return coordinates, complete
-
-            singular_points = np.asarray(
-                geometry_adapter.singular_points(values),
+            recovery_points = np.asarray(
+                system.geometry_adapter.root_recovery_points(system.values),
                 dtype=float,
             ).reshape(-1, 2)
+            if complete or not len(coordinates) or not len(recovery_points):
+                return coordinates, complete
+
             empty_neighborhoods = _recovery_neighborhoods_are_empty(
                 coordinates,
-                singular_points,
+                recovery_points,
                 current_grid_pixelscale,
             )
             if not np.any(empty_neighborhoods):
                 return coordinates, False
 
-            seeds = geometry_adapter.singular_image_seeds(
-                lens,
-                values,
+            seeds = _recovery_image_seeds(
+                system.lens,
+                recovery_points,
                 source_x=source_x,
                 source_y=source_y,
                 radius=min(realized_epsilon, current_grid_pixelscale),
             )
-            seeds = np.asarray(seeds, dtype=float)
             seeds = seeds[empty_neighborhoods]
-            unresolved_points = singular_points[empty_neighborhoods]
+            unresolved_points = recovery_points[empty_neighborhoods]
 
             solver_attempts += 1
             try:
-                singular_coordinates = _refine_image_seeds(
-                    lens,
+                recovery_coordinates = _refine_image_seeds(
+                    system.lens,
                     torch,
                     seeds,
                     unresolved_points,
@@ -4724,11 +4605,11 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 latest_retryable_error = f"{type(error).__name__}: {error}"
                 return coordinates, False
 
-            if len(singular_coordinates):
-                coordinates = np.vstack((coordinates, singular_coordinates))
+            if len(recovery_coordinates):
+                coordinates = np.vstack((coordinates, recovery_coordinates))
             return coordinates, result_is_complete(
                 coordinates,
-                recovery_stage="singular_seed",
+                recovery_stage="recovery_seed",
             )
 
         coordinates, complete = attempt(
@@ -4772,8 +4653,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         image_x_tensor = torch.as_tensor(coordinates[:, 0], dtype=torch.float64)
         image_y_tensor = torch.as_tensor(coordinates[:, 1], dtype=torch.float64)
-        magnifications = torch.abs(lens.magnification(image_x_tensor, image_y_tensor))
-        time_delays = lens.time_delay(image_x_tensor, image_y_tensor)
+        magnifications = torch.abs(system.lens.magnification(image_x_tensor, image_y_tensor))
+        time_delays = system.lens.time_delay(image_x_tensor, image_y_tensor)
 
         image_x = coordinates[:, 0]
         image_y = coordinates[:, 1]
@@ -4831,7 +4712,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                arcseconds;
             8. ``solver_pixelscale``, actual accepted grid spacing in
                arcseconds;
-            9. ``solver_attempts``, global calls plus executed singular-seed
+            9. ``solver_attempts``, global calls plus executed recovery-seed
                batches;
             10. ``solver_fov_expansions``, outer FOV steps only;
             11. ``solver_pixelscale_refinements``, outer requested-scale
