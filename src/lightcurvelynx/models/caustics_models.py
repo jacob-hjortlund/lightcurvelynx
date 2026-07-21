@@ -1207,6 +1207,19 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
     def axisymmetry_center(self, values):
         """Return the plane's exact image-plane symmetry center or ``None``.
 
+        Parameters
+        ----------
+        values : Mapping[str, Mapping[str, object]]
+            Realized adapter-owned values keyed by generated component name.
+
+        Returns
+        -------
+        tuple of float or None
+            Exact image-plane ``(x, y)`` center in arcseconds, or ``None`` when
+            the plane cannot certify axisymmetry.
+
+        Notes
+        -----
         A center is returned only when exactly one component is effectively
         non-affine, that component certifies an exact center, and every affine
         peer reports that it preserves axisymmetry. Affine peer centers are not
@@ -1230,6 +1243,19 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
     def preserves_axisymmetry(self, values):
         """Return whether every child is affine and symmetry-preserving.
 
+        Parameters
+        ----------
+        values : Mapping[str, Mapping[str, object]]
+            Realized adapter-owned values keyed by generated component name.
+
+        Returns
+        -------
+        bool
+            Whether the complete plane can preserve an enclosing component's
+            exact axisymmetry.
+
+        Notes
+        -----
         This capability is used when the whole plane is an affine component of
         an enclosing ``SinglePlane``. Any non-affine child makes it false; an
         empty component tuple returns true by ``all`` semantics.
@@ -1249,6 +1275,18 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
     def jacobian_mask_points(self, values):
         """Return component Jacobian mask points in recursive input order.
 
+        Parameters
+        ----------
+        values : Mapping[str, Mapping[str, object]]
+            Realized adapter-owned values keyed by generated component name.
+
+        Returns
+        -------
+        tuple of tuple of float
+            Image-plane ``(x, y)`` mask points in arcseconds.
+
+        Notes
+        -----
         Components without mask points contribute an empty tuple.
         """
         return tuple(
@@ -1260,6 +1298,18 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
     def root_recovery_points(self, values):
         """Return component recovery points in recursive input order.
 
+        Parameters
+        ----------
+        values : Mapping[str, Mapping[str, object]]
+            Realized adapter-owned values keyed by generated component name.
+
+        Returns
+        -------
+        tuple of tuple of float
+            Image-plane ``(x, y)`` recovery points in arcseconds.
+
+        Notes
+        -----
         Components without recovery points contribute an empty tuple.
         """
         return tuple(
@@ -1271,6 +1321,18 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
     def resolution_scale(self, values):
         """Return the smallest positive non-affine scale in arcseconds.
 
+        Parameters
+        ----------
+        values : Mapping[str, Mapping[str, object]]
+            Realized adapter-owned values keyed by generated component name.
+
+        Returns
+        -------
+        float
+            Smallest strictly positive child resolution scale in arcseconds.
+
+        Notes
+        -----
         Non-affine components whose returned scale is not strictly positive are
         excluded.
 
@@ -1341,6 +1403,18 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
     def pseudo_caustic_generators(self, values):
         """Return generators in component order with distinct-peer caps.
 
+        Parameters
+        ----------
+        values : Mapping[str, Mapping[str, object]]
+            Realized adapter-owned values keyed by generated component name.
+
+        Returns
+        -------
+        tuple of _PseudoCausticGenerator
+            Ordered child generators with any peer-separation caps applied.
+
+        Notes
+        -----
         Every non-affine component contributes its generator centers as peer
         locations, or its search center when it has no generator. For each
         returned generator, one quarter of the nearest strictly positive peer
@@ -2307,8 +2381,8 @@ def _find_all_caustics(
         ContourPy returns a malformed, non-finite, or open curve, or a mapped
         caustic is not closed within ``geometry_tolerance``.
     _CausticFOVError
-        If the outer boundary has not reached the positive-definite mapping
-        region, no critical curve is found, or a curve reaches the image-plane
+        If a selected outer-boundary eigenvalue compares less than or equal to
+        zero, no critical curve is found, or a curve reaches the image-plane
         boundary.
 
     Notes
@@ -2320,14 +2394,16 @@ def _find_all_caustics(
     neighborhood around each registered point are deliberately masked as part
     of critical-curve extraction. A point at exactly one actual grid spacing
     is masked. The post-mask grid and outer-boundary non-emptiness checks remain
-    algorithmic completeness guards. All valid outer-boundary eigenvalues of
-    the symmetrized Jacobian must be strictly positive. Critical-curve closure
-    and grid-boundary contact use an internal scale-aware tolerance distinct
-    from source-plane ``geometry_tolerance``. ContourPy output is independently
-    validated, and an in-tolerance but nonzero critical-curve endpoint gap is
-    closed by appending the first vertex before raytracing. The mapped
-    raytrace's paired shape, type, and finiteness remain trusted backend
-    postconditions apart from the endpoint-gap calculation.
+    algorithmic completeness guards. For finite derived boundary eigenvalues,
+    values less than or equal to zero trigger ``_CausticFOVError``. Non-finite
+    eigenvalues arising during symmetrization are not explicitly rejected by
+    that comparison. Critical-curve closure and grid-boundary contact use an
+    internal scale-aware tolerance distinct from source-plane
+    ``geometry_tolerance``. ContourPy output is independently validated, and an
+    in-tolerance but nonzero critical-curve endpoint gap is closed by appending
+    the first vertex before raytracing. The mapped raytrace's paired shape,
+    type, and finiteness remain trusted backend postconditions apart from the
+    endpoint-gap calculation.
     """
     contourpy = _import_contourpy()
     _, torch = _import_caustics_dependencies()
@@ -2487,7 +2563,8 @@ class _BoundaryGeometry:
     Notes
     -----
     The frozen dataclass prevents field reassignment but is only shallowly
-    immutable. NumPy arrays contained by the curve tuples remain mutable.
+    immutable. All contained NumPy arrays remain mutable, including both the
+    curve arrays and the ``point_caustics`` centers.
     """
 
     caustic_curves: tuple[np.ndarray, ...]
@@ -4439,7 +4516,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             Caller-owned random generator. When omitted, the node-owned generator
             configured by ``seed`` is used.
         **kwargs : dict, optional
-            Explicit overrides keyed by registered node input name.
+            Call-local overrides keyed by registered node input name. These
+            input overrides are not persisted to ``graph_state``.
 
         Returns
         -------
@@ -4487,14 +4565,15 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         Notes
         -----
-        All nine results are persisted to this node's ``GraphState``
-        entries only after every sample succeeds. The caller generator takes
-        precedence over the fallback generator. Exactly ``S`` unsigned 64-bit
-        sub-seeds in ``[0, 2**63)`` are drawn before any per-sample geometry or
-        rejection work, then one independent generator is created per sample
-        so variable rejection counts cannot perturb later samples. The chosen
-        parent generator has therefore consumed all ``S`` seeds even if a
-        later sample raises.
+        Registered ``**kwargs`` input overrides apply only to this call and are
+        not persisted to the ``GraphState``. Only the nine outputs are saved,
+        and they are saved after every sample succeeds. The caller generator
+        takes precedence over the fallback generator. Exactly ``S`` unsigned
+        64-bit sub-seeds in ``[0, 2**63)`` are drawn before any per-sample
+        geometry or rejection work, then one independent generator is created
+        per sample so variable rejection counts cannot perturb later samples.
+        The chosen parent generator has therefore consumed all ``S`` seeds even
+        if a later sample raises.
 
         The proposal must lie strictly inside the repaired union and must not
         equal a certified point caustic exactly. It is not redrawn after
