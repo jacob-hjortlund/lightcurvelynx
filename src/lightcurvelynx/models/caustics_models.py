@@ -3470,12 +3470,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         last_previous = None
         last_uncertainty = np.inf
         last_topology_stable = False
-        refinement_limit = (
-            max(self.max_boundary_refinements, 2)
-            if axisymmetry_center is not None
-            else self.max_boundary_refinements
-        )
-        for refinement in range(refinement_limit + 1):
+        for refinement in range(self.max_boundary_refinements + 1):
             current = self._boundary_geometry_for_one_lens(
                 lens,
                 geometry_adapter,
@@ -3485,9 +3480,10 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 pseudo_caustic_points=self.pseudo_caustic_points * (2**refinement),
                 initial_fov=None if previous is None else previous.critical_curve_fov,
             )
+            if previous is not None:
+                last_previous = previous
             if axisymmetry_center is None:
                 if previous is not None:
-                    last_previous = previous
                     current, last_uncertainty, last_topology_stable = _compare_boundary_geometry(
                         previous,
                         current,
@@ -3499,7 +3495,6 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 continue
 
             if older is not None and previous is not None:
-                last_previous = previous
                 partition = _partition_axisymmetric_point_caustics(
                     older.caustic_curves,
                     previous.caustic_curves,
