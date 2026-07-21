@@ -1208,7 +1208,14 @@ def _validate_root_lens_spec(lens):
 def _lens_spec_is_affine(lens):
     """Return the effective affinity of one recursive lens specification."""
     if lens.model == "SinglePlane":
-        return all(_lens_spec_is_affine(child) for child in lens.parameters["lenses"])
+        is_affine = all(_lens_spec_is_affine(child) for child in lens.parameters["lenses"])
+        if is_affine:
+            error_str = "Composite lens model only contains affine lens components:"
+            for child in lens.parameters["lenses"]:
+                error_str += f"\n{child.model}"
+            raise ValueError(error_str)
+        else:
+            return False
     return _LENS_MODEL_REGISTRY[lens.model].affine
 
 
@@ -1249,20 +1256,22 @@ def _construct_lens_tree(
 
     lens_name = lens_values.pop("name", name)
     lens_class = getattr(caustics, lens_spec.model)
-    children = tuple(
-        _construct_lens_tree(
-            child_spec,
-            values,
-            caustics=caustics,
-            torch=torch,
-            prefix=f"{prefix}_{index}",
-            name=f"{name}_{index}",
-            cosmology=cosmology,
-        )
-        for index, child_spec in enumerate(lens_spec.parameters.get("lenses", ()))
-    )
 
     if lens_spec.model == "SinglePlane":
+
+        children = tuple(
+            _construct_lens_tree(
+                child_spec,
+                values,
+                caustics=caustics,
+                torch=torch,
+                prefix=f"{prefix}_{index}",
+                name=f"{name}_{index}",
+                cosmology=cosmology,
+            )
+            for index, child_spec in enumerate(lens_spec.parameters.get("lenses", ()))
+        )
+
         lens = lens_class(
             cosmology=cosmology,
             lenses=children,
@@ -1279,8 +1288,7 @@ def _construct_lens_tree(
             z_s=z_s,
             **lens_values,
         )
-    if "s" in lens_values:
-        lens.s = float(lens.s)
+
     return lens
 
 
