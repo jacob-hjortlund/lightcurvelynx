@@ -2208,7 +2208,19 @@ def _build_lens_system(lens_spec, *, cosmology, values):
 
 
 class _CausticFOVError(RuntimeError):
-    """Signal that a larger image-plane FOV is required for completeness."""
+    """Signal that critical-curve completeness requires a larger search FOV.
+
+    Notes
+    -----
+    ``_find_all_caustics`` raises this private control-flow exception only for
+    conditions recoverable by enlarging the square image-plane field of view:
+    an exterior boundary that is not yet positive definite, no detected
+    critical curve, or a critical curve that reaches the grid boundary.
+    ``CausticsSourcePositionNode`` owns the bounded expansion policy and
+    converts final exhaustion to a public ``RuntimeError``. Structural contour
+    and mapping failures remain ordinary ``RuntimeError`` instances and are
+    never reclassified as FOV-retry signals.
+    """
 
 
 def _outer_grid_boundary(values):
@@ -2225,6 +2237,13 @@ def _outer_grid_boundary(values):
     numpy.ndarray, shape (4 * N - 4, ...)
         Top row, bottom row, and side interiors concatenated without duplicated
         corner entries.
+
+    Notes
+    -----
+    The result preserves the input row/column directions but is not a cyclic
+    walk around the perimeter: both full rows precede the two side interiors.
+    The trusted caller owns shape validation; NumPy indexing and concatenation
+    errors for malformed inputs propagate unchanged.
     """
     return np.concatenate(
         (
@@ -2274,9 +2293,10 @@ def _find_all_caustics(
     Returns
     -------
     list of numpy.ndarray
-        Closed source-plane caustic curves. Each element has shape ``(N, 2)``
-        and contains x/y offsets in arcseconds. Disconnected critical curves
-        remain separate list entries.
+        Producer-closed source-plane caustic curves. Each element has shape
+        ``(P, 2)`` and contains x/y offsets in arcseconds, with an endpoint gap
+        no larger than ``geometry_tolerance``. Disconnected critical curves
+        remain separate list entries in ContourPy order.
 
     Raises
     ------
@@ -2298,9 +2318,16 @@ def _find_all_caustics(
     Jacobian types, shapes, and finiteness are trusted except at registered
     Jacobian mask points: non-finite determinant samples and a one-spacing
     neighborhood around each registered point are deliberately masked as part
-    of critical-curve extraction. The post-mask grid and outer-boundary
-    non-emptiness checks remain algorithmic completeness guards. ContourPy
-    output is independently validated.
+    of critical-curve extraction. A point at exactly one actual grid spacing
+    is masked. The post-mask grid and outer-boundary non-emptiness checks remain
+    algorithmic completeness guards. All valid outer-boundary eigenvalues of
+    the symmetrized Jacobian must be strictly positive. Critical-curve closure
+    and grid-boundary contact use an internal scale-aware tolerance distinct
+    from source-plane ``geometry_tolerance``. ContourPy output is independently
+    validated, and an in-tolerance but nonzero critical-curve endpoint gap is
+    closed by appending the first vertex before raytracing. The mapped
+    raytrace's paired shape, type, and finiteness remain trusted backend
+    postconditions apart from the endpoint-gap calculation.
     """
     contourpy = _import_contourpy()
     _, torch = _import_caustics_dependencies()
@@ -2476,6 +2503,32 @@ _POINT_CAUSTIC_CONTRACTION_FACTOR = 0.5
 
 @dataclass(frozen=True)
 class _PointCausticPartition:
+    """Separate contracting axisymmetric point caustics from regular curves.
+
+    Attributes
+    ----------
+    previous_curves : tuple of numpy.ndarray
+        Matched regular true-caustic curves from the penultimate snapshot.
+        Each producer-closed array has shape ``(P, 2)`` in source-plane
+        arcseconds.
+    current_curves : tuple of numpy.ndarray
+        Matched regular true-caustic curves from the final snapshot, ordered
+        one-to-one with ``previous_curves``. Each array has shape ``(P, 2)``
+        in source-plane arcseconds.
+    previous_points : tuple of numpy.ndarray
+        Axis-aligned bounding-box centers for contracting curves in the
+        penultimate snapshot. Each array has shape ``(2,)`` in source-plane
+        arcseconds.
+    current_points : tuple of numpy.ndarray
+        Corresponding final-snapshot point-caustic centers, each with shape
+        ``(2,)`` in source-plane arcseconds.
+
+    Notes
+    -----
+    The frozen dataclass prevents field reassignment but is only shallowly
+    immutable. NumPy arrays contained by all four tuples remain mutable.
+    """
+
     previous_curves: tuple[np.ndarray, ...]
     current_curves: tuple[np.ndarray, ...]
     previous_points: tuple[np.ndarray, ...]
@@ -2483,6 +2536,28 @@ class _PointCausticPartition:
 
 
 def _curve_center_and_diameter(curve):
+    """Measure a raw curve's axis-aligned center and bounding-box diagonal.
+
+    Parameters
+    ----------
+    curve : array-like, shape (P, 2)
+        Trusted source-plane x/y curve in arcseconds. An exactly repeated final
+        vertex is ignored when present.
+
+    Returns
+    -------
+    center : numpy.ndarray, shape (2,)
+        Midpoint of the curve's axis-aligned bounding box in arcseconds.
+    diameter : float
+        Euclidean length of that bounding-box diagonal in arcseconds.
+
+    Notes
+    -----
+    ``diameter`` is neither an arclength nor a maximum pairwise-vertex
+    distance, and ``center`` is not a centroid. Production callers guarantee a
+    nonempty curve with two coordinate columns; NumPy conversion and reduction
+    errors for malformed inputs propagate unchanged.
+    """
     points = np.asarray(curve, dtype=float)
     if np.array_equal(points[0], points[-1]):
         points = points[:-1]
@@ -2492,6 +2567,30 @@ def _curve_center_and_diameter(curve):
 
 
 def _raw_curve_hausdorff_distance(first_curve, second_curve):
+    """Compute a bidirectional nearest-vertex distance between raw curves.
+
+    Parameters
+    ----------
+    first_curve : array-like, shape (P, 2)
+        First trusted source-plane curve in arcseconds.
+    second_curve : array-like, shape (Q, 2)
+        Second trusted source-plane curve in arcseconds.
+
+    Returns
+    -------
+    float
+        Maximum of the two directed nearest-vertex distances, in arcseconds.
+
+    Notes
+    -----
+    An exactly repeated closing endpoint is omitted from each curve before
+    building its ``scipy.spatial.cKDTree``. This is a discrete vertex-set
+    Hausdorff distance computed directly from cKDTree vertex clouds; boundary
+    certification instead delegates to Shapely's LineString Hausdorff
+    implementation. Production callers guarantee nonempty finite curves with
+    two coordinate columns; conversion and tree-query errors otherwise
+    propagate unchanged.
+    """
     first = np.asarray(first_curve, dtype=float)
     second = np.asarray(second_curve, dtype=float)
     if np.array_equal(first[0], first[-1]):
@@ -2506,7 +2605,31 @@ def _raw_curve_hausdorff_distance(first_curve, second_curve):
 
 
 def _match_raw_caustic_curves(reference_curves, candidate_curves):
-    """Match raw mapped true-caustic curves without constructing geometry."""
+    """Match raw true-caustic curves by discrete Hausdorff assignment.
+
+    Parameters
+    ----------
+    reference_curves : sequence of array-like
+        Reference producer-closed curves, each with shape ``(P, 2)`` in
+        source-plane arcseconds.
+    candidate_curves : sequence of array-like
+        Candidate curves of the same form and units.
+
+    Returns
+    -------
+    ordered_candidates : tuple
+        Candidate objects reordered into reference-index order. Unequal counts
+        return the candidates unchanged; two empty sequences return ``()``.
+    counts_match : bool
+        Whether the curve counts agree. Two empty sequences count as a match.
+
+    Notes
+    -----
+    For equal nonzero counts, the Hungarian assignment minimizes the sum of
+    discrete bidirectional nearest-vertex distances. Matching does not build or
+    repair polygonal geometry, and the returned tuple retains the original
+    candidate array objects.
+    """
     if len(reference_curves) != len(candidate_curves):
         return tuple(candidate_curves), False
     if not reference_curves:
@@ -2535,7 +2658,39 @@ def _partition_axisymmetric_point_caustics(
     *,
     boundary_tolerance,
 ):
-    """Partition two matched contractions from regular true boundaries."""
+    """Partition certified contractions from regular true boundaries.
+
+    Parameters
+    ----------
+    older_curves : sequence of array-like
+        Raw true-caustic curves from the oldest of three successive snapshots,
+        each with shape ``(P, 2)`` in source-plane arcseconds.
+    previous_curves : sequence of array-like
+        Penultimate raw true-caustic curves in the same units.
+    current_curves : sequence of array-like
+        Final raw true-caustic curves in the same units.
+    boundary_tolerance : float
+        Inclusive maximum displacement of successive bounding-box centers, in
+        arcseconds.
+
+    Returns
+    -------
+    _PointCausticPartition or None
+        Regular penultimate/final curves plus corresponding point centers,
+        ordered by the oldest-snapshot assignment. ``None`` is the count
+        mismatch sentinel for either consecutive assignment.
+
+    Notes
+    -----
+    Curves are first matched from oldest to penultimate and then from the
+    reordered penultimate set to the final set. A matched triple is classified
+    as a point caustic only when each successive bounding-box diagonal is no
+    larger than half its predecessor and each successive center displacement
+    is no larger than ``boundary_tolerance``. All other triples remain regular
+    boundaries; there is no separate absolute-diameter threshold. The caller's
+    exact-axisymmetry capability gate, rather than this helper, decides whether
+    contraction classification is permitted.
+    """
     previous_curves, previous_counts_match = _match_raw_caustic_curves(
         older_curves,
         previous_curves,
@@ -2637,12 +2792,21 @@ def _resample_closed_curve(curve, num_points=64):
         Normalized source-plane boundary whose last vertex exactly repeats its
         first.
     num_points : int, optional
-        Number of unique equally spaced points to return.
+        Number of unique equally spaced points to return. Production callers
+        provide a positive integer.
 
     Returns
     -------
     numpy.ndarray, shape (num_points, 2)
-        Source-plane coordinates sampled without repeating the endpoint.
+        Source-plane coordinates in arcseconds, sampled without repeating the
+        endpoint.
+
+    Notes
+    -----
+    Sampling is piecewise linear in cumulative arclength over every segment,
+    including the final segment back to the exactly repeated first vertex.
+    The trusted normalized curve has positive total arclength; NumPy errors for
+    malformed curves or invalid sample counts propagate unchanged.
     """
     coordinates = np.asarray(curve, dtype=float)
     segment_lengths = np.linalg.norm(np.diff(coordinates, axis=0), axis=1)
@@ -2662,11 +2826,52 @@ def _resample_closed_curve(curve, num_points=64):
 
 
 def _curve_orientation_is_preserved(reference, candidate):
-    """Return whether a matched curve retains its producer direction."""
+    """Compare the traversal directions of two matched closed curves.
+
+    Parameters
+    ----------
+    reference : numpy.ndarray, shape (P, 2)
+        Normalized reference curve in source-plane arcseconds, with its first
+        vertex exactly repeated at the end.
+    candidate : numpy.ndarray, shape (Q, 2)
+        Normalized candidate curve in the same units and closure convention.
+
+    Returns
+    -------
+    bool
+        Whether forward candidate traversal is no farther from the reference
+        than reversed traversal after optimal cyclic registration.
+
+    Notes
+    -----
+    Each curve is resampled to 64 unique equal-arclength points. Comparison is
+    cyclically registered at that 64-sample resolution, reducing sensitivity
+    to the chosen starting vertex while intentionally detecting a
+    producer-direction reversal. It is not a continuous phase optimization.
+    An exact forward/reverse tie is treated as preserved orientation.
+    """
     reference_points = _resample_closed_curve(reference)
     candidate_points = _resample_closed_curve(candidate)
 
     def minimum_cyclic_distance(points):
+        """Minimize mean squared displacement over all cyclic registrations.
+
+        Parameters
+        ----------
+        points : numpy.ndarray, shape (64, 2)
+            Candidate equal-arclength samples in source-plane arcseconds.
+
+        Returns
+        -------
+        float
+            Minimum mean squared pointwise distance to the enclosing
+            ``reference_points``, in square arcseconds.
+
+        Notes
+        -----
+        The closure compares all cyclic shifts and trusts the candidate and
+        reference sample counts to agree.
+        """
         return min(
             float(
                 np.mean(
@@ -2698,8 +2903,8 @@ def _boundary_regions(curves, *, geometry_tolerance):
     Returns
     -------
     tuple of shapely geometry
-        Repaired finite positive-area region corresponding to each input curve,
-        in input order.
+        Repaired finite positive-area polygonal region corresponding to each
+        input curve, in input order. Areas are in square arcseconds.
 
     Raises
     ------
@@ -2711,6 +2916,10 @@ def _boundary_regions(curves, *, geometry_tolerance):
 
     Notes
     -----
+    Each normalized ring is passed independently through
+    ``shapely.make_valid(..., method="structure")``. Invalid or
+    self-intersecting boundaries may therefore become multi-component regions,
+    but different input boundaries are neither matched nor unioned here.
     Precision-grid snapping is not performed here; the tolerance controls only
     curve normalization. Final union snapping belongs to
     ``_build_strong_lensing_region``.
@@ -2764,6 +2973,19 @@ def _match_boundary_curves(reference_curves, candidate_curves, *, geometry_toler
         If the optional Shapely dependency is unavailable.
     RuntimeError
         If normalization collapses a curve below three unique vertices.
+
+    Notes
+    -----
+    Equal nonzero sets are assigned with the Hungarian algorithm to minimize
+    total Shapely line Hausdorff distance, then returned in reference-index
+    order. Orientation is evaluated only after that assignment. Unlike
+    ``_match_raw_caustic_curves``, this helper normalizes curves and delegates
+    each distance to Shapely LineString geometry rather than querying cKDTree
+    vertex clouds directly.
+
+    Count mismatch is a non-exceptional convergence sentinel: displacement is
+    ``inf``, both stability flags are false, and candidate order is unchanged.
+    Two empty sets return zero displacement with both flags true.
     """
     if len(reference_curves) != len(candidate_curves):
         return tuple(candidate_curves), np.inf, False, False
@@ -2813,7 +3035,9 @@ def _boundary_topology_signature(geometry, *, geometry_tolerance):
     relations : tuple
         Pairwise Boolean relation tuples in combined true-then-pseudo region
         order. Each tuple contains ``(disjoint, within, contains, overlaps,
-        touches)`` for one increasing index pair.
+        touches)`` for one increasing index pair. Directional ``within`` and
+        ``contains`` predicates describe the lower-index region relative to the
+        higher-index region.
 
     Raises
     ------
@@ -2821,6 +3045,14 @@ def _boundary_topology_signature(geometry, *, geometry_tolerance):
         If the optional Shapely dependency is unavailable.
     RuntimeError
         If a boundary cannot be normalized into positive-area geometry.
+
+    Notes
+    -----
+    True and pseudo boundary types remain distinct in ``typed_counts``. Within
+    each type, the caller-established matching order controls both count and
+    pairwise-relation order. Geometry positions and metric displacements are
+    deliberately absent from the signature, and certified point caustics are
+    ignored.
     """
     true_regions = _boundary_regions(
         geometry.caustic_curves,
@@ -2845,6 +3077,12 @@ def _boundary_topology_signature(geometry, *, geometry_tolerance):
             Number of polygon components.
         interior_ring_count : int
             Total number of holes across all components.
+
+        Notes
+        -----
+        ``_boundary_regions`` guarantees repaired polygonal input. A Polygon
+        counts as one component; otherwise every member of the trusted
+        MultiPolygon's ``geoms`` sequence is counted.
         """
         polygons = (region,) if region.geom_type == "Polygon" else tuple(region.geoms)
         return len(polygons), sum(len(polygon.interiors) for polygon in polygons)
@@ -2891,10 +3129,24 @@ def _compare_boundary_geometry(previous, current, geometry_tolerance):
         Whether typed curve counts, producer directions, and the complete
         topology signature match.
 
+    Raises
+    ------
+    ImportError
+        If the optional Shapely dependency is unavailable.
+    RuntimeError
+        If any curve collapses during normalization or cannot produce a finite
+        positive-area repaired region.
+
     Notes
     -----
     Matching never crosses true/pseudo boundary types. Reordered arrays remain
     realization-local and are not cached on a node or across snapshots.
+    Unequal counts yield infinite displacement through the matching sentinel.
+    This helper does not apply ``boundary_tolerance``; the certification caller
+    owns the displacement-threshold decision.
+    ``point_caustics`` are copied through on the current snapshot but are not
+    matched, measured, or included in topology here; the axisymmetric
+    certification caller owns their count and center-stability checks.
     """
     caustic_curves, caustic_displacement, caustic_counts_stable, caustic_orientation_stable = (
         _match_boundary_curves(
@@ -2949,7 +3201,8 @@ def _source_boundary_clearance(source_x, source_y, geometry, geometry_tolerance)
     source_y : float
         Source-plane y position in arcseconds.
     geometry : _BoundaryGeometry
-        Certified snapshot containing at least one true or pseudo boundary.
+        Certified snapshot containing at least one regular true or pseudo
+        boundary.
     geometry_tolerance : float
         Curve-normalization tolerance in arcseconds.
 
@@ -2965,6 +3218,15 @@ def _source_boundary_clearance(source_x, source_y, geometry, geometry_tolerance)
         If the optional Shapely dependency is unavailable.
     RuntimeError
         If normalization collapses a producer-certified boundary.
+    ValueError
+        If the snapshot contains no regular true or pseudo boundary from which
+        a minimum distance can be taken.
+
+    Notes
+    -----
+    Clearance is the minimum Euclidean distance to normalized boundary
+    LineStrings. Certified point caustics are intentionally excluded because
+    they have no radius or boundary uncertainty.
     """
     curves = (*geometry.caustic_curves, *geometry.pseudo_caustic_curves)
     shapely = _import_shapely()
@@ -2999,7 +3261,8 @@ def _build_strong_lensing_region(
     -------
     shapely geometry
         Valid, finite, positive-area strong-lensing geometry. Disconnected
-        components, concavities, and holes are retained.
+        components, concavities, and holes are preserved subject to overlap
+        and precision-grid snapping; area is measured in square arcseconds.
 
     Raises
     ------
@@ -3015,9 +3278,12 @@ def _build_strong_lensing_region(
     Each boundary is converted to its own interior before union. The final
     union applies a Shapely precision grid with spacing
     ``geometry_tolerance``; this can genuinely collapse geometry and is why
-    the final area check is retained. Per-boundary construction preserves
-    concavities and holes and avoids accepting bounded faces collectively
+    the final area check is retained. Per-boundary construction represents each
+    input's concavities and holes before union, subject to subsequent overlap
+    and precision snapping, and avoids accepting bounded faces collectively
     formed by several curves but inside none of their individual interiors.
+    An empty input set reaches the same final non-positive-area
+    ``RuntimeError`` guard.
     """
     shapely = _import_shapely()
     curves = [*caustic_curves, *pseudo_caustic_curves]
@@ -3076,6 +3342,8 @@ def _sample_position(
 
     Raises
     ------
+    ImportError
+        If the optional Shapely dependency is unavailable.
     RuntimeError
         If no point is accepted within ``max_attempts``, with lens identity,
         geometry settings, bounding-box area, and polygon area in the message.
@@ -3083,10 +3351,13 @@ def _sample_position(
     Notes
     -----
     Production callers provide a validated finite positive-area polygonal
-    region. Sampling uses uniform draws over its bounding box followed by
-    strict interior rejection. The returned attempt count is one-based, and
-    the supplied sample-local generator isolates variable rejection counts
-    from other graph samples.
+    region. Sampling uses uniform draws over its axis-aligned bounding box
+    followed by Shapely's strict ``contains_xy`` interior test, so boundary
+    points are rejected. An excluded point is rejected only when both sampled
+    Python floats are exactly equal to its two coordinates; no tolerance or
+    exclusion radius is applied. Each attempt consumes the x draw before the y
+    draw. The returned attempt count is one-based, and the supplied sample-local
+    generator isolates variable rejection counts from other graph samples.
     """
     shapely = _import_shapely()
     bounds = tuple(float(value) for value in region.bounds)
@@ -3154,26 +3425,45 @@ def _validate_source_position_configuration(
         Float-convertible positive certification tolerance in arcseconds, at
         least ``geometry_tolerance``.
     max_boundary_refinements : int
-        Positive maximum number of boundary-refinement comparisons.
+        Positive maximum number of factor-of-two boundary-refinement steps.
     max_attempts : int
         Positive maximum number of rejection draws per realization.
 
     Returns
     -------
     normalized : dict[str, float]
-        Finite normalized values for ``pixelscale``,
+        New mapping with exactly the float-valued keys ``pixelscale``,
         ``pseudo_caustic_epsilon``, ``geometry_tolerance``,
-        ``boundary_tolerance``, and ``fov_expansion_factor``, plus ``fov``
-        when configured.
+        ``boundary_tolerance``, and ``fov_expansion_factor``; the additional
+        key ``fov`` is present only when ``fov`` was configured. Integer
+        settings are validated, while pre-normalized ``pixelscale_fraction``
+        is consumed only for the static FOV relation; neither is returned.
 
     Raises
     ------
     TypeError
         If a normalized scalar cannot be converted to float.
     ValueError
-        If an integer setting is outside its ordinary type/range contract, a
-        scalar is non-finite or outside its range, or the FOV, pixel-scale, and
-        tolerance relations are inconsistent.
+        If an integer setting is outside its built-in ``int`` type/range
+        contract, a scalar is non-finite or outside its range, or the FOV,
+        pixel-scale, and tolerance relations are inconsistent.
+
+    Notes
+    -----
+    All normalized angular settings must be finite and strictly positive;
+    ``fov_expansion_factor`` must instead be finite and strictly greater than
+    one. ``geometry_tolerance`` must be strictly smaller than configured
+    ``pixelscale``, while ``boundary_tolerance`` may equal but not undercut
+    ``geometry_tolerance``. A configured absolute ``fov`` must exceed
+    ``pixelscale`` only when relative pixel scaling is disabled; the relative
+    FOV relation is checked after realization. This helper does not recompare
+    ``geometry_tolerance`` with a potentially smaller fractional realized
+    pixelscale. ``max_fov_expansions`` is non-negative,
+    ``pseudo_caustic_points`` is at least three, and both
+    ``max_boundary_refinements`` and ``max_attempts`` are positive. Unlike the
+    image node's integer settings, these four checks use
+    ``isinstance(value, int)``: NumPy integer scalars are rejected, while
+    booleans follow Python's ``bool``-is-an-``int`` subclass semantics.
     """
     numeric_settings = {
         "pixelscale": pixelscale,
@@ -3215,7 +3505,43 @@ def _validate_source_position_configuration(
 
 
 def _validate_source_geometry_support(lens_spec, lens, name="lens"):
-    """Reject realized geometries that source-region sampling cannot certify."""
+    """Validate the source-region support tier of a realized lens tree.
+
+    Parameters
+    ----------
+    lens_spec : CausticsLensSpec
+        Registered atomic or recursive specification corresponding exactly to
+        ``lens``.
+    lens : object
+        Realized Caustics atomic lens or ``SinglePlane`` subtree.
+    name : str, optional
+        Generated positional component name used in diagnostics. Child index
+        ``i`` appends ``_<i>`` recursively, beginning with ``"lens"``.
+
+    Returns
+    -------
+    None
+        Every atomic component belongs to the currently certifiable
+        source-position geometry tier.
+
+    Raises
+    ------
+    NotImplementedError
+        If any realized EPL component has slope ``t > 1``. The message names
+        the recursive component and advises restricting the prior to
+        ``t <= 1`` or using ``CausticsLensImageNode`` until the unbounded
+        multi-image source geometry is supported.
+    ValueError
+        If trusted specification and realized composite child counts differ,
+        as reported by strict recursive pairing.
+
+    Notes
+    -----
+    The general EPL model domain is established elsewhere. This validator adds
+    only the source-position node's supported tier, ``t <= 1``; the image node
+    continues to support steeper physically valid EPL realizations. The first
+    unsupported depth-first component raises and stops traversal.
+    """
     if lens_spec.model == "EPL":
         slope = _caustics_scalar(lens.t.value)
         if slope > 1.0:
@@ -3250,8 +3576,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         include the lens-redshift setter ``z_l``.
     cosmology : caustics.Cosmology
         Fixed cosmology inherited by every realized lens.
-    source_redshift : parameter
-        Dimensionless source-redshift setter.
+    source_redshift : object
+        Graph setter for dimensionless source redshift.
     fov : float or None, optional
         Initial image-plane critical-curve search width in arcseconds. When
         None, the realized total-lens geometry adapter derives a starting width
@@ -3292,8 +3618,43 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
     Attributes
     ----------
+    lens : CausticsLensSpec
+        Stored registered specification used to construct a fresh realized lens
+        tree for every graph sample.
     cosmology : caustics.Cosmology
         Fixed node-owned cosmology excluded from the sampled ``GraphState``.
+    fov : float or None
+        Normalized configured initial image-plane search width in arcseconds,
+        or ``None`` for adapter-derived realization.
+    pixelscale : float
+        Normalized absolute Jacobian-grid spacing upper bound in arcseconds.
+    pixelscale_fraction : float or None
+        Normalized dimensionless relative-spacing fraction, or ``None``.
+    max_fov_expansions : int
+        Stored maximum number of bounded FOV expansions.
+    fov_expansion_factor : float
+        Stored dimensionless expansion multiplier.
+    pseudo_caustic_points : int
+        Stored initial unique-vertex count for each pseudo-caustic loop.
+    pseudo_caustic_epsilon : float
+        Stored initial pseudo-caustic loop radius in arcseconds.
+    geometry_tolerance : float
+        Stored curve normalization and topology tolerance in arcseconds.
+    boundary_tolerance : float
+        Stored certification displacement tolerance in arcseconds.
+    max_boundary_refinements : int
+        Stored maximum number of factor-of-two refinement steps.
+    max_attempts : int
+        Stored maximum number of rejection draws per realization.
+    _rng : numpy.random.Generator
+        Node-owned seeded fallback generator used only when ``compute`` is not
+        given ``rng_info``.
+    source_redshift : AttributeIndicator
+        Dynamic graph input for dimensionless source redshift.
+    lens_<path>_<field> : AttributeIndicator
+        Dynamic graph inputs flattened from ``lens``. The root path begins
+        ``lens`` (including ``lens_z_l``); nested ``SinglePlane`` child indices
+        are inserted before the atomic field name.
     source_x : AttributeIndicator
         Graph output for sampled source-plane x position in arcseconds.
     source_y : AttributeIndicator
@@ -3313,7 +3674,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     source_boundary_clearance : AttributeIndicator
         Graph output for nearest regular typed-boundary distance in arcseconds.
     boundary_refinements : AttributeIndicator
-        Graph output for the completed boundary-refinement count.
+        Graph output for the number of completed factor-of-two refinement
+        steps.
 
     Notes
     -----
@@ -3348,11 +3710,24 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
     Structural repair converts every final regular-boundary interior into valid
     polygonal geometry before union, and signed winding over those regular
-    curves provides the certified image count. Results are saved in
-    ``GraphState``; a caller RNG takes precedence over the seeded fallback, and
-    sample-local sub-seeds isolate variable rejection counts. Persisted
-    coordinates and diagnostics make downstream use deterministic from the
-    sampled state.
+    curves provides the certified image count. A sampled point is accepted only
+    after the penultimate and final winding counts agree and its final regular
+    boundary clearance is strictly greater than the matched-boundary
+    uncertainty; certification failure does not resample the point.
+
+    The exact output order is ``source_x``, ``source_y``,
+    ``strong_lensing_area``, ``sampling_attempts``, ``expected_num_images``,
+    ``critical_curve_fov``, ``boundary_uncertainty``,
+    ``source_boundary_clearance``, and ``boundary_refinements``. Each is a
+    NumPy scalar for one graph sample and has shape ``(S,)`` for ``S > 1``;
+    ``strong_lensing_area`` is in square arcseconds,
+    ``sampling_attempts`` is one-based, and ``boundary_refinements`` counts
+    completed factor-of-two steps. Results are saved in ``GraphState`` only
+    after every graph sample succeeds. A caller RNG takes precedence over the
+    seeded fallback, and exactly one unsigned 64-bit sub-seed per graph sample
+    is drawn up front before any per-sample work. Sample-local generators
+    isolate variable rejection counts, while persisted coordinates and
+    diagnostics make downstream use deterministic from the sampled state.
 
     References
     ----------
@@ -3429,7 +3804,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             Positive matched-boundary tolerance in arcseconds, at least
             ``geometry_tolerance``.
         max_boundary_refinements : int, optional
-            Positive maximum number of boundary-refinement comparisons.
+            Positive maximum number of factor-of-two boundary-refinement
+            steps.
         max_attempts : int, optional
             Positive maximum rejection-draw count per realization.
         seed : object, optional
@@ -3457,9 +3833,18 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         ``source_redshift`` is registered directly. The fixed ``cosmology`` is
         stored on the node rather than registered. Lens parameters use
         ``lens_<field>`` at the root and positional path segments inside nested
-        planes. All nine public outputs are registered in ``_OUTPUTS`` order.
+        planes. The nine public outputs are registered in exact order:
+        ``source_x``, ``source_y``, ``strong_lensing_area``,
+        ``sampling_attempts``, ``expected_num_images``,
+        ``critical_curve_fov``, ``boundary_uncertainty``,
+        ``source_boundary_clearance``, and ``boundary_refinements``.
+        Source-node integer checks use ``isinstance(value, int)``: NumPy
+        integer scalars are rejected, while booleans follow Python's integer
+        subclass semantics before range checks.
         The seeded node-owned generator is used only when ``compute`` receives
-        no caller generator.
+        no caller generator. Exceptions raised by
+        ``numpy.random.default_rng`` for an unsupported ``seed`` propagate
+        unchanged.
         """
         if not isinstance(lens, CausticsLensSpec):
             raise TypeError("lens must be a CausticsLensSpec.")
@@ -3511,11 +3896,30 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         )
 
     def _lens_description(self):
-        """Return a deterministic description of the root lens."""
+        """Describe the configured root lens deterministically.
+
+        Returns
+        -------
+        str
+            Text of the form ``"lens model '<model>'"`` using the root
+            specification's model name.
+        """
         return f"lens model {self.lens.model!r}"
 
     def _lens_identifier(self, sample_index):
-        """Return the lens specification, graph sample, and node identifier."""
+        """Build a contextual identifier for one graph realization.
+
+        Parameters
+        ----------
+        sample_index : int
+            Zero-based graph sample index.
+
+        Returns
+        -------
+        str
+            Root lens description, sample index, and current ``node_string``
+            for use in failure diagnostics.
+        """
         return f"{self._lens_description()} sample {sample_index} at node '{self.node_string}'"
 
     def _realized_pixelscale_for_one_lens(self, geometry_adapter, values):
@@ -3622,15 +4026,23 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         Raises
         ------
+        ImportError
+            If optional Caustics, Torch, or ContourPy dependencies are
+            unavailable.
+        ValueError
+            If dynamic initial-FOV realization is no larger than the requested
+            scale.
         RuntimeError
-            If ``_CausticFOVError`` persists through the configured bounded
+            If contour or mapping validation fails, or if
+            ``_CausticFOVError`` persists through the configured bounded
             expansion schedule.
 
         Notes
         -----
         Each retry multiplies the current FOV by
         ``fov_expansion_factor`` while retaining the same requested
-        ``pixelscale``.
+        ``pixelscale``. Only ``_CausticFOVError`` is caught; structural
+        ``RuntimeError`` instances and backend exceptions propagate unchanged.
         """
         if initial_fov is None:
             initial_fov = self._initial_fov_for_one_lens(
@@ -3703,7 +4115,20 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         _BoundaryGeometry
             Snapshot containing separate total-lens true and mapped pseudo
             boundaries, the successful FOV, requested scale upper bound, and
-            pseudo-caustic resolution.
+            pseudo-caustic resolution. True curves have shape ``(P, 2)`` and
+            each pseudo curve has shape ``(pseudo_caustic_points + 1, 2)`` in
+            source-plane arcseconds, including its repeated endpoint.
+
+        Raises
+        ------
+        ImportError
+            If an optional Caustics, Torch, or ContourPy dependency is
+            unavailable.
+        ValueError
+            If dynamic initial-FOV realization violates the realized scale.
+        RuntimeError
+            If bounded critical-curve extraction, contour validation, mapped
+            closure, or pseudo-caustic convergence fails.
 
         Notes
         -----
@@ -3774,19 +4199,35 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         Raises
         ------
+        ImportError
+            If an optional Caustics, Torch, ContourPy, or Shapely dependency is
+            unavailable.
+        ValueError
+            If a dynamic initial FOV is no larger than its requested grid
+            scale.
         RuntimeError
-            If displacement and typed topology do not converge within
+            If snapshot extraction or geometry normalization fails, or if
+            displacement and typed topology do not converge within
             ``max_boundary_refinements``.
 
         Notes
         -----
         Each refinement halves the requested grid scale and doubles the number
-        of pseudo-caustic vertices. Non-axisymmetric systems compare two raw
-        snapshots. Exactly axisymmetric systems first partition contracting
+        of pseudo-caustic vertices. After the baseline snapshot, each refined
+        extraction warm-starts its FOV recovery from the preceding snapshot's
+        successful ``critical_curve_fov``. Non-axisymmetric systems compare two
+        raw snapshots. Exactly axisymmetric systems first partition contracting
         point caustics across three raw snapshots, then apply the unchanged
         regular-boundary topology and displacement policy. Certified point
         centers must also retain their count and move no farther than
         ``boundary_tolerance``, but they do not enter boundary uncertainty.
+        ``axisymmetry_center(values)`` is used only as a ``None``/non-``None``
+        capability gate; its coordinate is not used by the contraction test.
+        Axisymmetric certification requires three snapshots and therefore at
+        least two completed refinements even though configuration accepts a
+        refinement limit of one. Exhaustion diagnostics report the last
+        penultimate and current requested scales, pseudo-caustic point counts,
+        successful FOVs, displacement, and topology flag.
         """
         axisymmetry_center = geometry_adapter.axisymmetry_center(values)
         older = None
@@ -3914,20 +4355,29 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         boundary_uncertainty : float
             Maximum matched-boundary displacement in arcseconds.
         boundary_refinements : int
-            Completed boundary-refinement count.
+            Number of completed factor-of-two boundary-refinement steps.
         region : shapely.Polygon or shapely.MultiPolygon
-            Complete supported strong-lensing source region.
+            Complete supported strong-lensing source region with coordinates
+            in arcseconds and area in square arcseconds.
         realized_pixelscale : float
             Realized initial requested grid-spacing upper bound in arcseconds.
 
         Raises
         ------
         ImportError
-            If an optional Caustics, ContourPy, or Shapely dependency is
+            If an optional Caustics, Torch, ContourPy, or Shapely dependency is
             unavailable.
+        KeyError
+            If a required flattened lens or source-redshift input is absent.
+        TypeError
+            If a realized backend scalar cannot be converted as required.
         ValueError
             If realized lens, adapter, or FOV/scale inputs violate their owned
             domains.
+        NotImplementedError
+            If a realized EPL component has ``t > 1`` and therefore lies
+            outside the source-region certification tier. The propagated
+            message advises restricting ``t`` or using the image node.
         RuntimeError
             If critical-curve or boundary certification exhausts, or topology
             construction collapses.
@@ -4007,14 +4457,29 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                arcseconds;
             8. ``source_boundary_clearance``, nearest typed-boundary
                distance in arcseconds;
-            9. ``boundary_refinements``, completed refinement count.
+            9. ``boundary_refinements``, completed factor-of-two refinement
+               step count.
 
-            Each value is a scalar when ``graph_state.num_samples == 1`` and
-            a NumPy array with shape ``(S,)`` for ``S`` graph samples
-            otherwise.
+            Each value is a NumPy scalar when
+            ``graph_state.num_samples == 1`` and a NumPy array with shape
+            ``(S,)`` for ``S`` graph samples otherwise.
 
         Raises
         ------
+        ImportError
+            If an optional Caustics, Torch, ContourPy, or Shapely dependency is
+            unavailable.
+        KeyError
+            If a required realized source or flattened lens input is absent.
+        TypeError
+            If a realized scalar cannot be normalized by its owning lens or
+            backend operation.
+        ValueError
+            If realized lens parameters, redshifts, adapter geometry, or
+            dynamic FOV/scale relations violate their owned domains.
+        NotImplementedError
+            If any realized EPL component has ``t > 1``; the source-position
+            node cannot yet certify that source-region tier.
         RuntimeError
             If bounded critical-curve extraction, boundary certification, or
             rejection sampling exhausts, or the sampled source fails
@@ -4023,10 +4488,25 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         Notes
         -----
         All nine results are persisted to this node's ``GraphState``
-        entries. The caller generator takes precedence over the fallback
-        generator. Exactly ``S`` unsigned 64-bit sub-seeds are drawn before
-        any per-sample rejection, then one independent generator is created per
-        sample so variable rejection counts cannot perturb later samples.
+        entries only after every sample succeeds. The caller generator takes
+        precedence over the fallback generator. Exactly ``S`` unsigned 64-bit
+        sub-seeds in ``[0, 2**63)`` are drawn before any per-sample geometry or
+        rejection work, then one independent generator is created per sample
+        so variable rejection counts cannot perturb later samples. The chosen
+        parent generator has therefore consumed all ``S`` seeds even if a
+        later sample raises.
+
+        The proposal must lie strictly inside the repaired union and must not
+        equal a certified point caustic exactly. It is not redrawn after
+        certification: the penultimate and final signed-winding image counts
+        must agree, and final regular-boundary clearance must be strictly
+        greater than boundary uncertainty, or the method raises before saving
+        any of this call's results. Sampling-exhaustion context includes
+        ``fov``, configured/fractional/realized pixel-scale settings,
+        ``max_fov_expansions``, pseudo-caustic settings, both tolerances, and
+        ``max_boundary_refinements``. The sampler reports ``max_attempts``
+        separately; the context mapping does not include
+        ``fov_expansion_factor``.
         """
         input_values = self._build_inputs(graph_state, **kwargs)
         num_samples = graph_state.num_samples
@@ -4221,8 +4701,50 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
     Attributes
     ----------
+    lens : CausticsLensSpec
+        Stored registered specification used to construct a fresh realized lens
+        tree for every graph sample.
     cosmology : caustics.Cosmology
         Fixed node-owned cosmology excluded from the sampled ``GraphState``.
+    max_images : int
+        Stored fixed image-output width and maximum accepted active count.
+    min_images : int
+        Stored minimum count required after bounded recovery.
+    fov_multiplier : float
+        Stored dimensionless multiplier applied to each realized initial FOV.
+    pixelscale : float
+        Stored absolute requested grid-spacing upper bound in arcseconds.
+    pixelscale_fraction : float or None
+        Stored dimensionless relative-spacing fraction, or ``None``.
+    epsilon : float
+        Stored absolute source-residual tolerance in arcseconds.
+    epsilon_fraction : float or None
+        Stored dimensionless relative-residual fraction, or ``None``.
+    max_depth : int
+        Stored Caustics global-search tree depth.
+    max_fov_expansions : int
+        Stored maximum number of outer FOV expansion steps.
+    fov_expansion_factor : float
+        Stored dimensionless FOV expansion multiplier.
+    max_pixelscale_refinements : int
+        Stored maximum number of outer requested-scale refinement steps.
+    pixelscale_refinement_factor : float
+        Stored dimensionless requested-scale refinement multiplier.
+    source_redshift : AttributeIndicator
+        Dynamic graph input for dimensionless source redshift.
+    source_x : AttributeIndicator
+        Dynamic graph input for finite source-plane x position in arcseconds.
+    source_y : AttributeIndicator
+        Dynamic graph input for finite source-plane y position in arcseconds.
+    fov : AttributeIndicator
+        Dynamic graph input realizing to an image-plane FOV in arcseconds or
+        ``None`` for adapter-derived extent.
+    expected_num_images : AttributeIndicator
+        Dynamic graph input realizing to an integer target or ``None``.
+    lens_<path>_<field> : AttributeIndicator
+        Dynamic graph inputs flattened from ``lens``. The root path begins
+        ``lens`` (including ``lens_z_l``); nested ``SinglePlane`` child indices
+        are inserted before each atomic field name.
     num_images : AttributeIndicator
         Graph output for active image count.
     image_x : AttributeIndicator
@@ -4239,7 +4761,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
     solver_fov : AttributeIndicator
         Graph output for final accepted or bounded-deficit FOV in arcseconds.
     solver_pixelscale : AttributeIndicator
-        Graph output for actual accepted spacing in arcseconds.
+        Graph output for the final successful global variant's actual spacing
+        in arcseconds.
     solver_attempts : AttributeIndicator
         Graph output counting every global Caustics invocation and every
         executed targeted-recovery batch.
@@ -4275,7 +4798,20 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
     numerical-center shift retains the base division count and base spacing.
     Both variants add a global solver attempt, and neither changes the outer
     expansion/refinement counters. Fixed-width GraphState outputs use the
-    padding and sentinel conventions documented above.
+    padding and sentinel conventions documented above. Active images retain no
+    local deduplication and are ordered by increasing delay, then x, then y.
+
+    The exact output order is ``num_images``, ``image_x``, ``image_y``,
+    ``macro_magnifications``, ``time_delays``, ``image_count_deficit``,
+    ``solver_fov``, ``solver_pixelscale``, ``solver_attempts``,
+    ``solver_fov_expansions``, and ``solver_pixelscale_refinements``. Image
+    coordinates and delays are NaN-padded, magnifications are zero-padded, and
+    ``image_count_deficit`` is ``-1`` when no expectation is supplied. All
+    count and diagnostic outputs are NumPy scalars for one sample while the
+    four image outputs have shape ``(M,)``, where ``M = max_images``. For
+    ``S > 1`` those shapes become ``(S,)`` and ``(S, M)`` respectively. All
+    eleven outputs are persisted in that order; image solving is deterministic
+    for realized inputs and does not consume caller RNG state.
 
     References
     ----------
@@ -4391,8 +4927,17 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         Source coordinates, source redshift, FOV, and optional expected count
         are registered directly. The fixed ``cosmology`` is stored on the node
         rather than registered. Lens parameters use ``lens_<field>`` at the
-        root and positional path segments inside nested planes. All eleven
-        public outputs are registered in ``_OUTPUTS`` order.
+        root and positional path segments inside nested planes. The eleven
+        public outputs are registered in exact order: ``num_images``,
+        ``image_x``, ``image_y``, ``macro_magnifications``, ``time_delays``,
+        ``image_count_deficit``, ``solver_fov``, ``solver_pixelscale``,
+        ``solver_attempts``, ``solver_fov_expansions``, and
+        ``solver_pixelscale_refinements``. Image-node integer validation uses
+        the ``(int, numpy.integer)`` contract; booleans follow Python's integer
+        subclass semantics before the stated range checks. Graph setters and
+        the identity-stored cosmology are not realized or physically validated
+        by this constructor; those checks remain with per-sample solving and
+        the Caustics backend.
         """
         if not isinstance(lens, CausticsLensSpec):
             raise TypeError("lens must be a CausticsLensSpec.")
@@ -4564,12 +5109,26 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             Global image coordinates in the physical image-plane coordinate
             system, in arcseconds.
 
+        Raises
+        ------
+        RuntimeError
+            If the Caustics global solver reports a numerical failure,
+            including the exact singular failures classified by ``_solve_one``.
+        IndexError
+            If the Caustics global solver reports an indexing failure,
+            including the exact empty-candidate failure classified by
+            ``_solve_one``.
+
         Notes
         -----
         This helper is the architectural boundary for exactly one Caustics
         invocation. A shifted numerical grid center changes only the search
         grid; returned coordinates are never translated. Paired output shapes,
-        types, and finiteness are trusted Caustics postconditions.
+        types, and finiteness are trusted Caustics postconditions. It catches
+        and classifies no exception itself: the nested ``attempt`` closure owns
+        the two narrow retry predicates, and every other backend exception
+        propagates unchanged. The returned rows are not translated, sorted,
+        deduplicated, or independently validated.
         """
         image_x, image_y = lens.forward_raytrace(
             beta_x,
@@ -4594,8 +5153,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             ``source_x`` and ``source_y`` in arcseconds; realized ``fov``,
             which may be ``None`` or a positive finite value in arcseconds;
             required ``expected_num_images``, whose value may be ``None`` or
-            an ordinary integer in the configured range; and every flattened
-            lens-specification graph input.
+            an ``int`` or ``numpy.integer`` in the configured range; and every
+            flattened lens-specification graph input.
 
         Returns
         -------
@@ -4611,16 +5170,19 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             Six scalar entries. ``image_count_deficit`` is expected minus
             recovered count, or ``-1`` without an expectation;
             ``solver_fov`` is the final accepted or bounded-deficit FOV in
-            arcseconds; ``solver_pixelscale`` is actual accepted grid spacing
-            in arcseconds; ``solver_attempts`` counts global calls and
-            executed targeted batches; and ``solver_fov_expansions`` and
+            arcseconds; ``solver_pixelscale`` is the actual spacing of the
+            final successful global grid variant in arcseconds;
+            ``solver_attempts`` counts global calls and executed targeted
+            batches; and ``solver_fov_expansions`` and
             ``solver_pixelscale_refinements`` count outer steps only.
 
         Notes
         -----
         All four arrays use the same deterministic ordering: increasing delay,
-        then image x, then image y. Padding to ``max_images`` is performed by
-        ``compute``.
+        then image x, then image y. Delays are normalized by subtracting their
+        minimum before the shared sort. Padding to ``max_images`` is performed
+        by ``compute``. Magnifications are absolute, so signed image parity is
+        not retained.
 
         A ``None`` FOV uses the realized adapter's total-lens extent; an
         explicit realized FOV overrides that extent. Either value is multiplied
@@ -4630,9 +5192,12 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         is ``min(realized_epsilon, actual_grid_spacing)``, while recovery-point
         neighborhood occupancy and root locality use the actual grid spacing.
         Each outer attempt is independent, so its global coordinates replace
-        rather than merge with any earlier attempt. Supplemental roots are
-        local to a successful, nonempty, deficient attempt and run only when
-        the adapter supplies explicit recovery points.
+        rather than merge with any earlier attempt; the solver does not retain
+        the best earlier count. Supplemental roots are local to a successful,
+        nonempty, deficient attempt and run only when the adapter supplies
+        explicit recovery points with at least one unoccupied neighborhood.
+        They are appended without local deduplication, so every returned array
+        and count retains duplicates supplied by global or targeted solving.
 
         The divisions-plus-one variant changes actual spacing; the half-cell
         numerical-center shift retains base divisions and base spacing. Both
@@ -4641,7 +5206,13 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         unchanged. All bounded FOV expansions run before requested-scale
         refinements. After retryable exhaustion, ``None`` coordinates are
         normalized to an empty array; recovery below ``min_images`` raises,
-        while a bounded deficit at or above that minimum may be returned.
+        while a bounded deficit at or above that minimum may be returned. Such
+        a nonzero bounded deficit can occur only when an explicit expected
+        count is configured, because the no-expectation contract completes as
+        soon as ``min_images`` is reached. Exceptions from Caustics or Torch
+        that do not satisfy the two exact retry classifiers propagate
+        unchanged. This helper returns realization-local values and does not
+        persist anything to ``GraphState``.
 
         Raises
         ------
@@ -4650,14 +5221,18 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         KeyError
             If a required realized input is absent.
         TypeError
-            If an owned realized scalar cannot be normalized or a redshift is
-            not scalar.
+            If an owned source-coordinate or explicit-FOV scalar cannot be
+            normalized, or a downstream constructor/backend reports a type
+            failure.
         ValueError
             If source coordinates, FOV, expected count, redshifts, or the
             realized lens specification violate their owned domains.
         RuntimeError
             If a recovered count exceeds its expectation or ``max_images``,
             or bounded recovery exhausts below ``min_images``.
+        IndexError
+            If Caustics raises an indexing error outside the exact recognized
+            empty-candidate retry classifier.
         """
         source_coordinates = {}
         for name in ("source_x", "source_y"):
@@ -4747,7 +5322,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             This closure reads enclosing mutable recovery state but performs no
             solver call and changes no counter. ``initial_fov`` already
             includes the configured ``fov_multiplier``; the raw realized FOV
-            and multiplier are not separate diagnostic fields.
+            and multiplier are not separate diagnostic fields. The text also
+            omits ``min_images``, source coordinates, and the numerical search
+            center. ``latest_retryable_error`` is sticky recovery context, not
+            a returned output diagnostic.
             """
             return (
                 f"initial_fov={initial_fov}, current_fov={current_fov}, "
@@ -4790,6 +5368,14 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             RuntimeError
                 If the recovered count exceeds ``expected_num_images`` when
                 present or exceeds ``max_images``.
+
+            Notes
+            -----
+            Expected-count overflow is checked before maximum-count overflow.
+            Because a configured expectation cannot exceed ``max_images``, the
+            distinct maximum-overflow branch is reachable only when no
+            expectation is present. Coordinates are counted by row without
+            deduplication.
             """
             recovered_count = len(coordinates)
             if expected_num_images is not None and recovered_count > expected_num_images:
@@ -4829,19 +5415,28 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
             Raises
             ------
+            ImportError
+                If targeted recovery reaches the optional Caustics
+                root-refinement import and it is unavailable.
             RuntimeError
                 If a recovered count exceeds the expected or maximum count.
+            IndexError
+                If a global or targeted backend call raises an indexing error
+                outside the exact recognized empty-candidate classifier.
 
             Notes
             -----
             The global variant order is the base grid, a divisions-plus-one
-            parity grid, then a half-cell numerical-center shift at the base
-            division count. Only the exact singular linear-solve classifier
-            advances that inner sequence. Three singular failures exhaust
-            naturally through the loop ``else``; the known empty-candidate
-            failure immediately returns ``(None, False)`` for retry only by
-            the surrounding bounded outer schedule. Unrelated exceptions
-            propagate unchanged.
+            parity grid, then a half-cell shift in both numerical-center
+            coordinates at the base division count. Only a ``RuntimeError``
+            whose case-insensitive text contains ``linalg.solve`` and either
+            ``input matrix is singular`` or ``singular u`` advances that inner
+            sequence. Three such failures exhaust naturally through the loop
+            ``else``. An ``IndexError`` whose case-insensitive text contains
+            ``index 0 is out of bounds`` immediately returns ``(None, False)``
+            for retry only by the surrounding bounded outer schedule. A
+            successful but deficient global result also ends the variant
+            sequence. Unrelated exceptions propagate unchanged.
 
             Every actual global Caustics invocation increments
             ``solver_attempts``. Each executed recovery-seed batch adds one
@@ -4852,22 +5447,35 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             and therefore retains base spacing. Both add a global attempt, and
             neither changes the outer expansion/refinement counters.
 
-            Targeted recovery runs only after a successful, nonempty, deficient
-            global result with explicit adapter recovery points. It selects one
-            seed for each empty recovery neighborhood over the total lens. Its
-            radius is the smaller of fixed realized epsilon and actual grid
-            spacing. Residual certification uses fixed epsilon, while
-            neighborhood occupancy and root locality use actual grid spacing.
-            Retryable targeted failures leave the global result deficient.
-            Targeted roots and global coordinates are local to this attempt;
-            every later outer call replaces them.
+            The adapter's recovery points are queried after every successful
+            global solve, even a complete one. Targeted work itself runs only
+            after a successful, nonempty, deficient global result with explicit
+            points and at least one neighborhood for which every global image
+            is strictly farther than actual grid spacing. Seed circles are
+            raytraced for all adapter recovery points before selecting the
+            empty-neighborhood seeds. Their radius is the smaller of fixed
+            realized epsilon and actual grid spacing. Residual certification
+            uses a strict fixed-epsilon bound, while neighborhood occupancy and
+            root locality use actual grid spacing, inclusively for occupancy
+            and locality. Each deterministic seed circle has 256 uniformly
+            spaced angular locations, and active seeds undergo exactly eight
+            root-refinement passes in one counted batch. Retryable targeted
+            failures leave the global result deficient. Supplemental roots are
+            appended without deduplication. Targeted roots and global
+            coordinates are local to this attempt; every later outer call
+            replaces them rather than preserving the best earlier count.
 
             Numerical-center shifts never modify physical lens values or
             translate returned image coordinates. If all outer calls remain
             retryable, the enclosing solver's reachable
             ``coordinates is None`` branch converts the result to shape
-            ``(0, 2)``. The enclosing schedule completes every FOV expansion
-            before beginning requested-scale refinement.
+            ``(0, 2)`` before the positive ``min_images`` policy raises. The
+            enclosing schedule completes every FOV expansion before beginning
+            requested-scale refinement. Seed-circle raytraces occur outside
+            the targeted-refinement exception classifier; their failures
+            propagate and do not increment ``solver_attempts``. One entered
+            root-refinement batch increments the counter once, not once per
+            internal refinement pass.
             """
             nonlocal solver_attempts, current_grid_pixelscale, current_grid_variant
             nonlocal latest_retryable_error
@@ -5074,24 +5682,60 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                ``-1`` without an expectation;
             7. ``solver_fov``, final accepted or bounded-deficit FOV in
                arcseconds;
-            8. ``solver_pixelscale``, actual accepted grid spacing in
-               arcseconds;
+            8. ``solver_pixelscale``, final successful global variant's actual
+               grid spacing in arcseconds;
             9. ``solver_attempts``, global calls plus executed recovery-seed
                batches;
             10. ``solver_fov_expansions``, outer FOV steps only;
             11. ``solver_pixelscale_refinements``, outer requested-scale
                 steps only.
 
-            For one sample, count and diagnostic outputs are scalars and each
-            fixed-width image output has shape ``(M,)``, where
+            For one sample, count and diagnostic outputs are NumPy scalars and
+            each fixed-width image output has shape ``(M,)``, where
             ``M = max_images``. For ``S > 1``, count and diagnostic outputs
             have shape ``(S,)``, and image outputs have shape ``(S, M)``.
 
+        Raises
+        ------
+        ImportError
+            If an optional Caustics or Torch runtime, model component, or
+            targeted root-refinement dependency is unavailable.
+        KeyError
+            If a required realized source, solver-control, redshift, or
+            flattened lens input is absent.
+        TypeError
+            If an owned source-coordinate or explicit-FOV scalar cannot be
+            normalized, or lens/backend construction reports a type failure.
+        ValueError
+            If realized source coordinates, expected count, FOV, lens
+            geometry, redshifts, or the initial FOV/scale relation violate
+            their owned domains.
+        RuntimeError
+            If image count exceeds its expectation or ``max_images``, bounded
+            recovery exhausts below ``min_images``, or an unclassified backend
+            runtime failure propagates.
+        IndexError
+            If Caustics raises an indexing error outside the exact recognized
+            empty-candidate retry classifier.
+
         Notes
         -----
-        The method is deterministic and does not consume ``rng_info``. It
-        saves all eleven values to this node's ``GraphState`` entries in
-        ``_OUTPUTS`` order.
+        The method deletes ``rng_info`` without inspecting or consuming it; no
+        generator is created. Active image rows preserve the solver's lack of
+        local deduplication and its delay/x/y ordering. Float image arrays are
+        initialized with NaN for x, y, and delay and zero for absolute
+        magnification, so only the first ``num_images`` entries are active.
+        ``image_count_deficit`` alone uses ``-1`` as the no-expectation
+        sentinel.
+
+        Single-sample count and diagnostic outputs are NumPy scalar values;
+        multi-sample count/counter arrays have integer dtype and angular
+        diagnostics have floating dtype. Registered-name ``kwargs`` override
+        input values for this call but are not written back as graph inputs.
+        All eleven output values are saved in ``_OUTPUTS`` order only after
+        every sample solves successfully. Other unclassified exceptions from
+        construction, adapters, Torch, Caustics, NumPy conversion,
+        magnification, or delay evaluation propagate unchanged.
         """
         del rng_info  # The solver is deterministic for realized input parameters.
         input_values = self._build_inputs(graph_state, **kwargs)
