@@ -11,17 +11,24 @@ delays in days, this module uses the convention
     )
 
 Thus the earliest active image has zero relative delay, and later images are
-evaluated at earlier source times. The child source owns its redshift
-conversion and effects attached directly to it. Rest-frame effects added
-through the wrapper are likewise delegated to the child, while observer-frame
-effects added to the wrapper are applied once after the image sum.
+evaluated at earlier source times. An SED child owns its configured framework
+redshift conversion and effects attached directly to it. A ``BandfluxModel``
+instead produces observer-frame bandfluxes, with no framework redshift
+conversion by either child or wrapper. Effects marked as rest-frame and added
+through the wrapper are delegated to the child: an SED child applies them in
+its rest-frame pipeline, whereas a ``BandfluxModel`` applies them through its
+observer-frame band-pass API. Observer-frame effects added to the wrapper are
+applied once after the image sum.
 
 The fixed-width ``macro_magnifications`` and ``time_delays`` arrays and the
 ``num_images`` count from
 :class:`~lightcurvelynx.models.caustics_models.CausticsLensImageNode` can be
-connected directly to :class:`UnresolvedStrongLensModel`. Only the arrays'
-leading active prefix is evaluated, so the lens node's inactive zero and NaN
-padding does not contribute to the unresolved flux.
+connected directly to :class:`UnresolvedStrongLensModel` when each realization
+has at least two images, as guaranteed by the lens node's default
+``min_images=2``. A lens node configured with ``min_images=1`` can produce a
+one-image realization that this wrapper rejects. Only the arrays' leading
+active prefix is evaluated, so the lens node's inactive zero and NaN padding
+does not contribute to the unresolved flux.
 """
 
 import numpy as np
@@ -69,7 +76,9 @@ class UnresolvedStrongLensModel(MultiObjectModel):
     num_objects : int
         Number of child models, always one.
     apply_redshift : bool
-        ``False`` because the child evaluation owns redshift conversion.
+        ``False`` to suppress wrapper redshift conversion. An SED child owns
+        its configured framework conversion; a ``BandfluxModel`` remains in
+        the observer frame and does not support framework redshift conversion.
 
     Raises
     ------
@@ -78,17 +87,25 @@ class UnresolvedStrongLensModel(MultiObjectModel):
 
     Notes
     -----
-    Validation and finiteness checks apply only after truncating both
-    fixed-width arrays to their leading active prefix. Inactive padding is
-    ignored. Active image pairs are normalized by the minimum delay and placed
-    in ascending delay order with stable ordering for equal delays.
+    Both full fixed-width arrays are float-coerced and checked for
+    one-dimensional, equal-length structure before active-prefix truncation.
+    Finiteness and value checks then apply only to the active prefix. Thus
+    float-coercible inactive padding, including the Caustics zero and NaN
+    sentinels, is ignored by active-value validation, but non-coercible padding
+    or invalid full-array shape and length are not ignored. Active image pairs
+    are normalized by the minimum delay and placed in ascending delay order
+    with stable ordering for equal delays.
 
-    Effects attached directly to the child run on each shifted image.
-    Rest-frame effects added through this wrapper are also child-owned;
-    observer-frame effects added to the wrapper run once on the summed flux at
-    the original observation times. Public evaluation over an ``S``-sample
-    state returns ``(S, T, W)`` SEDs or ``(S, T)`` bandfluxes, while a
-    one-sample state returns ``(T, W)`` or ``(T,)`` respectively.
+    Effects attached directly to an SED child run in that child's configured
+    rest- or observer-frame pipeline for each shifted image. Effects marked as
+    rest-frame and delegated to a ``BandfluxModel`` instead run through its
+    observer-frame ``apply_bandflux`` pipeline because bandflux children have
+    no rest-frame conversion. Observer-frame effects retained by the wrapper
+    run once on the summed flux at the original observation times; on the
+    bandflux path every such effect must implement ``apply_bandflux``. Public
+    evaluation over an ``S``-sample state returns ``(S, T, W)`` SEDs or
+    ``(S, T)`` bandfluxes, while a one-sample state returns ``(T, W)`` or
+    ``(T,)`` respectively.
 
     Explicit outer metadata overrides are not child overrides: they replace
     the default wrapper linkage and can affect wrapper-level effects, but the
@@ -139,9 +156,11 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         Notes
         -----
         The source is retained as the wrapper's only child. The outer
-        ``apply_redshift`` flag is set to ``False`` because the shifted child
-        evaluation applies the child's redshift conversion and must not be
-        redshifted a second time by the wrapper.
+        ``apply_redshift`` flag is set to ``False`` because this wrapper must
+        not perform framework redshift conversion. A shifted SED-child
+        evaluation applies that child's configured conversion; a
+        ``BandfluxModel`` evaluation is already defined in the observer frame
+        and applies no framework redshift conversion.
         """
         if not isinstance(source_model, BasePhysicalModel):
             raise TypeError("source_model must be a BasePhysicalModel.")
@@ -174,8 +193,9 @@ class UnresolvedStrongLensModel(MultiObjectModel):
             allow_gradient=False,
         )
 
-        # This composite overrides the single-state evaluation pipeline. Redshift
-        # conversion is owned by the child source and must not be applied twice.
+        # This composite overrides the single-state evaluation pipeline. SED
+        # children apply their own configured redshift conversion; BandfluxModel
+        # children are already observer-frame. The wrapper applies no conversion.
         self.apply_redshift = False
 
     def minwave(self, graph_state=None):
@@ -239,11 +259,16 @@ class UnresolvedStrongLensModel(MultiObjectModel):
 
         Notes
         -----
-        Magnifications and delays are first coerced to floating-point arrays.
-        When ``num_images`` is ``None``, every entry is active. Otherwise, both
-        arrays are truncated to their leading ``num_images`` entries before
-        finiteness and value validation. Consequently, invalid or sentinel
-        values in inactive padding are ignored.
+        The full magnification and delay inputs are first coerced to
+        floating-point arrays, then checked for one-dimensional shape and
+        equal length. These operations occur before ``num_images`` validation
+        or prefix truncation, so non-coercible inactive values and invalid
+        full-array structure are not ignored. When ``num_images`` is ``None``,
+        every entry is active. Otherwise, both arrays are truncated to their
+        leading ``num_images`` entries before finiteness and value validation.
+        Float-coercible inactive values, including zero and NaN padding from
+        ``CausticsLensImageNode``, are therefore ignored only by those
+        active-value checks.
 
         A common delay offset is removed by subtracting the minimum active
         delay. Magnifications remain paired with their delays during a stable
@@ -368,15 +393,20 @@ class UnresolvedStrongLensModel(MultiObjectModel):
 
         Raises
         ------
+        NotImplementedError
+            If a wrapper observer-frame effect does not implement
+            ``apply_bandflux`` and inherits the base method.
         Exception
-            The first exception raised by a delegated effect is propagated
+            Any other exception raised by a delegated effect is propagated
             unchanged.
 
         Notes
         -----
         Effects are applied in ``obs_frame_effects`` registration order. Each
         effect receives the output of the preceding effect, the original times
-        and filters, and the wrapper's realized local parameters.
+        and filters, and the wrapper's realized local parameters. Every effect
+        in this list must implement ``apply_bandflux`` for use on this path;
+        the base method's ``NotImplementedError`` is not intercepted.
         """
         params = self.get_local_params(state)
         for effect in self.obs_frame_effects:
@@ -425,11 +455,12 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         evaluated by the child in one call and reshaped to ``(I, T, W)``.
         Absolute magnifications weight the image axis before it is summed.
 
-        The child evaluation owns redshift conversion and its child-level
-        effects for each shifted image. Wrapper observer-frame effects are
-        applied once to the final sum at the original times and wavelengths.
-        Exceptions from image coercion or validation, child evaluation, output
-        reshaping, and wrapper effects are propagated unchanged.
+        The SED child evaluation owns its configured framework redshift
+        conversion and child-level effects for each shifted image. Wrapper
+        observer-frame effects are applied once to the final sum at the
+        original times and wavelengths. Exceptions from image coercion or
+        validation, child evaluation, output reshaping, and wrapper effects
+        are propagated unchanged.
         """
         if isinstance(self.source_model, BandfluxModel):
             raise TypeError(
@@ -502,6 +533,9 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         ------
         ValueError
             If active image parameters fail validation.
+        NotImplementedError
+            If a ``BandfluxModel`` child effect or wrapper observer-frame
+            effect does not implement ``apply_bandflux``.
 
         Notes
         -----
@@ -511,12 +545,20 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         bandflux evaluation. Its result is reshaped to ``(I, T)``, weighted by
         absolute magnification, and summed over images.
 
-        This path supports either an SED-based or bandflux-only child. The
-        child owns redshift conversion and child-level effects for every
-        shifted image. Wrapper observer-frame effects run once on the final sum
-        at the original times and filters. Exceptions from image coercion or
-        validation, child evaluation, output reshaping, passband/filter lookup,
-        and wrapper effects are propagated unchanged.
+        This path supports either an SED-based or bandflux-only child. An SED
+        child evaluates and integrates its SED, including that child's
+        configured framework redshift conversion and rest- and observer-frame
+        effects, for each shifted image. A ``BandfluxModel`` instead evaluates
+        observer-frame bandfluxes with no framework redshift conversion. All
+        of its child effects, including effects marked as rest-frame and
+        delegated through this wrapper, execute through its observer-frame
+        ``apply_bandflux`` API.
+
+        Wrapper observer-frame effects run once on the final sum at the
+        original times and filters, and each must implement
+        ``apply_bandflux``. Exceptions from image coercion or validation,
+        child evaluation, output reshaping, passband/filter lookup, and
+        wrapper effects are propagated unchanged.
         """
         times = np.asarray(times, dtype=float)
         filters = np.asarray(filters)
