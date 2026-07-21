@@ -44,7 +44,7 @@ __all__ = [
     "CausticsSourcePositionNode",
 ]
 
-_REALIZATION_SUPPLIED_LENS_PARAMETERS = {"cosmology", "z_l"}
+_REALIZATION_SUPPLIED_LENS_PARAMETERS = {"cosmology", "z_l", "z_s"}
 _ROOT_LENS_PARAMETERS = {"z_l"}
 
 
