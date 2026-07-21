@@ -1,4 +1,22 @@
-"""Caustics-backed nodes for strong-lens image configurations."""
+"""Structured Caustics specifications and strong-lensing graph nodes.
+
+``CausticsLensSpec`` describes one explicitly registered SIS, SIE, EPL, NFW,
+TNFW, PseudoJaffe, ExternalShear, or MassSheet component, while
+``CausticsSinglePlaneSpec`` preserves an ordered flat composition. Values in a
+specification's ``parameters`` mapping retain graph-dependency identity and
+become ``lens_<field>`` inputs for an atomic lens or
+``lens_<component>_<field>`` inputs for a composition. Fixed ``options`` and
+registry defaults are immutable realization metadata rather than graph inputs.
+
+The source-position node supports registered systems whose EPL components have
+``t <= 1``. It extracts total-lens critical curves, separates exactly certified
+zero-dimensional true caustics, maps component-owned pseudo-caustics through
+the total lens, structurally repairs regular interiors, and uses signed boundary
+counting. The image node accepts the full physical EPL domain and combines
+independent global attempts with capability-specific supplemental root
+recovery. Both nodes document their persisted output units, shapes, and bounded
+recovery or certification contracts on their public classes and methods.
+"""
 
 import inspect
 import keyword
@@ -256,7 +274,7 @@ def _snapshot_string_mapping(name, mapping):
     return snapshot
 
 
-def _get_lens_model_schema(model):
+def _get_registered_schema(model):
     if not isinstance(model, str) or not model:
         raise TypeError("model must be a non-empty string.")
     try:
@@ -424,14 +442,45 @@ def _realize_component_values(schema, parameter_values, options):
 
 @dataclass(frozen=True, init=False)
 class CausticsLensSpec:
-    """Immutable specification of one registered Caustics lens component."""
+    """Structurally immutable specification of one registered lens component.
+
+    Parameters
+    ----------
+    model : str
+        Explicit registry key: ``SIS``, ``SIE``, ``EPL``, ``NFW``, ``TNFW``,
+        ``PseudoJaffe``, ``ExternalShear``, or ``MassSheet``.
+    parameters : Mapping[str, object]
+        Registered fields whose values remain referenced as graph dependencies.
+        They become ``lens_<field>`` inputs for an atomic node or
+        ``lens_<component>_<field>`` inputs inside a single-plane node.
+    options : Mapping[str, object] or None, optional
+        Fixed registered fields represented by recursively immutable literals.
+        Registry defaults fill absent optional fields during realization.
+
+    Attributes
+    ----------
+    model : str
+        Registered component key.
+    parameters : Mapping[str, object]
+        Read-only snapshot of graph-visible fields in supplied order.
+    options : Mapping[str, object]
+        Read-only snapshot of fixed fields in supplied order.
+
+    Notes
+    -----
+    The mappings are snapshotted structurally, but dependency values in
+    ``parameters`` are not deep-copied. Realization merges registry defaults,
+    fixed ``options``, and graph-visible ``parameters`` in that precedence
+    order. Constructor-owned cosmology, redshift, naming, and plane fields are
+    reserved. Only explicitly registered models and fields are accepted.
+    """
 
     model: str
     parameters: Mapping[str, object]
     options: Mapping[str, object]
 
     def __init__(self, model, parameters, options=None):
-        schema = _get_lens_model_schema(model)
+        schema = _get_registered_schema(model)
         parameter_snapshot = _snapshot_string_mapping("parameters", parameters)
         option_snapshot = _snapshot_string_mapping("options", {} if options is None else options)
         for name, value in option_snapshot.items():
@@ -444,7 +493,26 @@ class CausticsLensSpec:
 
 @dataclass(frozen=True, init=False)
 class CausticsSinglePlaneSpec:
-    """Immutable ordered collection of lens components on one plane."""
+    """Structurally immutable ordered collection of components on one plane.
+
+    Parameters
+    ----------
+    components : Mapping[str, CausticsLensSpec]
+        Nonempty flat mapping of identifier names to atomic specifications.
+        Component order and dependency identity are preserved.
+
+    Attributes
+    ----------
+    components : Mapping[str, CausticsLensSpec]
+        Read-only snapshot whose keys name fresh Caustics child lenses and form
+        ``lens_<component>_<field>`` graph paths.
+
+    Notes
+    -----
+    Component names must be non-keyword Python identifiers and may not collide
+    with the realized Caskade or single-plane namespace. Nested planes and
+    affine-only systems are not supported by the consuming nodes.
+    """
 
     components: Mapping[str, CausticsLensSpec]
 
