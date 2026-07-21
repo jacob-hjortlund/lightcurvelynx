@@ -1,3 +1,29 @@
+"""Unresolved strong-lens models for a single physical source.
+
+An unresolved system combines all static macro-images into one measured flux.
+For absolute dimensionless magnifications ``mu_i`` and observer-frame arrival
+delays in days, this module uses the convention
+
+::
+
+    F(t, wavelength) = sum_i mu_i * F_source(
+        t - (delay_i - min(delay)), wavelength
+    )
+
+Thus the earliest active image has zero relative delay, and later images are
+evaluated at earlier source times. The child source owns its redshift
+conversion and effects attached directly to it. Rest-frame effects added
+through the wrapper are likewise delegated to the child, while observer-frame
+effects added to the wrapper are applied once after the image sum.
+
+The fixed-width ``macro_magnifications`` and ``time_delays`` arrays and the
+``num_images`` count from
+:class:`~lightcurvelynx.models.caustics_models.CausticsLensImageNode` can be
+connected directly to :class:`UnresolvedStrongLensModel`. Only the arrays'
+leading active prefix is evaluated, so the lens node's inactive zero and NaN
+padding does not contribute to the unresolved flux.
+"""
+
 import numpy as np
 
 from lightcurvelynx.models.multi_object_model import MultiObjectModel
@@ -7,28 +33,66 @@ from lightcurvelynx.models.physical_model import BandfluxModel, BasePhysicalMode
 class UnresolvedStrongLensModel(MultiObjectModel):
     """Wrap one physical source as an unresolved static macro-lens system.
 
-    The model evaluates the source at observer-frame times shifted by each
-    macro-image's relative arrival delay, scales those evaluations by absolute
-    macro-magnifications, and returns their sum.
+    The source is evaluated at observer-frame times shifted by each active
+    macro-image's relative arrival delay. Those evaluations are scaled by
+    absolute macro-magnifications and summed before wrapper observer-frame
+    effects are applied.
 
     Parameters
     ----------
     source_model : BasePhysicalModel
-        The physical source to lens.
+        Physical source whose SED or bandflux evaluation is lensed.
     macro_magnifications : parameter
-        Absolute, dimensionless image magnifications. Each sampled value is a
-        one-dimensional array.
+        Setter for fixed-width absolute, dimensionless image magnifications.
+        Realized values have shape ``(I,)`` for one sample and ``(S, I)`` for
+        ``S`` samples.
     time_delays : parameter
-        Image arrival delays in observer-frame days. An arbitrary common offset
-        is allowed and removed before evaluation.
-    num_images : parameter, optional
-        Number of active entries in the image arrays. If None, every entry is
-        active.
-    node_label : str, optional
-        Label for the outer model node.
+        Setter for fixed-width image arrival delays in observer-frame days,
+        with the same realized shapes as ``macro_magnifications``. An arbitrary
+        common offset is allowed and removed before evaluation.
+    num_images : parameter or None, optional
+        Setter for the number of active leading entries. ``None`` activates all
+        ``I`` entries; otherwise the realized value must satisfy
+        ``2 <= num_images <= I``.
+    node_label : str or None, optional
+        Human-readable label for the outer model node.
     **kwargs : dict, optional
-        Overrides for outer physical-model parameters such as ra, dec, t0, and
-        redshift. Unspecified values are linked to the source model.
+        Outer physical-model parameter overrides. By default ``ra``, ``dec``,
+        ``redshift``, ``t0``, and ``distance`` are linked to ``source_model``.
+
+    Attributes
+    ----------
+    source_model : BasePhysicalModel
+        Child physical source evaluated for every active macro-image.
+    objects : list of BasePhysicalModel
+        The one-element child-model list used by ``MultiObjectModel``.
+    num_objects : int
+        Number of child models, always one.
+    apply_redshift : bool
+        ``False`` because the child evaluation owns redshift conversion.
+
+    Raises
+    ------
+    TypeError
+        If ``source_model`` is not a ``BasePhysicalModel``.
+
+    Notes
+    -----
+    Validation and finiteness checks apply only after truncating both
+    fixed-width arrays to their leading active prefix. Inactive padding is
+    ignored. Active image pairs are normalized by the minimum delay and placed
+    in ascending delay order with stable ordering for equal delays.
+
+    Effects attached directly to the child run on each shifted image.
+    Rest-frame effects added through this wrapper are also child-owned;
+    observer-frame effects added to the wrapper run once on the summed flux at
+    the original observation times. Public evaluation over an ``S``-sample
+    state returns ``(S, T, W)`` SEDs or ``(S, T)`` bandfluxes, while a
+    one-sample state returns ``(T, W)`` or ``(T,)`` respectively.
+
+    Explicit outer metadata overrides are not child overrides: they replace
+    the default wrapper linkage and can affect wrapper-level effects, but the
+    child continues to use its own parameters for flux evaluation.
     """
 
     def __init__(
@@ -41,6 +105,44 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         node_label=None,
         **kwargs,
     ):
+        """Configure an unresolved strong-lens wrapper.
+
+        Parameters
+        ----------
+        source_model : BasePhysicalModel
+            Child physical source to evaluate at every active image delay.
+        macro_magnifications : parameter
+            Graph setter for fixed-width absolute dimensionless
+            macro-magnifications. The parameter is registered without gradient
+            support.
+        time_delays : parameter
+            Graph setter for fixed-width observer-frame image arrival delays in
+            days. The parameter is registered without gradient support.
+        num_images : parameter or None, optional
+            Graph setter for the active leading-image count. ``None`` uses the
+            full realized image-array width. The parameter is registered
+            without gradient support.
+        node_label : str or None, optional
+            Human-readable label for the outer model node.
+        **kwargs : dict, optional
+            Outer ``BasePhysicalModel`` parameters. Missing ``ra``, ``dec``,
+            ``redshift``, ``t0``, and ``distance`` setters are linked to the
+            corresponding child setters; explicit values remain outer-only
+            overrides.
+
+        Raises
+        ------
+        TypeError
+            If ``source_model`` is not a ``BasePhysicalModel``. This check is
+            performed before graph links or model parameters are registered.
+
+        Notes
+        -----
+        The source is retained as the wrapper's only child. The outer
+        ``apply_redshift`` flag is set to ``False`` because the shifted child
+        evaluation applies the child's redshift conversion and must not be
+        redshifted a second time by the wrapper.
+        """
         if not isinstance(source_model, BasePhysicalModel):
             raise TypeError("source_model must be a BasePhysicalModel.")
 
@@ -77,28 +179,87 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         self.apply_redshift = False
 
     def minwave(self, graph_state=None):
-        """Return the child's minimum supported wavelength in Angstroms."""
+        """Return the child model's minimum wavelength bound.
+
+        Parameters
+        ----------
+        graph_state : GraphState or None, optional
+            Sampled state forwarded unchanged to the child model.
+
+        Returns
+        -------
+        float or None
+            Child minimum wavelength bound in Angstroms, or ``None`` when
+            unbounded.
+        """
         return self.source_model.minwave(graph_state=graph_state)
 
     def maxwave(self, graph_state=None):
-        """Return the child's maximum supported wavelength in Angstroms."""
+        """Return the child model's maximum wavelength bound.
+
+        Parameters
+        ----------
+        graph_state : GraphState or None, optional
+            Sampled state forwarded unchanged to the child model.
+
+        Returns
+        -------
+        float or None
+            Child maximum wavelength bound in Angstroms, or ``None`` when
+            unbounded.
+        """
         return self.source_model.maxwave(graph_state=graph_state)
 
     def _get_active_images(self, state):
-        """Return validated magnifications and normalized delays for one system."""
+        """Return validated active magnifications and relative delays.
+
+        Parameters
+        ----------
+        state : GraphState
+            One-sample state containing this wrapper's realized image
+            parameters.
+
+        Returns
+        -------
+        magnifications : numpy.ndarray, shape (I,)
+            Active absolute dimensionless magnifications in ascending
+            relative-delay order, where ``I`` is the active image count.
+        relative_delays : numpy.ndarray, shape (I,)
+            Active observer-frame delays in days, normalized to begin at zero
+            and sorted in ascending order.
+
+        Raises
+        ------
+        ValueError
+            If the realized image arrays are not one-dimensional or have
+            different lengths; if ``num_images`` is not scalar and
+            integer-valued, is less than two, or exceeds the array width; if an
+            active magnification is non-finite or negative; if all active
+            magnifications are zero; or if an active delay is non-finite.
+
+        Notes
+        -----
+        Magnifications and delays are first coerced to floating-point arrays.
+        When ``num_images`` is ``None``, every entry is active. Otherwise, both
+        arrays are truncated to their leading ``num_images`` entries before
+        finiteness and value validation. Consequently, invalid or sentinel
+        values in inactive padding are ignored.
+
+        A common delay offset is removed by subtracting the minimum active
+        delay. Magnifications remain paired with their delays during a stable
+        ascending sort, so images with equal delays retain their input order.
+        Conversion and graph-lookup exceptions are propagated unchanged.
+        """
         params = self.get_local_params(state)
         magnifications = np.asarray(params["macro_magnifications"], dtype=float)
         time_delays = np.asarray(params["time_delays"], dtype=float)
 
         if magnifications.ndim != 1 or time_delays.ndim != 1:
             raise ValueError(
-                "macro_magnifications and time_delays must be one-dimensional "
-                "for a single GraphState sample."
+                "macro_magnifications and time_delays must be one-dimensional for a single GraphState sample."
             )
         if len(magnifications) != len(time_delays):
-            raise ValueError(
-                "macro_magnifications and time_delays must have the same length."
-            )
+            raise ValueError("macro_magnifications and time_delays must have the same length.")
 
         raw_num_images = params["num_images"]
         if raw_num_images is None:
@@ -113,10 +274,7 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         if num_images < 2:
             raise ValueError("A strong lens system must contain at least two images.")
         if num_images > len(magnifications):
-            raise ValueError(
-                f"num_images={num_images} exceeds the image-array length "
-                f"{len(magnifications)}."
-            )
+            raise ValueError(f"num_images={num_images} exceeds the image-array length {len(magnifications)}.")
 
         magnifications = magnifications[:num_images]
         time_delays = time_delays[:num_images]
@@ -142,6 +300,36 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         wavelengths,
         state,
     ):
+        """Apply wrapper observer-frame effects to an unresolved SED.
+
+        Parameters
+        ----------
+        flux_density : numpy.ndarray, shape (T, W)
+            Summed unresolved spectral flux density in nJy.
+        times : numpy.ndarray, shape (T,)
+            Original observer-frame observation times in MJD/days.
+        wavelengths : numpy.ndarray, shape (W,)
+            Observer-frame wavelengths in Angstroms.
+        state : GraphState
+            One-sample state supplying realized wrapper effect parameters.
+
+        Returns
+        -------
+        flux_density : numpy.ndarray, shape (T, W)
+            Spectral flux density in nJy after every wrapper effect.
+
+        Raises
+        ------
+        Exception
+            The first exception raised by a delegated effect is propagated
+            unchanged.
+
+        Notes
+        -----
+        Effects are applied in ``obs_frame_effects`` registration order. Each
+        effect receives the output of the preceding effect, the original times
+        and wavelengths, and the wrapper's realized local parameters.
+        """
         params = self.get_local_params(state)
         for effect in self.obs_frame_effects:
             flux_density = effect.apply(
@@ -160,6 +348,36 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         filters,
         state,
     ):
+        """Apply wrapper observer-frame effects to unresolved bandfluxes.
+
+        Parameters
+        ----------
+        bandfluxes : numpy.ndarray, shape (T,)
+            Summed unresolved bandfluxes in nJy.
+        times : numpy.ndarray, shape (T,)
+            Original observer-frame observation times in MJD/days.
+        filters : numpy.ndarray, shape (T,)
+            Filter identifiers corresponding to the observations.
+        state : GraphState
+            One-sample state supplying realized wrapper effect parameters.
+
+        Returns
+        -------
+        bandfluxes : numpy.ndarray, shape (T,)
+            Bandfluxes in nJy after every wrapper effect.
+
+        Raises
+        ------
+        Exception
+            The first exception raised by a delegated effect is propagated
+            unchanged.
+
+        Notes
+        -----
+        Effects are applied in ``obs_frame_effects`` registration order. Each
+        effect receives the output of the preceding effect, the original times
+        and filters, and the wrapper's realized local parameters.
+        """
         params = self.get_local_params(state)
         for effect in self.obs_frame_effects:
             bandfluxes = effect.apply_bandflux(
@@ -171,11 +389,51 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         return bandfluxes
 
     def _evaluate_single(self, times, wavelengths, state, **kwargs):
-        """Evaluate one unresolved lensed SED in observer-frame units."""
+        """Evaluate one unresolved lensed SED in observer-frame units.
+
+        Parameters
+        ----------
+        times : numpy.ndarray, shape (T,)
+            Observer-frame observation times in MJD/days.
+        wavelengths : numpy.ndarray, shape (W,)
+            Observer-frame wavelengths in Angstroms.
+        state : GraphState
+            One-sample state containing the child and wrapper parameters.
+        **kwargs : dict, optional
+            Additional keyword arguments forwarded unchanged to the child's
+            SED evaluation.
+
+        Returns
+        -------
+        flux_density : numpy.ndarray, shape (T, W)
+            Magnification-weighted unresolved spectral flux density in nJy,
+            including child and wrapper effects.
+
+        Raises
+        ------
+        TypeError
+            If the child is a ``BandfluxModel``, which has no SED evaluation
+            path.
+        ValueError
+            If active image parameters fail validation.
+
+        Notes
+        -----
+        The image-major shifted-time grid is
+        ``times[None, :] - relative_delays[:, None]``. It is flattened so all
+        ``T`` times for the first image precede those for the next image, then
+        evaluated by the child in one call and reshaped to ``(I, T, W)``.
+        Absolute magnifications weight the image axis before it is summed.
+
+        The child evaluation owns redshift conversion and its child-level
+        effects for each shifted image. Wrapper observer-frame effects are
+        applied once to the final sum at the original times and wavelengths.
+        Exceptions from image coercion or validation, child evaluation, output
+        reshaping, and wrapper effects are propagated unchanged.
+        """
         if isinstance(self.source_model, BandfluxModel):
             raise TypeError(
-                "UnresolvedStrongLensModel contains a BandfluxModel, which does "
-                "not support SED evaluation."
+                "UnresolvedStrongLensModel contains a BandfluxModel, which does not support SED evaluation."
             )
 
         times = np.asarray(times, dtype=float)
@@ -219,7 +477,47 @@ class UnresolvedStrongLensModel(MultiObjectModel):
         filters,
         state,
     ):
-        """Evaluate one unresolved lensed bandflux time series in nJy."""
+        """Evaluate one unresolved lensed bandflux time series.
+
+        Parameters
+        ----------
+        passband_group : PassbandGroup or None
+            Passband collection delegated to the child evaluation. ``None``
+            is valid only for child models that do not require passband
+            definitions.
+        times : numpy.ndarray, shape (T,)
+            Observer-frame observation times in MJD/days.
+        filters : numpy.ndarray, shape (T,)
+            Filter identifiers selecting a passband for each observation.
+        state : GraphState
+            One-sample state containing the child and wrapper parameters.
+
+        Returns
+        -------
+        bandfluxes : numpy.ndarray, shape (T,)
+            Magnification-weighted unresolved bandfluxes in nJy, including
+            child and wrapper effects.
+
+        Raises
+        ------
+        ValueError
+            If active image parameters fail validation.
+
+        Notes
+        -----
+        The image-major grid uses ``times - relative_delay`` for each image and
+        is flattened to length ``I * T``. The filter sequence is tiled once per
+        image in the same order before both arrays are delegated to the child's
+        bandflux evaluation. Its result is reshaped to ``(I, T)``, weighted by
+        absolute magnification, and summed over images.
+
+        This path supports either an SED-based or bandflux-only child. The
+        child owns redshift conversion and child-level effects for every
+        shifted image. Wrapper observer-frame effects run once on the final sum
+        at the original times and filters. Exceptions from image coercion or
+        validation, child evaluation, output reshaping, passband/filter lookup,
+        and wrapper effects are propagated unchanged.
+        """
         times = np.asarray(times, dtype=float)
         filters = np.asarray(filters)
         magnifications, relative_delays = self._get_active_images(state)
