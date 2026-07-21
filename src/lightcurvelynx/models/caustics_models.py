@@ -1,29 +1,17 @@
-"""Structured Caustics specifications and strong-lensing graph nodes.
+"""Caustics-backed lens specifications and strong-lensing graph nodes.
 
-``CausticsLensSpec`` describes one explicitly registered SIS, SIE, EPL, NFW,
-TNFW, PseudoJaffe, ExternalShear, or MassSheet component, while
-``CausticsSinglePlaneSpec`` preserves an ordered flat composition. Values in a
-specification's ``parameters`` mapping retain graph-dependency identity and
-become ``lens_<field>`` inputs for an atomic lens or
-``lens_<component>_<field>`` inputs for a composition. Fixed ``options`` and
-registry defaults are immutable realization metadata rather than graph inputs.
-
-The source-position node supports registered systems whose EPL components have
-``t <= 1``. It extracts total-lens critical curves, separates exactly certified
-zero-dimensional true caustics, maps component-owned pseudo-caustics through
-the total lens, structurally repairs regular interiors, and uses signed boundary
-counting. The image node accepts the full physical EPL domain and combines
-independent global attempts with capability-specific supplemental root
-recovery. Both nodes document their persisted output units, shapes, and bounded
-recovery or certification contracts on their public classes and methods.
+``CausticsLensSpec`` mirrors one explicitly registered Caustics constructor.
+Its parameters become graph inputs, except that a ``SinglePlane`` spec's
+``lenses`` sequence contains nested specifications. The root spec owns its
+cosmology and lens redshift (``z_l``); the consuming node supplies the source
+redshift as ``z_s`` when each sampled lens is realized.
 """
 
 import inspect
-import keyword
 from collections.abc import Mapping
 from dataclasses import dataclass
+from inspect import Parameter
 from math import hypot
-from numbers import Real
 from types import MappingProxyType
 
 import numpy as np
@@ -36,501 +24,123 @@ from lightcurvelynx.base_models import FunctionNode
 __all__ = [
     "CausticsLensImageNode",
     "CausticsLensSpec",
-    "CausticsSinglePlaneSpec",
     "CausticsSourcePositionNode",
 ]
 
-_RESERVED_LENS_PARAMETERS = {
-    "cosmology",
-    "name",
-    "z_l",
-    "z_s",
-}
-_RESERVED_LENS_SPEC_FIELDS = _RESERVED_LENS_PARAMETERS | {"lenses"}
-_MISSING = object()
+_INHERITED_LENS_PARAMETERS = {"cosmology", "z_l"}
 
 
-@dataclass(frozen=True)
-class _LensFieldSchema:
-    default: object = _MISSING
-    kind: str = "finite"
+def _is_required_parameter(parameter):
+    """Return whether an inspected constructor parameter has no default."""
+    return parameter.default is Parameter.empty and parameter.kind not in (
+        Parameter.VAR_POSITIONAL,
+        Parameter.VAR_KEYWORD,
+    )
 
 
-@dataclass(frozen=True)
-class _LensModelSchema:
-    model: str
-    fields: Mapping[str, _LensFieldSchema]
-    always_required: tuple[str, ...]
-    selector_branches: Mapping[str, Mapping[object, tuple[str, ...]]]
-    mutually_exclusive_fields: Mapping[str, tuple[str, ...]]
-    affine: bool = False
-
-
-@dataclass(frozen=True)
-class _RegisteredLensModel:
-    schema: _LensModelSchema
-    lens_class: object
-    geometry_factory: object
-
-
-_LENS_MODEL_SCHEMAS = MappingProxyType(
-    {
-        "SIS": _LensModelSchema(
-            model="SIS",
-            fields=MappingProxyType(
-                {
-                    "x0": _LensFieldSchema(),
-                    "y0": _LensFieldSchema(),
-                    "Rein": _LensFieldSchema(kind="positive"),
-                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
-                }
-            ),
-            always_required=("x0", "y0", "Rein"),
-            selector_branches=MappingProxyType({}),
-            mutually_exclusive_fields=MappingProxyType({}),
-        ),
-        "SIE": _LensModelSchema(
-            model="SIE",
-            fields=MappingProxyType(
-                {
-                    "x0": _LensFieldSchema(),
-                    "y0": _LensFieldSchema(),
-                    "q": _LensFieldSchema(kind="q"),
-                    "phi": _LensFieldSchema(),
-                    "Rein": _LensFieldSchema(kind="positive"),
-                    "parametrization": _LensFieldSchema(default="Rein", kind="selector"),
-                    "sigma_v": _LensFieldSchema(kind="positive"),
-                    "angle_system": _LensFieldSchema(default="q_phi", kind="selector"),
-                    "e1": _LensFieldSchema(kind="ellipticity_pair"),
-                    "e2": _LensFieldSchema(kind="ellipticity_pair"),
-                    "c1": _LensFieldSchema(),
-                    "c2": _LensFieldSchema(),
-                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
-                }
-            ),
-            always_required=("x0", "y0"),
-            selector_branches=MappingProxyType(
-                {
-                    "parametrization": MappingProxyType(
-                        {
-                            "Rein": ("Rein",),
-                            "velocity_dispersion": ("sigma_v",),
-                        }
-                    ),
-                    "angle_system": MappingProxyType(
-                        {
-                            "q_phi": ("q", "phi"),
-                            "e1_e2": ("e1", "e2"),
-                            "c1_c2": ("c1", "c2"),
-                        }
-                    ),
-                }
-            ),
-            mutually_exclusive_fields=MappingProxyType(
-                {
-                    "parametrization": ("Rein", "sigma_v"),
-                    "angle_system": ("q", "phi", "e1", "e2", "c1", "c2"),
-                }
-            ),
-        ),
-        "EPL": _LensModelSchema(
-            model="EPL",
-            fields=MappingProxyType(
-                {
-                    "x0": _LensFieldSchema(),
-                    "y0": _LensFieldSchema(),
-                    "q": _LensFieldSchema(kind="q"),
-                    "phi": _LensFieldSchema(),
-                    "e1": _LensFieldSchema(kind="ellipticity_pair"),
-                    "e2": _LensFieldSchema(kind="ellipticity_pair"),
-                    "c1": _LensFieldSchema(),
-                    "c2": _LensFieldSchema(),
-                    "Rein": _LensFieldSchema(kind="positive"),
-                    "t": _LensFieldSchema(kind="t"),
-                    "angle_system": _LensFieldSchema(default="q_phi", kind="selector"),
-                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
-                    "n_iter": _LensFieldSchema(default=18, kind="positive_int"),
-                    "chunk_size": _LensFieldSchema(default=None, kind="chunk_size"),
-                }
-            ),
-            always_required=("x0", "y0", "Rein", "t"),
-            selector_branches=MappingProxyType(
-                {
-                    "angle_system": MappingProxyType(
-                        {
-                            "q_phi": ("q", "phi"),
-                            "e1_e2": ("e1", "e2"),
-                            "c1_c2": ("c1", "c2"),
-                        }
-                    )
-                }
-            ),
-            mutually_exclusive_fields=MappingProxyType(
-                {"angle_system": ("q", "phi", "e1", "e2", "c1", "c2")}
-            ),
-        ),
-        "NFW": _LensModelSchema(
-            model="NFW",
-            fields=MappingProxyType(
-                {
-                    "x0": _LensFieldSchema(),
-                    "y0": _LensFieldSchema(),
-                    "mass": _LensFieldSchema(kind="positive"),
-                    "c": _LensFieldSchema(kind="positive"),
-                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
-                }
-            ),
-            always_required=("x0", "y0", "mass", "c"),
-            selector_branches=MappingProxyType({}),
-            mutually_exclusive_fields=MappingProxyType({}),
-        ),
-        "TNFW": _LensModelSchema(
-            model="TNFW",
-            fields=MappingProxyType(
-                {
-                    "x0": _LensFieldSchema(),
-                    "y0": _LensFieldSchema(),
-                    "mass": _LensFieldSchema(kind="positive"),
-                    "Rs": _LensFieldSchema(kind="positive"),
-                    "tau": _LensFieldSchema(kind="positive"),
-                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
-                    "interpret_m_total_mass": _LensFieldSchema(default=True, kind="bool"),
-                }
-            ),
-            always_required=("x0", "y0", "mass", "Rs", "tau"),
-            selector_branches=MappingProxyType({}),
-            mutually_exclusive_fields=MappingProxyType({}),
-        ),
-        "PseudoJaffe": _LensModelSchema(
-            model="PseudoJaffe",
-            fields=MappingProxyType(
-                {
-                    "x0": _LensFieldSchema(),
-                    "y0": _LensFieldSchema(),
-                    "mass": _LensFieldSchema(kind="positive"),
-                    "Rc": _LensFieldSchema(kind="positive"),
-                    "Rs": _LensFieldSchema(kind="positive"),
-                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
-                }
-            ),
-            always_required=("x0", "y0", "mass", "Rc", "Rs"),
-            selector_branches=MappingProxyType({}),
-            mutually_exclusive_fields=MappingProxyType({}),
-        ),
-        "ExternalShear": _LensModelSchema(
-            model="ExternalShear",
-            fields=MappingProxyType(
-                {
-                    "x0": _LensFieldSchema(),
-                    "y0": _LensFieldSchema(),
-                    "gamma_1": _LensFieldSchema(),
-                    "gamma_2": _LensFieldSchema(),
-                    "parametrization": _LensFieldSchema(default="cartesian", kind="selector"),
-                    "gamma": _LensFieldSchema(kind="nonnegative"),
-                    "phi": _LensFieldSchema(),
-                    "s": _LensFieldSchema(default=0.0, kind="nonnegative"),
-                }
-            ),
-            always_required=("x0", "y0"),
-            selector_branches=MappingProxyType(
-                {
-                    "parametrization": MappingProxyType(
-                        {
-                            "cartesian": ("gamma_1", "gamma_2"),
-                            "angular": ("gamma", "phi"),
-                        }
-                    )
-                }
-            ),
-            mutually_exclusive_fields=MappingProxyType(
-                {"parametrization": ("gamma_1", "gamma_2", "gamma", "phi")}
-            ),
-            affine=True,
-        ),
-        "MassSheet": _LensModelSchema(
-            model="MassSheet",
-            fields=MappingProxyType(
-                {
-                    "x0": _LensFieldSchema(),
-                    "y0": _LensFieldSchema(),
-                    "kappa": _LensFieldSchema(),
-                }
-            ),
-            always_required=("x0", "y0", "kappa"),
-            selector_branches=MappingProxyType({}),
-            mutually_exclusive_fields=MappingProxyType({}),
-            affine=True,
-        ),
-    }
-)
-
-
-def _snapshot_string_mapping(name, mapping):
-    if not isinstance(mapping, Mapping):
-        raise TypeError(f"{name} must be a mapping.")
-    snapshot = dict(mapping)
-    if any(not isinstance(key, str) for key in snapshot):
-        raise TypeError(f"{name} keys must be strings.")
-    return snapshot
-
-
-def _get_registered_schema(model):
-    if not isinstance(model, str) or not model:
-        raise TypeError("model must be a non-empty string.")
-    try:
-        return _LENS_MODEL_REGISTRY[model].schema
-    except KeyError as err:
-        raise ValueError(f"Unregistered Caustics lens model {model!r}.") from err
-
-
-def _validate_option_literal(name, value):
-    if value is None or isinstance(value, (str, bool, np.bool_, Real)):
-        return
-    if isinstance(value, tuple):
-        for index, item in enumerate(value):
-            _validate_option_literal(f"{name}[{index}]", item)
-        return
-    raise TypeError(f"{name} must be a recursively immutable literal value.")
-
-
-def _validate_finite(name, value):
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
-        raise TypeError(f"{name} must be a real scalar excluding booleans.")
-    if not -np.inf < value < np.inf:
-        raise ValueError(f"{name} must be finite.")
-    return value
-
-
-def _validate_field_value(schema, name, value):
-    field = schema.fields[name]
-    if field.kind in {"finite", "positive", "nonnegative", "q", "t", "ellipticity_pair"}:
-        normalized = _validate_finite(name, value)
-        if field.kind == "positive" and normalized <= 0:
-            raise ValueError(f"{name} must be positive.")
-        if field.kind == "nonnegative" and normalized < 0:
-            raise ValueError(f"{name} must be nonnegative.")
-        if field.kind == "q" and not 0 < normalized <= 1:
-            raise ValueError(f"{name} must satisfy 0 < {name} <= 1.")
-        if field.kind == "t" and not 0 < normalized < 2:
-            raise ValueError(f"{name} must satisfy 0 < {name} < 2.")
-        return normalized
-    if field.kind == "positive_int":
-        if isinstance(value, (bool, np.bool_)) or (
-            type(value) is not int and not isinstance(value, np.integer)
-        ):
-            raise TypeError(f"{name} must be an integer excluding booleans.")
-        if value < 1:
-            raise ValueError(f"{name} must be at least 1.")
-        return value
-    if field.kind == "chunk_size":
-        if value is None:
-            return None
-        if isinstance(value, (bool, np.bool_)) or (
-            type(value) is not int and not isinstance(value, np.integer)
-        ):
-            raise TypeError(f"{name} must be None or an integer excluding booleans.")
-        if value != 1:
-            raise ValueError(f"{name} must be None or the integer 1.")
-        return value
-    if field.kind == "bool":
-        if not isinstance(value, (bool, np.bool_)):
-            raise TypeError(f"{name} must be a boolean.")
-        return bool(value)
-    if field.kind == "selector":
-        branches = schema.selector_branches[name]
-        if not isinstance(value, str):
-            raise TypeError(f"{name} must be a string selector.")
-        if value not in branches:
-            choices = ", ".join(repr(choice) for choice in branches)
-            raise ValueError(f"{name} must be one of {choices}.")
-        return value
-
-
-def _validate_ellipticity_pair(schema, values):
-    pair = tuple(name for name, field in schema.fields.items() if field.kind == "ellipticity_pair")
-    if pair and all(name in values for name in pair):
-        first, second = pair
-        first_value = values[first]
-        second_value = values[second]
-        if abs(first_value) >= 1 or abs(second_value) >= 1 or hypot(first_value, second_value) >= 1:
-            raise ValueError(f"{first} and {second} must satisfy hypot({first}, {second}) < 1.")
-
-
-def _validate_pseudo_jaffe_radii(schema, values):
-    if schema.model == "PseudoJaffe" and "Rc" in values and "Rs" in values and values["Rc"] >= values["Rs"]:
-        raise ValueError("PseudoJaffe requires Rc < Rs.")
-
-
-def _validate_selector_fields(schema, values):
-    for selector, branches in schema.selector_branches.items():
-        selected = values[selector]
-        active_fields = branches[selected]
-        missing = tuple(name for name in active_fields if name not in values)
-        if missing:
-            names = ", ".join(missing)
-            raise ValueError(f"{schema.model} selector {selector}={selected!r} requires: {names}.")
-        inactive_fields = set(schema.mutually_exclusive_fields[selector]).difference(active_fields)
-        supplied_inactive = tuple(name for name in inactive_fields if name in values)
-        if supplied_inactive:
-            names = ", ".join(sorted(supplied_inactive))
-            raise ValueError(f"{schema.model} selector {selector}={selected!r} does not accept: {names}.")
-
-
-def _validate_realized_fields(schema, values):
-    unknown = tuple(name for name in values if name not in schema.fields)
-    if unknown:
-        names = ", ".join(unknown)
-        raise ValueError(f"Unknown {schema.model} field(s): {names}.")
-    missing = tuple(name for name in schema.always_required if name not in values)
-    if missing:
-        names = ", ".join(missing)
-        raise ValueError(f"Missing required {schema.model} field(s): {names}.")
-    for name in schema.fields:
-        if name in values:
-            values[name] = _validate_field_value(schema, name, values[name])
-    _validate_selector_fields(schema, values)
-    _validate_ellipticity_pair(schema, values)
-    _validate_pseudo_jaffe_radii(schema, values)
-
-
-def _validate_spec_fields(schema, parameters, options):
-    supplied = set(parameters).union(options)
-    reserved = _RESERVED_LENS_SPEC_FIELDS.intersection(supplied)
-    if reserved:
-        names = ", ".join(sorted(reserved))
-        raise ValueError(f"Reserved lens field name(s): {names}.")
-    unknown = supplied.difference(schema.fields)
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"Unknown {schema.model} field(s): {names}.")
-    missing = set(schema.always_required).difference(supplied)
-    if missing:
-        names = ", ".join(name for name in schema.always_required if name in missing)
-        raise ValueError(f"Missing required {schema.model} field(s): {names}.")
-
-    for name, value in options.items():
-        _validate_field_value(schema, name, value)
-
-    fixed_options = {name: value for name, value in options.items() if name not in parameters}
-    _validate_ellipticity_pair(schema, fixed_options)
-    _validate_pseudo_jaffe_radii(schema, fixed_options)
-
-    for selector, branches in schema.selector_branches.items():
-        if selector in parameters:
-            continue
-        selected = options.get(selector, schema.fields[selector].default)
-        selected = _validate_field_value(schema, selector, selected)
-        active_fields = branches[selected]
-        missing = tuple(name for name in active_fields if name not in supplied)
-        if missing:
-            names = ", ".join(missing)
-            raise ValueError(f"{schema.model} selector {selector}={selected!r} requires: {names}.")
-        inactive_fields = set(schema.mutually_exclusive_fields[selector]).difference(active_fields)
-        supplied_inactive = tuple(name for name in inactive_fields if name in supplied)
-        if supplied_inactive:
-            names = ", ".join(sorted(supplied_inactive))
-            raise ValueError(f"{schema.model} selector {selector}={selected!r} does not accept: {names}.")
-
-
-def _realize_component_values(schema, parameter_values, options):
-    values = {name: field.default for name, field in schema.fields.items() if field.default is not _MISSING}
-    values.update(options)
-    values.update(parameter_values)
-    _validate_realized_fields(schema, values)
-    return MappingProxyType(values)
+def _get_model_class(model):
+    """Return one explicitly registered top-level Caustics lens class."""
+    if model not in _LENS_MODEL_REGISTRY:
+        raise ValueError(f"Requested model {model!r} is not supported currently.")
+    caustics = _import_caustics()
+    return getattr(caustics, model)
 
 
 @dataclass(frozen=True, init=False)
 class CausticsLensSpec:
-    """Structurally immutable specification of one registered lens component.
+    """Describe one registered Caustics lens constructor.
 
     Parameters
     ----------
     model : str
-        Explicit registry key: ``SIS``, ``SIE``, ``EPL``, ``NFW``, ``TNFW``,
-        ``PseudoJaffe``, ``ExternalShear``, or ``MassSheet``.
+        Explicit registry key, including ``SinglePlane`` for a composition.
     parameters : Mapping[str, object]
-        Registered fields whose values remain referenced as graph dependencies.
-        They become ``lens_<field>`` inputs for an atomic node or
-        ``lens_<component>_<field>`` inputs inside a single-plane node.
-    options : Mapping[str, object] or None, optional
-        Fixed registered fields represented by recursively immutable literals.
-        Registry defaults fill absent optional fields during realization.
+        Constructor arguments. Values remain graph dependencies. For
+        ``SinglePlane``, ``lenses`` is a sequence of nested lens specs rather
+        than a graph input.
 
     Attributes
     ----------
     model : str
-        Registered component key.
+        Registered constructor name.
     parameters : Mapping[str, object]
-        Read-only snapshot of graph-visible fields in supplied order.
-    options : Mapping[str, object]
-        Read-only snapshot of fixed fields in supplied order.
+        Read-only snapshot of supplied constructor arguments.
 
     Notes
     -----
-    The mappings are snapshotted structurally, but dependency values in
-    ``parameters`` are not deep-copied. Realization merges registry defaults,
-    fixed ``options``, and graph-visible ``parameters`` in that precedence
-    order. Constructor-owned cosmology, redshift, naming, and plane fields are
-    reserved. Only explicitly registered models and fields are accepted.
+    Validation is deliberately structural: the model must be registered,
+    required constructor arguments must be available here or inherited from a
+    parent plane, and explicit parameter names must occur in the constructor
+    signature. Realized parameter values are passed to Caustics without local
+    physical-domain validation.
     """
 
     model: str
     parameters: Mapping[str, object]
-    options: Mapping[str, object]
 
-    def __init__(self, model, parameters, options=None):
-        schema = _get_registered_schema(model)
-        parameter_snapshot = _snapshot_string_mapping("parameters", parameters)
-        option_snapshot = _snapshot_string_mapping("options", {} if options is None else options)
-        for name, value in option_snapshot.items():
-            _validate_option_literal(f"options[{name!r}]", value)
-        _validate_spec_fields(schema, parameter_snapshot, option_snapshot)
+    def __init__(self, model, parameters):
+        if not isinstance(parameters, Mapping):
+            raise TypeError("parameters must be a mapping.")
+        parameter_snapshot = dict(parameters)
+        if any(not isinstance(name, str) for name in parameter_snapshot):
+            raise TypeError("parameters keys must be strings.")
+        if "z_s" in parameter_snapshot:
+            raise ValueError("z_s is supplied by the consuming node as source_redshift.")
+
+        model_class = _get_model_class(model)
+        signature = inspect.signature(model_class)
+        supported = {
+            name
+            for name, parameter in signature.parameters.items()
+            if parameter.kind not in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD)
+        }
+        if model == "ExternalShear":
+            parametrization = parameter_snapshot.get("parametrization", "cartesian")
+            if isinstance(parametrization, str) and parametrization == "angular":
+                supported.difference_update(("gamma_1", "gamma_2"))
+                supported.update(("gamma", "phi"))
+            elif not isinstance(parametrization, str):
+                supported.update(("gamma", "phi"))
+        for name, parameter in signature.parameters.items():
+            if (
+                _is_required_parameter(parameter)
+                and name not in parameter_snapshot
+                and name not in _INHERITED_LENS_PARAMETERS
+            ):
+                raise ValueError(f"{name} is required by the chosen {model} lens model.")
+        unsupported = set(parameter_snapshot).difference(supported)
+        if unsupported:
+            names = "\n".join(sorted(unsupported))
+            raise ValueError(
+                f"parameters contains keys not supported by the chosen {model} lens model.\n"
+                f"Offending keys are:\n{names}"
+            )
+
+        if model == "SinglePlane":
+            lenses = tuple(parameter_snapshot["lenses"])
+            if any(not isinstance(lens, CausticsLensSpec) for lens in lenses):
+                raise TypeError("SinglePlane lenses must contain only CausticsLensSpec objects.")
+            parameter_snapshot["lenses"] = lenses
+
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "parameters", MappingProxyType(parameter_snapshot))
-        object.__setattr__(self, "options", MappingProxyType(option_snapshot))
-
-
-@dataclass(frozen=True, init=False)
-class CausticsSinglePlaneSpec:
-    """Structurally immutable ordered collection of components on one plane.
-
-    Parameters
-    ----------
-    components : Mapping[str, CausticsLensSpec]
-        Nonempty flat mapping of identifier names to atomic specifications.
-        Component order and dependency identity are preserved.
-
-    Attributes
-    ----------
-    components : Mapping[str, CausticsLensSpec]
-        Read-only snapshot whose keys name fresh Caustics child lenses and form
-        ``lens_<component>_<field>`` graph paths.
-
-    Notes
-    -----
-    Component names must be non-keyword Python identifiers and may not collide
-    with the realized Caskade or single-plane namespace. Nested planes and
-    affine-only systems are not supported by the consuming nodes.
-    """
-
-    components: Mapping[str, CausticsLensSpec]
-
-    def __init__(self, components):
-        component_snapshot = _snapshot_string_mapping("components", components)
-        if not component_snapshot:
-            raise ValueError("CausticsSinglePlaneSpec components must be nonempty.")
-        for name, component in component_snapshot.items():
-            if not name.isidentifier() or keyword.iskeyword(name):
-                raise ValueError(f"Component name {name!r} must be a non-keyword Python identifier.")
-            if not isinstance(component, CausticsLensSpec):
-                raise TypeError(f"Component {name!r} must be a CausticsLensSpec.")
-        object.__setattr__(self, "components", MappingProxyType(component_snapshot))
 
 
 _RECOVERY_SEED_POINTS = 256
 _RECOVERY_ROOT_REFINEMENTS = 8
 _INITIAL_FOV_PADDING = 1.1
+
+
+def _import_caustics():
+    """Lazily import the optional Caustics package."""
+    try:
+        import caustics
+    except ImportError as err:  # pragma: no cover
+        raise ImportError(
+            "Caustics-backed lens nodes require the optional 'caustics' package. "
+            "Install it with `pip install caustics`."
+        ) from err
+    return caustics
 
 
 def _import_caustics_dependencies():
@@ -549,11 +159,11 @@ def _import_caustics_dependencies():
         If either Caustics or its PyTorch backend cannot be imported. The
         original import error is retained as the exception cause.
     """
+    caustics = _import_caustics()
     try:
         import torch
 
         torch.set_default_dtype(torch.float64)
-        import caustics
     except ImportError as err:  # pragma: no cover
         raise ImportError(
             "Caustics-backed lens nodes require the optional 'caustics' package. "
@@ -858,46 +468,6 @@ def _is_retryable_forward_raytrace_error(error):
     schedule.
     """
     return isinstance(error, IndexError) and "index 0 is out of bounds" in str(error).lower()
-
-
-def _validate_lens_redshifts(values):
-    """Validate redshifts from one realized Caustics-node input mapping.
-
-    Parameters
-    ----------
-    values : Mapping
-        Numeric inputs for one lens-system sample. The mapping must contain
-        dimensionless ``lens_redshift`` and ``source_redshift`` entries.
-
-    Returns
-    -------
-    lens_redshift : float
-        Finite, non-negative lens redshift.
-    source_redshift : float
-        Finite source redshift strictly greater than ``lens_redshift``.
-
-    Raises
-    ------
-    KeyError
-        If either required redshift is absent.
-    TypeError
-        If a redshift cannot be converted to a scalar float.
-    ValueError
-        If a redshift is non-finite or the lens/source ordering is invalid.
-    """
-    try:
-        z_l = float(values["lens_redshift"])
-    except (TypeError, ValueError, OverflowError) as err:
-        raise TypeError("lens_redshift must realize to a scalar numeric value.") from err
-    try:
-        z_s = float(values["source_redshift"])
-    except (TypeError, ValueError, OverflowError) as err:
-        raise TypeError("source_redshift must realize to a scalar numeric value.") from err
-    if not np.isfinite(z_l) or not np.isfinite(z_s):
-        raise ValueError("Lens and source redshifts must be finite.")
-    if z_l < 0.0 or z_s <= z_l:
-        raise ValueError(f"Expected 0 <= lens_redshift < source_redshift; got {z_l} and {z_s}.")
-    return z_l, z_s
 
 
 def _import_contourpy():
@@ -1261,8 +831,11 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
         return center
 
     def preserves_axisymmetry(self, values):
-        """Return false because this is a non-affine composite adapter."""
-        return False
+        """Return whether this plane is entirely symmetry-preserving affine."""
+        return all(
+            component.affine and component.adapter.preserves_axisymmetry(values[component.name])
+            for component in self.components
+        )
 
     def reference_num_images(self, values):
         """Return one image plus every component's reference-image excess."""
@@ -1331,33 +904,47 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
         return max(max_x - min_x, max_y - min_y)
 
     def pseudo_caustic_generators(self, values):
-        """Return ordered generators capped by their nearest peer center."""
-        owners = tuple(
-            (
-                component,
-                component.adapter.search_center(values[component.name]),
-            )
-            for component in self.components
-            if not component.affine
-        )
+        """Return ordered generators capped by their nearest distinct peer."""
+        owner_centers = []
         generators = []
-        for owner_index, (component, owner_center) in enumerate(owners):
-            for generator in component.adapter.pseudo_caustic_generators(values[component.name]):
-                if len(owners) > 1:
-                    nearest_distance = min(
-                        hypot(
-                            owner_center[0] - other_center[0],
-                            owner_center[1] - other_center[1],
-                        )
-                        for other_index, (_, other_center) in enumerate(owners)
-                        if other_index != owner_index
+        for component in self.components:
+            if component.affine:
+                continue
+            component_values = values[component.name]
+            component_generators = component.adapter.pseudo_caustic_generators(component_values)
+            if component_generators:
+                owner_centers.extend(generator.center for generator in component_generators)
+            else:
+                owner_centers.append(component.adapter.search_center(component_values))
+            generators.extend(component_generators)
+
+        capped_generators = []
+        for generator in generators:
+            separations = tuple(
+                distance
+                for center in owner_centers
+                if (
+                    distance := hypot(
+                        generator.center[0] - center[0],
+                        generator.center[1] - center[1],
                     )
-                    generator = _PseudoCausticGenerator(
-                        center=generator.center,
-                        max_initial_radius=(_PSEUDO_CAUSTIC_SEPARATION_FRACTION * nearest_distance),
-                    )
-                generators.append(generator)
-        return tuple(generators)
+                )
+                > 0.0
+            )
+            max_initial_radius = generator.max_initial_radius
+            if separations:
+                peer_cap = _PSEUDO_CAUSTIC_SEPARATION_FRACTION * min(separations)
+                if max_initial_radius is None:
+                    max_initial_radius = peer_cap
+                else:
+                    max_initial_radius = min(max_initial_radius, peer_cap)
+            capped_generators.append(
+                _PseudoCausticGenerator(
+                    center=generator.center,
+                    max_initial_radius=max_initial_radius,
+                )
+            )
+        return tuple(capped_generators)
 
 
 def _trace_pseudo_caustics(
@@ -1449,7 +1036,7 @@ def _sis_geometry_adapter(lens, values):
         _caustics_scalar(lens.y0.value),
     )
     einstein_radius = _caustics_scalar(lens.Rein.value)
-    unsoftened = float(values["s"]) == 0.0
+    unsoftened = float(lens.s) == 0.0
     return _PointSingularityGeometryAdapter(
         center=center,
         resolution=einstein_radius,
@@ -1468,7 +1055,7 @@ def _sie_geometry_adapter(lens, values):
     )
     einstein_radius = _caustics_scalar(lens.Rein.value)
     axis_ratio = _caustics_scalar(lens.q.value)
-    unsoftened = float(values["s"]) == 0.0
+    unsoftened = float(lens.s) == 0.0
     return _PointSingularityGeometryAdapter(
         center=center,
         resolution=einstein_radius,
@@ -1509,7 +1096,7 @@ def _nfw_geometry_adapter(lens, values):
     scale_radius_mpc = _caustics_scalar(lens.get_scale_radius())
     distance_mpc = _caustics_scalar(lens.cosmology.angular_diameter_distance(lens.z_l.value))
     angular_scale = float(scale_radius_mpc / distance_mpc * rad_to_arcsec)
-    unsoftened = float(values["s"]) == 0.0
+    unsoftened = float(lens.s) == 0.0
     return _SmoothCuspGeometryAdapter(
         center=center,
         resolution=angular_scale,
@@ -1527,7 +1114,7 @@ def _tnfw_geometry_adapter(lens, values):
     )
     scale_radius = _caustics_scalar(lens.Rs.value)
     truncation = _caustics_scalar(lens.tau.value)
-    unsoftened = float(values["s"]) == 0.0
+    unsoftened = float(lens.s) == 0.0
     return _PointSingularityGeometryAdapter(
         center=center,
         resolution=scale_radius,
@@ -1568,298 +1155,224 @@ def _mass_sheet_geometry_adapter(lens, values):
     return _AffinePerturbationGeometryAdapter(axisymmetry_preserving=True)
 
 
+@dataclass(frozen=True)
+class _RegisteredLensModel:
+    affine: bool
+    geometry_factory: object
+
+
 _LENS_MODEL_REGISTRY = {
-    "SIS": _RegisteredLensModel(_LENS_MODEL_SCHEMAS["SIS"], lambda c: c.SIS, _sis_geometry_adapter),
-    "SIE": _RegisteredLensModel(_LENS_MODEL_SCHEMAS["SIE"], lambda c: c.SIE, _sie_geometry_adapter),
-    "EPL": _RegisteredLensModel(_LENS_MODEL_SCHEMAS["EPL"], lambda c: c.EPL, _epl_geometry_adapter),
-    "NFW": _RegisteredLensModel(_LENS_MODEL_SCHEMAS["NFW"], lambda c: c.NFW, _nfw_geometry_adapter),
-    "TNFW": _RegisteredLensModel(_LENS_MODEL_SCHEMAS["TNFW"], lambda c: c.TNFW, _tnfw_geometry_adapter),
+    "SIS": _RegisteredLensModel(affine=False, geometry_factory=_sis_geometry_adapter),
+    "SIE": _RegisteredLensModel(affine=False, geometry_factory=_sie_geometry_adapter),
+    "EPL": _RegisteredLensModel(affine=False, geometry_factory=_epl_geometry_adapter),
+    "NFW": _RegisteredLensModel(affine=False, geometry_factory=_nfw_geometry_adapter),
+    "TNFW": _RegisteredLensModel(affine=False, geometry_factory=_tnfw_geometry_adapter),
     "PseudoJaffe": _RegisteredLensModel(
-        _LENS_MODEL_SCHEMAS["PseudoJaffe"], lambda c: c.PseudoJaffe, _pseudo_jaffe_geometry_adapter
+        affine=False,
+        geometry_factory=_pseudo_jaffe_geometry_adapter,
     ),
     "ExternalShear": _RegisteredLensModel(
-        _LENS_MODEL_SCHEMAS["ExternalShear"], lambda c: c.ExternalShear, _external_shear_geometry_adapter
+        affine=True,
+        geometry_factory=_external_shear_geometry_adapter,
     ),
     "MassSheet": _RegisteredLensModel(
-        _LENS_MODEL_SCHEMAS["MassSheet"], lambda c: c.MassSheet, _mass_sheet_geometry_adapter
+        affine=True,
+        geometry_factory=_mass_sheet_geometry_adapter,
+    ),
+    "SinglePlane": _RegisteredLensModel(
+        affine=False,
+        geometry_factory=_SinglePlaneGeometryAdapter,
     ),
 }
 
 
-@dataclass(frozen=True)
-class _CompiledLensComponent:
-    name: str
-    registry: _RegisteredLensModel
-    parameter_fields: tuple[str, ...]
-    parameter_graph_names: Mapping[str, str]
-    options: Mapping[str, object]
+def _validate_root_lens_spec(lens):
+    missing = _INHERITED_LENS_PARAMETERS.difference(lens.parameters)
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise ValueError(f"The root lens specification requires: {names}.")
+
+    def validate_children(spec):
+        for child in spec.parameters.get("lenses", ()):
+            inherited = _INHERITED_LENS_PARAMETERS.intersection(child.parameters)
+            if inherited:
+                names = ", ".join(sorted(inherited))
+                raise ValueError(f"Nested lens specifications inherit rather than define: {names}.")
+            validate_children(child)
+
+    validate_children(lens)
+    if _lens_spec_is_affine(lens):
+        raise ValueError("Caustics strong-lensing nodes require at least one non-affine lens model.")
 
 
-@dataclass(frozen=True)
-class _CompiledLensSpec:
-    components: tuple[_CompiledLensComponent, ...]
-    graph_inputs: tuple[tuple[str, object], ...]
-    is_single_plane: bool
+def _lens_spec_is_affine(lens):
+    """Return the effective affinity of one recursive lens specification."""
+    if lens.model == "SinglePlane":
+        return all(_lens_spec_is_affine(child) for child in lens.parameters["lenses"])
+    return _LENS_MODEL_REGISTRY[lens.model].affine
 
 
-@dataclass(frozen=True)
-class _RealizedLensComponent:
-    name: str
-    registry: _RegisteredLensModel
-    values: Mapping[str, object]
-    lens: object
-    geometry_adapter: _GeometryAdapter
-
-
-@dataclass(frozen=True)
-class _RealizedLensSystem:
-    lens: object
-    geometry_adapter: _GeometryAdapter
-    values: Mapping[str, object]
-    components: tuple[_RealizedLensComponent, ...]
-
-
-def _component_name_namespace(caustics):
-    """Return the live Caskade and SinglePlane attribute namespace."""
-    import caskade
-
-    single_plane = caustics.SinglePlane(
-        cosmology=caustics.FlatLambdaCDM(name="namespace_cosmology"),
-        lenses=(),
-        name="namespace_single_plane",
-    )
-    node_tuple = caskade.NodeTuple((), name="namespace_tuple")
-    namespace = set()
-    for node_class, node in (
-        (caskade.Node, caskade.Node(name="namespace_node")),
-        (caskade.NodeCollection, caskade.NodeCollection(name="namespace_collection")),
-        (caskade.NodeTuple, node_tuple),
-        (caustics.SinglePlane, single_plane),
-    ):
-        namespace.update(dir(node))
-        namespace.update(dir(node_class))
-        namespace.update(name for name in inspect.signature(node_class).parameters if hasattr(node, name))
-    return namespace
-
-
-def _compile_lens_spec(lens, *, reserved_parameter_names=()):
-    """Compile an immutable lens specification into deterministic graph metadata."""
-    is_single_plane = isinstance(lens, CausticsSinglePlaneSpec)
-    if is_single_plane:
-        caustics, _ = _import_caustics_dependencies()
-        component_namespace = _component_name_namespace(caustics)
-        component_specs = tuple(lens.components.items())
-        for name, _ in component_specs:
-            if not name.isidentifier() or keyword.iskeyword(name):
-                raise ValueError(f"Component name {name!r} must be a non-keyword Python identifier.")
-            if name in component_namespace:
-                raise ValueError(f"Component name {name!r} collides with the Caskade/SinglePlane namespace.")
-    else:
-        component_specs = (("lens", lens),)
-
-    flattened_names = set(reserved_parameter_names)
-    compiled_components = []
+def _lens_graph_inputs(lens, prefix="lens"):
+    """Flatten one recursive specification into graph input names and setters."""
     graph_inputs = []
-    for component_name, component_spec in component_specs:
-        registry = _LENS_MODEL_REGISTRY[component_spec.model]
-        parameter_fields = tuple(
-            field_name for field_name in registry.schema.fields if field_name in component_spec.parameters
-        )
-        parameter_graph_names = {}
-        for field_name in parameter_fields:
-            if is_single_plane:
-                graph_name = f"lens_{component_name}_{field_name}"
-            else:
-                graph_name = f"lens_{field_name}"
-            if graph_name in flattened_names:
-                raise ValueError(f"Duplicate or reserved flattened lens parameter name {graph_name!r}.")
-            flattened_names.add(graph_name)
-            parameter_graph_names[field_name] = graph_name
-            graph_inputs.append((graph_name, component_spec.parameters[field_name]))
-        compiled_components.append(
-            _CompiledLensComponent(
-                name=component_name,
-                registry=registry,
-                parameter_fields=parameter_fields,
-                parameter_graph_names=MappingProxyType(parameter_graph_names),
-                options=MappingProxyType(dict(component_spec.options)),
-            )
-        )
-
-    if all(component.registry.schema.affine for component in compiled_components):
-        raise ValueError("A lens specification must contain at least one non-affine component.")
-    return _CompiledLensSpec(
-        components=tuple(compiled_components),
-        graph_inputs=tuple(graph_inputs),
-        is_single_plane=is_single_plane,
-    )
+    for name, setter in lens.parameters.items():
+        if name == "lenses":
+            for index, child in enumerate(setter):
+                graph_inputs.extend(_lens_graph_inputs(child, f"{prefix}_{index}"))
+        else:
+            graph_inputs.append((f"{prefix}_{name}", setter))
+    return tuple(graph_inputs)
 
 
-def _caustics_lens_kwargs(registry, values, torch):
-    """Convert registered numeric fields while preserving configuration literals."""
-    kwargs = {}
-    for name, field in registry.schema.fields.items():
-        if name not in values:
-            continue
-        value = values[name]
-        if field.kind == "positive_int":
-            value = int(value)
-        elif field.kind == "chunk_size" and value is not None:
-            value = int(value)
-        elif field.kind == "bool":
-            value = bool(value)
-        elif field.kind != "selector" and value is not None:
-            value = torch.as_tensor(value, dtype=torch.float64)
-        kwargs[name] = value
-    return kwargs
-
-
-def _construct_registered_lens(
-    component,
-    component_values,
+def _construct_lens_tree(
+    lens_spec,
+    values,
     *,
     caustics,
     torch,
-    cosmology,
-    z_l,
-    z_s,
+    prefix,
     name,
+    cosmology=None,
+    z_l=None,
+    z_s=None,
+    root=False,
 ):
-    """Construct one fresh explicitly registered Caustics lens component."""
-    try:
-        lens_class = component.registry.lens_class(caustics)
-        lens_kwargs = _caustics_lens_kwargs(component.registry, component_values, torch)
-        return lens_class(
+    """Recursively construct fresh Caustics objects from one graph sample."""
+    lens_values = {
+        parameter_name: values[f"{prefix}_{parameter_name}"]
+        for parameter_name in lens_spec.parameters
+        if parameter_name != "lenses"
+    }
+    if root:
+        cosmology = lens_values.pop("cosmology")
+        z_l = torch.as_tensor(lens_values.pop("z_l"), dtype=torch.float64)
+
+    lens_name = lens_values.pop("name", name)
+    lens_class = getattr(caustics, lens_spec.model)
+    children = tuple(
+        _construct_lens_tree(
+            child_spec,
+            values,
+            caustics=caustics,
+            torch=torch,
+            prefix=f"{prefix}_{index}",
+            name=f"{name}_{index}",
             cosmology=cosmology,
+        )
+        for index, child_spec in enumerate(lens_spec.parameters.get("lenses", ()))
+    )
+
+    if lens_spec.model == "SinglePlane":
+        lens = lens_class(
+            cosmology=cosmology,
+            lenses=children,
+            name=lens_name,
             z_l=z_l,
             z_s=z_s,
-            name=name,
-            **lens_kwargs,
+            **lens_values,
         )
-    except Exception as err:
-        raise ValueError(
-            f"Failed to construct Caustics component {component.name!r} "
-            f"with model {component.registry.schema.model!r}."
-        ) from err
+    else:
+        lens = lens_class(
+            cosmology=cosmology,
+            name=lens_name,
+            z_l=z_l,
+            z_s=z_s,
+            **lens_values,
+        )
+    if "s" in lens_values:
+        lens.s = float(lens.s)
+    return lens
 
 
-def _build_lens_system(compiled, *, cosmology, values):
-    """Realize one fresh atomic or single-plane Caustics lens system."""
-    z_l_value, z_s_value = _validate_lens_redshifts(values)
-    caustics, torch = _import_caustics_dependencies()
-    z_l = torch.as_tensor(z_l_value, dtype=torch.float64)
-    z_s = torch.as_tensor(z_s_value, dtype=torch.float64)
+def _realize_lens_geometry(lens_spec, lens, values, *, torch, prefix, name, root=False):
+    """Staticize one realized tree and recursively construct its geometry."""
+    lens_values = {
+        parameter_name: values[f"{prefix}_{parameter_name}"]
+        for parameter_name in lens_spec.parameters
+        if parameter_name != "lenses"
+    }
+    if root:
+        lens_values.pop("cosmology")
+        lens_values.pop("z_l")
+    lens_values.pop("name", None)
 
-    realized_values = []
-    for component in compiled.components:
-        parameter_values = {
-            field_name: values[component.parameter_graph_names[field_name]]
-            for field_name in component.parameter_fields
-        }
-        realized_values.append(
-            _realize_component_values(
-                component.registry.schema,
-                parameter_values,
-                component.options,
+    registry = _LENS_MODEL_REGISTRY[lens_spec.model]
+    if lens_spec.model != "SinglePlane":
+        for parameter_name in lens_values:
+            parameter = getattr(lens, parameter_name, None)
+            if hasattr(parameter, "value") and hasattr(parameter, "to"):
+                parameter.to(dtype=torch.float64)
+        lens.to_static()
+        adapter_values = MappingProxyType(lens_values)
+        adapter = registry.geometry_factory(lens, adapter_values)
+        non_affine_components = ()
+        if not registry.affine:
+            non_affine_components = ((name, adapter.search_center(adapter_values)),)
+        return adapter, adapter_values, registry.affine, non_affine_components
+
+    components = []
+    adapter_values = {}
+    non_affine_components = []
+    for index, (child_spec, child_lens) in enumerate(
+        zip(lens_spec.parameters["lenses"], lens.lenses, strict=True)
+    ):
+        child_name = f"{name}_{index}"
+        child_adapter, child_values, child_affine, child_non_affine = _realize_lens_geometry(
+            child_spec,
+            child_lens,
+            values,
+            torch=torch,
+            prefix=f"{prefix}_{index}",
+            name=child_name,
+        )
+        components.append(
+            _GeometryComponent(
+                name=child_name,
+                adapter=child_adapter,
+                affine=child_affine,
             )
         )
-
-    non_affine = tuple(
-        (component, component_values)
-        for component, component_values in zip(compiled.components, realized_values, strict=True)
-        if not component.registry.schema.affine
-    )
-    for first_index, (first, first_values) in enumerate(non_affine):
-        for second, second_values in non_affine[first_index + 1 :]:
-            if first_values["x0"] == second_values["x0"] and first_values["y0"] == second_values["y0"]:
+        adapter_values[child_name] = child_values
+        non_affine_components.extend(child_non_affine)
+    for first_index, (first_name, first_center) in enumerate(non_affine_components):
+        for second_name, second_center in non_affine_components[first_index + 1 :]:
+            if first_center == second_center:
                 raise ValueError(
-                    f"Non-affine lens components {first.name!r} and {second.name!r} "
+                    f"Non-affine lens components {first_name!r} and {second_name!r} "
                     "have exactly coincident centers."
                 )
+    adapter_values = MappingProxyType(adapter_values)
+    return (
+        registry.geometry_factory(tuple(components)),
+        adapter_values,
+        all(component.affine for component in components),
+        tuple(non_affine_components),
+    )
 
-    if not compiled.is_single_plane:
-        component = compiled.components[0]
-        component_values = realized_values[0]
-        lens = _construct_registered_lens(
-            component,
-            component_values,
-            caustics=caustics,
-            torch=torch,
-            cosmology=cosmology,
-            z_l=z_l,
-            z_s=z_s,
-            name="lens",
-        )
-        lens.to_static()
-        geometry_adapter = component.registry.geometry_factory(lens, component_values)
-        realized_component = _RealizedLensComponent(
-            name=component.name,
-            registry=component.registry,
-            values=component_values,
-            lens=lens,
-            geometry_adapter=geometry_adapter,
-        )
-        return _RealizedLensSystem(
-            lens=lens,
-            geometry_adapter=geometry_adapter,
-            values=component_values,
-            components=(realized_component,),
-        )
 
-    children = tuple(
-        _construct_registered_lens(
-            component,
-            component_values,
-            caustics=caustics,
-            torch=torch,
-            cosmology=cosmology,
-            z_l=None,
-            z_s=None,
-            name=component.name,
-        )
-        for component, component_values in zip(compiled.components, realized_values, strict=True)
+def _build_lens_system(lens_spec, *, values):
+    """Realize one fresh registered lens tree for a graph sample."""
+    caustics, torch = _import_caustics_dependencies()
+    lens = _construct_lens_tree(
+        lens_spec,
+        values,
+        caustics=caustics,
+        torch=torch,
+        prefix="lens",
+        name="lens",
+        z_s=torch.as_tensor(values["source_redshift"], dtype=torch.float64),
+        root=True,
     )
-    lens = caustics.SinglePlane(
-        cosmology=cosmology,
-        lenses=children,
-        name="lens_plane",
-        z_l=z_l,
-        z_s=z_s,
+    geometry_adapter, adapter_values, _, _ = _realize_lens_geometry(
+        lens_spec,
+        lens,
+        values,
+        torch=torch,
+        prefix="lens",
+        name="lens",
+        root=True,
     )
-    for child in children:
-        child.to_static()
-    realized_components = tuple(
-        _RealizedLensComponent(
-            name=component.name,
-            registry=component.registry,
-            values=component_values,
-            lens=child,
-            geometry_adapter=component.registry.geometry_factory(child, component_values),
-        )
-        for component, component_values, child in zip(
-            compiled.components,
-            realized_values,
-            children,
-            strict=True,
-        )
-    )
-    geometry_adapter = _SinglePlaneGeometryAdapter(
-        tuple(
-            _GeometryComponent(
-                name=component.name,
-                adapter=component.geometry_adapter,
-                affine=component.registry.schema.affine,
-            )
-            for component in realized_components
-        )
-    )
-    system_values = MappingProxyType({component.name: component.values for component in realized_components})
-    return _RealizedLensSystem(
-        lens=lens,
-        geometry_adapter=geometry_adapter,
-        values=system_values,
-        components=realized_components,
-    )
+    return lens, geometry_adapter, adapter_values
 
 
 class _CausticFOVError(RuntimeError):
@@ -2869,17 +2382,21 @@ def _validate_source_position_configuration(
     return normalized
 
 
-def _validate_source_geometry_support(system):
+def _validate_source_geometry_support(lens_spec, lens, name="lens"):
     """Reject realized geometries that source-region sampling cannot certify."""
-    for component in system.components:
-        if component.registry.schema.model == "EPL" and component.values["t"] > 1.0:
-            slope = component.values["t"]
+    if lens_spec.model == "EPL":
+        slope = _caustics_scalar(lens.t.value)
+        if slope > 1.0:
             raise NotImplementedError(
-                f"Component {component.name!r} has physically valid EPL slope t={slope} > 1, "
+                f"Component {name!r} has physically valid EPL slope t={slope} > 1, "
                 "but CausticsSourcePositionNode cannot yet certify its unbounded "
                 "multi-image geometry. Restrict the prior to t <= 1 or use "
                 "CausticsLensImageNode; support is expected in a future extension."
             )
+    for index, (child_spec, child_lens) in enumerate(
+        zip(lens_spec.parameters.get("lenses", ()), getattr(lens, "lenses", ()), strict=True)
+    ):
+        _validate_source_geometry_support(child_spec, child_lens, f"{name}_{index}")
 
 
 class CausticsSourcePositionNode(FunctionNode, CiteClass):
@@ -2896,16 +2413,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
     Parameters
     ----------
-    lens : CausticsLensSpec | CausticsSinglePlaneSpec
-        Immutable registered lens specification. Parameter fields become graph
-        inputs named ``lens_<field>`` for an atomic lens or
-        ``lens_<component>_<field>`` for a single plane. Fixed options and
-        registry defaults remain immutable realization metadata rather than
-        graph inputs.
-    cosmology : caustics.Cosmology
-        Fixed cosmology used to construct each realized lens.
-    lens_redshift : parameter
-        Dimensionless lens-redshift setter.
+    lens : CausticsLensSpec
+        Registered atomic or recursive lens specification. The root parameters
+        include ``cosmology`` and the lens-redshift setter ``z_l``.
     source_redshift : parameter
         Dimensionless source-redshift setter.
     fov : float or None, optional
@@ -3030,8 +2540,6 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         self,
         lens,
         *,
-        cosmology,
-        lens_redshift,
         source_redshift,
         fov=None,
         pixelscale=0.01,
@@ -3051,14 +2559,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         Parameters
         ----------
-        lens : CausticsLensSpec | CausticsSinglePlaneSpec
-            Immutable atomic or ordered single-plane lens specification.
-            Parameter fields are graph-visible; fixed options and registry
-            defaults are realized as immutable metadata.
-        cosmology : caustics.Cosmology
-            Fixed cosmology supplied to every realized lens.
-        lens_redshift : object
-            Graph setter for dimensionless lens redshift.
+        lens : CausticsLensSpec
+            Registered atomic or recursive lens specification. The root owns
+            ``cosmology`` and the dimensionless lens-redshift setter ``z_l``.
         source_redshift : object
             Graph setter for dimensionless source redshift.
         fov : float-convertible scalar or None, optional
@@ -3111,28 +2614,16 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
         Notes
         -----
-        Redshifts are registered first. Parameter fields then use compiled order
-        and the key scheme ``lens_<field>`` for an atomic lens or
-        ``lens_<component>_<field>`` for a single plane. All nine public outputs
-        are registered in ``_OUTPUTS`` order. The public specification and its
-        immutable compilation are stored on the node, while realized adapters
-        remain sample-local. The seeded node-owned generator is used only when
-        ``compute`` receives no caller generator.
+        ``source_redshift`` is registered directly. Lens parameters use
+        ``lens_<field>`` at the root and positional path segments inside nested
+        planes. All nine public outputs are registered in ``_OUTPUTS`` order.
+        The seeded node-owned generator is used only when ``compute`` receives
+        no caller generator.
         """
-        if not isinstance(lens, (CausticsLensSpec, CausticsSinglePlaneSpec)):
-            raise TypeError("lens must be a CausticsLensSpec or CausticsSinglePlaneSpec.")
-
-        reserved_names = {
-            "lens_redshift",
-            "source_redshift",
-            *self._OUTPUTS,
-            *dir(type(self)),
-            *dir(self),
-        }
-        compiled_lens = _compile_lens_spec(
-            lens,
-            reserved_parameter_names=reserved_names,
-        )
+        if not isinstance(lens, CausticsLensSpec):
+            raise TypeError("lens must be a CausticsLensSpec.")
+        _validate_root_lens_spec(lens)
+        lens_graph_inputs = _lens_graph_inputs(lens)
 
         pixelscale_fraction = _validate_optional_positive_fraction(
             "pixelscale_fraction",
@@ -3153,8 +2644,6 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         )
 
         self.lens = lens
-        self._compiled_lens = compiled_lens
-        self.cosmology = cosmology
         self.fov = normalized.get("fov")
         self.pixelscale = normalized["pixelscale"]
         self.pixelscale_fraction = pixelscale_fraction
@@ -3168,11 +2657,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         self.max_attempts = int(max_attempts)
         self._rng = np.random.default_rng(seed)
 
-        node_inputs = {
-            "lens_redshift": lens_redshift,
-            "source_redshift": source_redshift,
-        }
-        for name, setter in self._compiled_lens.graph_inputs:
+        node_inputs = {"source_redshift": source_redshift}
+        for name, setter in lens_graph_inputs:
             node_inputs[name] = setter
 
         super().__init__(
@@ -3183,15 +2669,11 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         )
 
     def _lens_description(self):
-        """Return a deterministic description of the compiled components."""
-        components = ", ".join(
-            f"{component.name}={component.registry.schema.model}"
-            for component in self._compiled_lens.components
-        )
-        return f"lens components [{components}]"
+        """Return a deterministic description of the root lens."""
+        return f"lens model {self.lens.model!r}"
 
     def _lens_identifier(self, sample_index):
-        """Return the compiled lens, graph sample, and node identifier."""
+        """Return the lens specification, graph sample, and node identifier."""
         return f"{self._lens_description()} sample {sample_index} at node '{self.node_string}'"
 
     def _realized_pixelscale_for_one_lens(self, geometry_adapter, values):
@@ -3571,17 +3053,18 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         Parameters
         ----------
         values : Mapping
-            Numeric inputs for exactly one graph sample, including redshifts and
-            every compiled lens parameter entry.
+            Inputs for exactly one graph sample, including source redshift and
+            every flattened lens-specification parameter.
         sample_index : int
             Zero-based graph sample index included in adaptive-FOV exhaustion
             diagnostics.
 
         Returns
         -------
-        system : _RealizedLensSystem
-            Shared total lens, geometry adapter, component metadata, and values
-            for this realization.
+        geometry_adapter : _GeometryAdapter
+            Realized aggregate geometry adapter.
+        adapter_values : Mapping
+            Recursive values consumed by the geometry adapter.
         previous_geometry : _BoundaryGeometry
             Penultimate boundary snapshot.
         geometry : _BoundaryGeometry
@@ -3613,21 +3096,20 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         realization and threads its total lens, adapter, and values through
         certification without caching sample-local objects on the node.
         """
-        system = _build_lens_system(
-            self._compiled_lens,
-            cosmology=self.cosmology,
+        lens, geometry_adapter, adapter_values = _build_lens_system(
+            self.lens,
             values=values,
         )
-        _validate_source_geometry_support(system)
+        _validate_source_geometry_support(self.lens, lens)
         realized_pixelscale = self._realized_pixelscale_for_one_lens(
-            system.geometry_adapter,
-            system.values,
+            geometry_adapter,
+            adapter_values,
         )
         previous_geometry, geometry, uncertainty, refinements = (
             self._certified_boundary_geometry_for_one_lens(
-                system.lens,
-                system.geometry_adapter,
-                system.values,
+                lens,
+                geometry_adapter,
+                adapter_values,
                 sample_index=sample_index,
                 pixelscale=realized_pixelscale,
             )
@@ -3638,7 +3120,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             geometry_tolerance=self.geometry_tolerance,
         )
         return (
-            system,
+            geometry_adapter,
+            adapter_values,
             previous_geometry,
             geometry,
             uncertainty,
@@ -3726,7 +3209,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 name: _sample_value(value, sample_index, num_samples) for name, value in input_values.items()
             }
             (
-                system,
+                geometry_adapter,
+                adapter_values,
                 previous_geometry,
                 geometry,
                 uncertainty,
@@ -3764,17 +3248,17 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 excluded_points=geometry.point_caustics,
             )
 
-            previous_count = system.geometry_adapter.expected_num_images(
+            previous_count = geometry_adapter.expected_num_images(
                 source_x[sample_index],
                 source_y[sample_index],
-                values=system.values,
+                values=adapter_values,
                 caustic_curves=previous_geometry.caustic_curves,
                 pseudo_caustic_curves=previous_geometry.pseudo_caustic_curves,
             )
-            final_count = system.geometry_adapter.expected_num_images(
+            final_count = geometry_adapter.expected_num_images(
                 source_x[sample_index],
                 source_y[sample_index],
-                values=system.values,
+                values=adapter_values,
                 caustic_curves=geometry.caustic_curves,
                 pseudo_caustic_curves=geometry.pseudo_caustic_curves,
             )
@@ -3840,16 +3324,9 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
     Parameters
     ----------
-    lens : CausticsLensSpec | CausticsSinglePlaneSpec
-        Immutable registered atomic or ordered single-plane lens
-        specification. Parameter fields become graph inputs named
-        ``lens_<field>`` for an atomic lens or
-        ``lens_<component>_<field>`` for a single plane. Fixed options and
-        registry defaults remain immutable realization metadata.
-    cosmology : caustics.Cosmology
-        Fixed cosmology supplied to every realized total lens.
-    lens_redshift : object
-        Graph setter for dimensionless lens redshift.
+    lens : CausticsLensSpec
+        Registered atomic or recursive lens specification. The root parameters
+        include ``cosmology`` and the lens-redshift setter ``z_l``.
     source_redshift : object
         Graph setter for dimensionless source redshift.
     source_x : object
@@ -3976,8 +3453,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         self,
         lens,
         *,
-        cosmology,
-        lens_redshift,
         source_redshift,
         source_x,
         source_y,
@@ -4001,15 +3476,9 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         Parameters
         ----------
-        lens : CausticsLensSpec | CausticsSinglePlaneSpec
-            Immutable atomic or ordered single-plane specification containing
-            only explicitly registered lens models. Parameter fields are
-            graph-visible; fixed options and registry defaults remain
-            immutable realization metadata.
-        cosmology : caustics.Cosmology
-            Fixed cosmology supplied to each realized total lens.
-        lens_redshift : object
-            Graph setter for dimensionless lens redshift.
+        lens : CausticsLensSpec
+            Registered atomic or recursive lens specification. The root owns
+            ``cosmology`` and the dimensionless lens-redshift setter ``z_l``.
         source_redshift : object
             Graph setter for dimensionless source redshift.
         source_x : object
@@ -4068,33 +3537,15 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         Notes
         -----
-        Redshifts, source coordinates, FOV, and optional expected count are
-        registered first. Compiled parameter fields then use
-        ``lens_<field>`` for an atomic lens or
-        ``lens_<component>_<field>`` for a single plane. Fixed options and
-        registry defaults are not graph inputs. All eleven public outputs are
-        registered in ``_OUTPUTS`` order. The public specification and its
-        immutable compilation are stored on the node, while realized total
-        lenses and adapters remain sample-local.
+        Source coordinates, source redshift, FOV, and optional expected count
+        are registered directly. Lens parameters use ``lens_<field>`` at the
+        root and positional path segments inside nested planes. All eleven
+        public outputs are registered in ``_OUTPUTS`` order.
         """
-        if not isinstance(lens, (CausticsLensSpec, CausticsSinglePlaneSpec)):
-            raise TypeError("lens must be a CausticsLensSpec or CausticsSinglePlaneSpec.")
-
-        reserved_names = {
-            "lens_redshift",
-            "source_redshift",
-            "source_x",
-            "source_y",
-            "fov",
-            "expected_num_images",
-            *self._OUTPUTS,
-            *dir(type(self)),
-            *dir(self),
-        }
-        compiled_lens = _compile_lens_spec(
-            lens,
-            reserved_parameter_names=reserved_names,
-        )
+        if not isinstance(lens, CausticsLensSpec):
+            raise TypeError("lens must be a CausticsLensSpec.")
+        _validate_root_lens_spec(lens)
+        lens_graph_inputs = _lens_graph_inputs(lens)
 
         pixelscale_fraction = _validate_optional_positive_fraction(
             "pixelscale_fraction",
@@ -4145,8 +3596,6 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 raise ValueError(f"{name} must be a non-negative integer.")
 
         self.lens = lens
-        self._compiled_lens = compiled_lens
-        self.cosmology = cosmology
         self.max_images = int(max_images)
         self.min_images = int(min_images)
         self.fov_multiplier = normalized_scalars["fov_multiplier"]
@@ -4161,14 +3610,13 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         self.pixelscale_refinement_factor = normalized_scalars["pixelscale_refinement_factor"]
 
         node_inputs = {
-            "lens_redshift": lens_redshift,
             "source_redshift": source_redshift,
             "source_x": source_x,
             "source_y": source_y,
             "fov": fov,
             "expected_num_images": expected_num_images,
         }
-        for name, setter in self._compiled_lens.graph_inputs:
+        for name, setter in lens_graph_inputs:
             node_inputs[name] = setter
 
         super().__init__(
@@ -4289,12 +3737,12 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         ----------
         values : Mapping
             Inputs for exactly one graph sample. Required entries are
-            dimensionless ``lens_redshift`` and ``source_redshift``; finite
-            scalar source-plane ``source_x`` and ``source_y`` in arcseconds;
-            realized ``fov``, which may be ``None`` or a positive finite value
-            in arcseconds; required ``expected_num_images``, whose value may be
-            ``None`` or an ordinary integer in the configured range; and every
-            compiled atomic or component-qualified lens graph input.
+            dimensionless ``source_redshift``; finite scalar source-plane
+            ``source_x`` and ``source_y`` in arcseconds; realized ``fov``,
+            which may be ``None`` or a positive finite value in arcseconds;
+            required ``expected_num_images``, whose value may be ``None`` or
+            an ordinary integer in the configured range; and every flattened
+            lens-specification graph input.
 
         Returns
         -------
@@ -4380,16 +3828,15 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 )
             expected_num_images = int(expected_num_images)
 
-        system = _build_lens_system(
-            self._compiled_lens,
-            cosmology=self.cosmology,
+        lens, geometry_adapter, adapter_values = _build_lens_system(
+            self.lens,
             values=values,
         )
         _, torch = _import_caustics_dependencies()
 
         realized_fov = values["fov"]
         if realized_fov is None:
-            realized_fov = system.geometry_adapter.initial_fov(system.values)
+            realized_fov = geometry_adapter.initial_fov(adapter_values)
         else:
             try:
                 realized_fov = float(realized_fov)
@@ -4399,8 +3846,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 raise ValueError("fov must realize to None or a positive finite value.")
         initial_fov = realized_fov * self.fov_multiplier
         realized_pixelscale, realized_epsilon = self._realized_angular_settings(
-            system.geometry_adapter,
-            system.values,
+            geometry_adapter,
+            adapter_values,
         )
         if initial_fov <= realized_pixelscale:
             raise ValueError(
@@ -4410,7 +3857,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         beta_x = torch.as_tensor(source_x, dtype=torch.float64)
         beta_y = torch.as_tensor(source_y, dtype=torch.float64)
-        center_x, center_y = system.geometry_adapter.search_center(system.values)
+        center_x, center_y = geometry_adapter.search_center(adapter_values)
         target_count = self.min_images if expected_num_images is None else expected_num_images
         latest_retryable_error = None
         solver_attempts = 0
@@ -4594,7 +4041,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 solver_attempts += 1
                 try:
                     coordinates = self._forward_raytrace_images(
-                        system.lens,
+                        lens,
                         torch,
                         beta_x,
                         beta_y,
@@ -4624,7 +4071,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             )
 
             recovery_points = np.asarray(
-                system.geometry_adapter.root_recovery_points(system.values),
+                geometry_adapter.root_recovery_points(adapter_values),
                 dtype=float,
             ).reshape(-1, 2)
             if complete or not len(coordinates) or not len(recovery_points):
@@ -4639,7 +4086,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 return coordinates, False
 
             seeds = _recovery_image_seeds(
-                system.lens,
+                lens,
                 recovery_points,
                 source_x=source_x,
                 source_y=source_y,
@@ -4651,7 +4098,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             solver_attempts += 1
             try:
                 recovery_coordinates = _refine_image_seeds(
-                    system.lens,
+                    lens,
                     torch,
                     seeds,
                     unresolved_points,
@@ -4716,8 +4163,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         image_x_tensor = torch.as_tensor(coordinates[:, 0], dtype=torch.float64)
         image_y_tensor = torch.as_tensor(coordinates[:, 1], dtype=torch.float64)
-        magnifications = torch.abs(system.lens.magnification(image_x_tensor, image_y_tensor))
-        time_delays = system.lens.time_delay(image_x_tensor, image_y_tensor)
+        magnifications = torch.abs(lens.magnification(image_x_tensor, image_y_tensor))
+        time_delays = lens.time_delay(image_x_tensor, image_y_tensor)
 
         image_x = coordinates[:, 0]
         image_y = coordinates[:, 1]
