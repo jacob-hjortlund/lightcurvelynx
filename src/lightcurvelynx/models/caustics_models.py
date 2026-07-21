@@ -1186,6 +1186,15 @@ _LENS_MODEL_REGISTRY = {
 }
 
 
+def _lens_spec_is_affine(lens):
+    """Return the effective affinity of one recursive lens specification."""
+    if lens.model == "SinglePlane":
+        is_affine = all(_lens_spec_is_affine(child) for child in lens.parameters["lenses"])
+    else:
+        is_affine = _LENS_MODEL_REGISTRY[lens.model].affine
+    return is_affine
+
+
 def _validate_root_lens_spec(lens):
     missing = _INHERITED_LENS_PARAMETERS.difference(lens.parameters)
     if missing:
@@ -1203,20 +1212,6 @@ def _validate_root_lens_spec(lens):
     validate_children(lens)
     if _lens_spec_is_affine(lens):
         raise ValueError("Caustics strong-lensing nodes require at least one non-affine lens model.")
-
-
-def _lens_spec_is_affine(lens):
-    """Return the effective affinity of one recursive lens specification."""
-    if lens.model == "SinglePlane":
-        is_affine = all(_lens_spec_is_affine(child) for child in lens.parameters["lenses"])
-        if is_affine:
-            error_str = "Composite lens model only contains affine lens components:"
-            for child in lens.parameters["lenses"]:
-                error_str += f"\n{child.model}"
-            raise ValueError(error_str)
-        else:
-            return False
-    return _LENS_MODEL_REGISTRY[lens.model].affine
 
 
 def _lens_graph_inputs(lens, prefix="lens"):
