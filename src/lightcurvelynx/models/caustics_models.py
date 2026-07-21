@@ -19,9 +19,9 @@ node owns one fixed cosmology object and supplies its sampled source redshift as
 Caustics is imported lazily for specification inspection and lens realization;
 PyTorch is loaded explicitly only with the realization runtime. ContourPy and
 Shapely are additional lazy dependencies of source-region sampling. Every
-successful runtime-dependency load calls
-``torch.set_default_dtype(torch.float64)``; this process-wide default-dtype side
-effect is not restored by this module.
+successful call to ``_import_caustics_dependencies()`` sets Torch's process-wide
+default dtype to ``torch.float64``; this side effect is not restored by this
+module.
 """
 
 import inspect
