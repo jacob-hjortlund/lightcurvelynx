@@ -6,6 +6,32 @@ import pytest
 from lightcurvelynx.graph_state import GraphState
 from lightcurvelynx.models import caustics_models
 
+_SOURCE_OUTPUTS = (
+    "source_x",
+    "source_y",
+    "strong_lensing_area",
+    "sampling_attempts",
+    "expected_num_images",
+    "critical_curve_fov",
+    "boundary_uncertainty",
+    "source_boundary_clearance",
+    "boundary_refinements",
+)
+
+_IMAGE_OUTPUTS = (
+    "num_images",
+    "image_x",
+    "image_y",
+    "macro_magnifications",
+    "time_delays",
+    "image_count_deficit",
+    "solver_fov",
+    "solver_pixelscale",
+    "solver_attempts",
+    "solver_fov_expansions",
+    "solver_pixelscale_refinements",
+)
+
 
 class _FakeSIS:
     """Expose a required node-owned source redshift in the SIS signature."""
@@ -1895,8 +1921,8 @@ def test_image_node_accepts_documented_integer_boundaries(valid_sis_spec, fixed_
 @pytest.mark.parametrize(
     ("factory", "outputs"),
     [
-        (_source_node, caustics_models.CausticsSourcePositionNode._OUTPUTS),
-        (_image_node, caustics_models.CausticsLensImageNode._OUTPUTS),
+        (_source_node, _SOURCE_OUTPUTS),
+        (_image_node, _IMAGE_OUTPUTS),
     ],
 )
 def test_public_nodes_keep_cosmology_fixed_and_register_exact_output_order(
@@ -1911,8 +1937,8 @@ def test_public_nodes_keep_cosmology_fixed_and_register_exact_output_order(
     assert node.cosmology is fixed_cosmology
     assert "cosmology" not in node.list_params()
     assert "cosmology" not in node.setters
-    assert node.outputs == outputs
-    assert node.list_params()[-len(outputs) :] == outputs
+    assert tuple(node.outputs) == outputs
+    assert tuple(node.list_params()[-len(outputs) :]) == outputs
 
 
 def test_source_node_resolves_absolute_and_relative_pixelscales(valid_sis_spec, fixed_cosmology):
@@ -2242,6 +2268,18 @@ def test_source_compute_shapes_output_order_persistence_and_fixed_semantics(
     """Pack all nine outputs while preserving an already fixed GraphState value."""
     node = _source_node(valid_sis_spec, fixed_cosmology)
     _patch_source_compute_runtime(monkeypatch, node)
+    sample_results = iter(
+        [
+            (1.25, -0.75, 10.0, 3),
+            (2.5, -1.5, 20.0, 4),
+        ]
+    )
+
+    def deterministic_sample(*args, **kwargs):
+        del args, kwargs
+        return next(sample_results)
+
+    monkeypatch.setattr(caustics_models, "_sample_position", deterministic_sample)
     fixed_outputs = {"source_x": 99.0} if num_samples == 1 else None
     graph_state = _graph_state_for(
         node,
@@ -2252,17 +2290,47 @@ def test_source_compute_shapes_output_order_persistence_and_fixed_semantics(
     results = node.compute(graph_state, rng_info=np.random.default_rng(123))
     saved = graph_state[node.node_string]
 
-    assert [name for name in saved if name in node._OUTPUTS] == node._OUTPUTS
+    assert tuple(name for name in saved if name in _SOURCE_OUTPUTS) == _SOURCE_OUTPUTS
     assert "cosmology" not in saved
     if num_samples == 1:
+        assert results[0] == 1.25
+        assert results[1] == -0.75
+        assert results[2] == 10.0
+        assert results[3] == 3
+        assert results[4] == 4
+        assert results[5] == 5.0
+        assert results[6] == 0.1
+        assert results[7] == 0.5
+        assert results[8] == 2
         assert saved["source_x"] == 99.0
-        assert results[0] != 99.0
-        for name, result in zip(node._OUTPUTS[1:], results[1:], strict=True):
-            np.testing.assert_array_equal(saved[name], result)
+        assert saved["source_y"] == -0.75
+        assert saved["strong_lensing_area"] == 10.0
+        assert saved["sampling_attempts"] == 3
+        assert saved["expected_num_images"] == 4
+        assert saved["critical_curve_fov"] == 5.0
+        assert saved["boundary_uncertainty"] == 0.1
+        assert saved["source_boundary_clearance"] == 0.5
+        assert saved["boundary_refinements"] == 2
         assert all(np.isscalar(result) for result in results)
     else:
-        for name, result in zip(node._OUTPUTS, results, strict=True):
-            np.testing.assert_array_equal(saved[name], result)
+        np.testing.assert_array_equal(results[0], [1.25, 2.5])
+        np.testing.assert_array_equal(results[1], [-0.75, -1.5])
+        np.testing.assert_array_equal(results[2], [10.0, 20.0])
+        np.testing.assert_array_equal(results[3], [3, 4])
+        np.testing.assert_array_equal(results[4], [4, 4])
+        np.testing.assert_array_equal(results[5], [5.0, 5.0])
+        np.testing.assert_array_equal(results[6], [0.1, 0.1])
+        np.testing.assert_array_equal(results[7], [0.5, 0.5])
+        np.testing.assert_array_equal(results[8], [2, 2])
+        np.testing.assert_array_equal(saved["source_x"], [1.25, 2.5])
+        np.testing.assert_array_equal(saved["source_y"], [-0.75, -1.5])
+        np.testing.assert_array_equal(saved["strong_lensing_area"], [10.0, 20.0])
+        np.testing.assert_array_equal(saved["sampling_attempts"], [3, 4])
+        np.testing.assert_array_equal(saved["expected_num_images"], [4, 4])
+        np.testing.assert_array_equal(saved["critical_curve_fov"], [5.0, 5.0])
+        np.testing.assert_array_equal(saved["boundary_uncertainty"], [0.1, 0.1])
+        np.testing.assert_array_equal(saved["source_boundary_clearance"], [0.5, 0.5])
+        np.testing.assert_array_equal(saved["boundary_refinements"], [2, 2])
         assert all(result.shape == (2,) for result in results)
 
 
@@ -2333,7 +2401,7 @@ def test_source_compute_rejects_uncertified_sample_before_persistence(
     with pytest.raises(RuntimeError, match=message):
         node.compute(graph_state, rng_info=np.random.default_rng(5))
 
-    assert not set(node._OUTPUTS).intersection(graph_state[node.node_string])
+    assert not set(_SOURCE_OUTPUTS).intersection(graph_state[node.node_string])
 
 
 def test_image_node_resolves_absolute_and_relative_angular_settings(
@@ -2898,6 +2966,52 @@ def test_image_bounded_deficit_requires_at_least_min_images(
         assert result[4]["image_count_deficit"] == deficit
 
 
+def test_image_no_expectation_completes_at_minimum_with_deficit_sentinel(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Complete the real solve policy at min_images and emit the no-target sentinel."""
+    node = _image_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        min_images=2,
+        expected_num_images=None,
+        max_fov_expansions=2,
+        max_pixelscale_refinements=2,
+    )
+    lens = _ArrayLens([-2.0, 3.0], [4.0, 1.0])
+    _patch_image_runtime(monkeypatch, lens, _FakeGeometryAdapter())
+    calls = []
+
+    def forward(*args, **kwargs):
+        del args
+        calls.append(kwargs)
+        return np.array([[2.0, 0.0], [1.0, 0.0]])
+
+    monkeypatch.setattr(node, "_forward_raytrace_images", forward)
+
+    image_x, image_y, magnifications, delays, diagnostics = node._solve_one(
+        _image_values(expected_num_images=None)
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["current_fov"] == 4.0
+    assert calls[0]["divisions"] == 4
+    np.testing.assert_array_equal(image_x, [1.0, 2.0])
+    np.testing.assert_array_equal(image_y, [0.0, 0.0])
+    np.testing.assert_array_equal(magnifications, [3.0, 2.0])
+    np.testing.assert_array_equal(delays, [0.0, 3.0])
+    assert diagnostics == {
+        "image_count_deficit": -1,
+        "solver_fov": 4.0,
+        "solver_pixelscale": 1.0,
+        "solver_attempts": 1,
+        "solver_fov_expansions": 0,
+        "solver_pixelscale_refinements": 0,
+    }
+
+
 def test_image_compute_single_sample_packs_padding_and_preserves_fixed_output(
     monkeypatch,
     valid_sis_spec,
@@ -2937,23 +3051,33 @@ def test_image_compute_single_sample_packs_padding_and_preserves_fixed_output(
     saved = graph_state[node.node_string]
 
     assert caller_rng.random() == expected_next_draw
-    assert [name for name in saved if name in node._OUTPUTS] == node._OUTPUTS
+    assert tuple(name for name in saved if name in _IMAGE_OUTPUTS) == _IMAGE_OUTPUTS
     assert "cosmology" not in saved
     assert np.isscalar(results[0])
     assert all(np.isscalar(result) for result in results[5:])
     assert all(result.shape == (4,) for result in results[1:5])
     assert results[0] == 2
-    np.testing.assert_array_equal(results[1][:2], [2.0, 1.0])
-    np.testing.assert_array_equal(results[2][:2], [-2.0, -1.0])
+    np.testing.assert_array_equal(results[1], [2.0, 1.0, np.nan, np.nan])
+    np.testing.assert_array_equal(results[2], [-2.0, -1.0, np.nan, np.nan])
     np.testing.assert_array_equal(results[3], [5.0, 6.0, 0.0, 0.0])
-    np.testing.assert_array_equal(results[4][:2], [0.0, 3.0])
-    assert np.all(np.isnan(results[1][2:]))
-    assert np.all(np.isnan(results[2][2:]))
-    assert np.all(np.isnan(results[4][2:]))
+    np.testing.assert_array_equal(results[4], [0.0, 3.0, np.nan, np.nan])
     assert results[5] == -1
+    assert results[6] == 8.0
+    assert results[7] == 0.25
+    assert results[8] == 3
+    assert results[9] == 1
+    assert results[10] == 0
     assert saved["num_images"] == 99
-    for name, result in zip(node._OUTPUTS[1:], results[1:], strict=True):
-        np.testing.assert_array_equal(saved[name], result)
+    np.testing.assert_array_equal(saved["image_x"], [2.0, 1.0, np.nan, np.nan])
+    np.testing.assert_array_equal(saved["image_y"], [-2.0, -1.0, np.nan, np.nan])
+    np.testing.assert_array_equal(saved["macro_magnifications"], [5.0, 6.0, 0.0, 0.0])
+    np.testing.assert_array_equal(saved["time_delays"], [0.0, 3.0, np.nan, np.nan])
+    assert saved["image_count_deficit"] == -1
+    assert saved["solver_fov"] == 8.0
+    assert saved["solver_pixelscale"] == 0.25
+    assert saved["solver_attempts"] == 3
+    assert saved["solver_fov_expansions"] == 1
+    assert saved["solver_pixelscale_refinements"] == 0
 
 
 def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
@@ -3017,17 +3141,49 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
     saved = graph_state[node.node_string]
 
     np.testing.assert_array_equal(seen_source_x, [0.1, 0.2])
-    assert [name for name in saved if name in node._OUTPUTS] == node._OUTPUTS
+    assert tuple(name for name in saved if name in _IMAGE_OUTPUTS) == _IMAGE_OUTPUTS
     assert all(result.shape == (2,) for result in (results[0], *results[5:]))
     assert all(result.shape == (2, 4) for result in results[1:5])
     np.testing.assert_array_equal(results[0], [2, 1])
+    np.testing.assert_array_equal(
+        results[1],
+        [[2.0, 1.0, np.nan, np.nan], [7.0, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(
+        results[2],
+        [[-2.0, -1.0, np.nan, np.nan], [-7.0, np.nan, np.nan, np.nan]],
+    )
     np.testing.assert_array_equal(results[3], [[5.0, 6.0, 0.0, 0.0], [9.0, 0.0, 0.0, 0.0]])
+    np.testing.assert_array_equal(
+        results[4],
+        [[0.0, 3.0, np.nan, np.nan], [0.0, np.nan, np.nan, np.nan]],
+    )
     np.testing.assert_array_equal(results[5], [0, -1])
-    assert np.all(np.isnan(results[1][0, 2:]))
-    assert np.all(np.isnan(results[1][1, 1:]))
-    assert np.all(np.isnan(results[2][0, 2:]))
-    assert np.all(np.isnan(results[2][1, 1:]))
-    assert np.all(np.isnan(results[4][0, 2:]))
-    assert np.all(np.isnan(results[4][1, 1:]))
-    for name, result in zip(node._OUTPUTS, results, strict=True):
-        np.testing.assert_array_equal(saved[name], result)
+    np.testing.assert_array_equal(results[6], [8.0, 16.0])
+    np.testing.assert_array_equal(results[7], [0.25, 0.125])
+    np.testing.assert_array_equal(results[8], [3, 5])
+    np.testing.assert_array_equal(results[9], [1, 2])
+    np.testing.assert_array_equal(results[10], [0, 1])
+    np.testing.assert_array_equal(saved["num_images"], [2, 1])
+    np.testing.assert_array_equal(
+        saved["image_x"],
+        [[2.0, 1.0, np.nan, np.nan], [7.0, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(
+        saved["image_y"],
+        [[-2.0, -1.0, np.nan, np.nan], [-7.0, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(
+        saved["macro_magnifications"],
+        [[5.0, 6.0, 0.0, 0.0], [9.0, 0.0, 0.0, 0.0]],
+    )
+    np.testing.assert_array_equal(
+        saved["time_delays"],
+        [[0.0, 3.0, np.nan, np.nan], [0.0, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(saved["image_count_deficit"], [0, -1])
+    np.testing.assert_array_equal(saved["solver_fov"], [8.0, 16.0])
+    np.testing.assert_array_equal(saved["solver_pixelscale"], [0.25, 0.125])
+    np.testing.assert_array_equal(saved["solver_attempts"], [3, 5])
+    np.testing.assert_array_equal(saved["solver_fov_expansions"], [1, 2])
+    np.testing.assert_array_equal(saved["solver_pixelscale_refinements"], [0, 1])
