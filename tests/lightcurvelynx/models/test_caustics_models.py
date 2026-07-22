@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ import pytest
 
 from lightcurvelynx.graph_state import GraphState
 from lightcurvelynx.models import caustics_models
+from lightcurvelynx.models._caustics import runtime as caustics_runtime
 
 _SOURCE_OUTPUTS = (
     "source_x",
@@ -32,6 +34,11 @@ _IMAGE_OUTPUTS = (
     "solver_fov_expansions",
     "solver_pixelscale_refinements",
 )
+
+
+def test_private_caustics_runtime_module_is_available():
+    """Keep the private runtime integration importable by its stable path."""
+    assert importlib.util.find_spec("lightcurvelynx.models._caustics.runtime") is not None
 
 
 class _FakeSIS:
@@ -330,7 +337,7 @@ def fake_caustics_registry(monkeypatch):
         MassSheet=_FakeMassSheet,
         SinglePlane=_FakeSinglePlane,
     )
-    monkeypatch.setattr(caustics_models, "_import_caustics", lambda: registry)
+    monkeypatch.setattr(caustics_runtime, "_import_caustics", lambda: registry)
     return registry
 
 
@@ -344,9 +351,9 @@ def recording_caustics_runtime(monkeypatch):
         SIS=_RecordingSIS,
         SinglePlane=_RecordingSinglePlane,
     )
-    monkeypatch.setattr(caustics_models, "_import_caustics", lambda: runtime)
+    monkeypatch.setattr(caustics_runtime, "_import_caustics", lambda: runtime)
     monkeypatch.setattr(
-        caustics_models,
+        caustics_runtime,
         "_import_caustics_dependencies",
         lambda: (runtime, _RecordingTorch),
     )
@@ -467,7 +474,7 @@ def _patch_image_runtime(monkeypatch, lens, geometry_adapter):
         lambda *args, **kwargs: (lens, geometry_adapter, {}),
     )
     monkeypatch.setattr(
-        caustics_models,
+        caustics_runtime,
         "_import_caustics_dependencies",
         lambda: (object(), _FakeTorch),
     )
@@ -1092,50 +1099,6 @@ def test_build_lens_system_rejects_exact_non_affine_center_collision(
 
 
 @pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        (None, None),
-        (2, 2.0),
-        (0.25, 0.25),
-        (np.array(0.75), 0.75),
-        ("0.5", 0.5),
-    ],
-)
-def test_validate_optional_positive_fraction_accepts_scalar_values(value, expected):
-    """Normalize every supported optional scalar representation."""
-    result = caustics_models._validate_optional_positive_fraction("fraction", value)
-    assert result == expected
-
-
-@pytest.mark.parametrize("value", [np.array([0.5]), "not-a-number", object()])
-def test_validate_optional_positive_fraction_rejects_non_scalars(value):
-    """Reject arrays and objects that cannot represent one floating scalar."""
-    with pytest.raises(TypeError, match="None or a scalar value convertible to float"):
-        caustics_models._validate_optional_positive_fraction("fraction", value)
-
-
-@pytest.mark.parametrize("value", [0.0, -0.1, np.nan, np.inf, -np.inf])
-def test_validate_optional_positive_fraction_rejects_non_positive_or_non_finite(value):
-    """Reject normalized fractions outside the finite positive domain."""
-    with pytest.raises(ValueError, match="fraction must be finite and positive"):
-        caustics_models._validate_optional_positive_fraction("fraction", value)
-
-
-def test_sample_value_preserves_single_sample_and_indexes_multiple_samples():
-    """Keep a single-system object intact and index only multi-sample values."""
-    single = np.array([1.0, 2.0])
-    first = object()
-    second = object()
-
-    assert caustics_models._sample_value(single, 0, 1) is single
-    assert caustics_models._sample_value([first, second], 1, 2) is second
-    np.testing.assert_array_equal(
-        caustics_models._sample_value(np.array([[1.0, 2.0], [3.0, 4.0]]), 1, 2),
-        [3.0, 4.0],
-    )
-
-
-@pytest.mark.parametrize(
     ("error", "expected"),
     [
         (RuntimeError("torch.linalg.solve: input matrix is singular"), True),
@@ -1209,7 +1172,7 @@ def test_recovery_image_seeds_selects_nearest_circle_point_per_recovery_point(
         return mapped
 
     fake_lens = object()
-    monkeypatch.setattr(caustics_models, "_raytrace_curve", raytrace_curve)
+    monkeypatch.setattr(caustics_runtime, "_raytrace_curve", raytrace_curve)
 
     empty = caustics_models._recovery_image_seeds(
         fake_lens,
@@ -1704,7 +1667,7 @@ def test_trace_pseudo_caustics_caps_initial_radius_halves_to_convergence_and_clo
         traced_loops.append(coordinates.copy())
         return coordinates.copy()
 
-    monkeypatch.setattr(caustics_models, "_raytrace_curve", raytrace_curve)
+    monkeypatch.setattr(caustics_runtime, "_raytrace_curve", raytrace_curve)
 
     (curve,) = caustics_models._trace_pseudo_caustics(
         lens,
@@ -1747,7 +1710,7 @@ def test_trace_pseudo_caustics_reports_bounded_halving_exhaustion(monkeypatch):
         return coordinates + np.array([len(traced_loops), 0.0])
 
     monkeypatch.setattr(
-        caustics_models,
+        caustics_runtime,
         "_raytrace_curve",
         nonconverging_raytrace,
     )
@@ -3282,7 +3245,7 @@ def test_image_solve_derives_none_fov_or_converts_explicit_fov(
         lambda *args, **kwargs: (lens, adapter, adapter_values),
     )
     monkeypatch.setattr(
-        caustics_models,
+        caustics_runtime,
         "_import_caustics_dependencies",
         lambda: (object(), _FakeTorch),
     )

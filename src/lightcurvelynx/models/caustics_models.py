@@ -40,6 +40,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
 from lightcurvelynx.base_models import FunctionNode
+from lightcurvelynx.models._caustics import runtime as _runtime
 
 __all__ = [
     "CausticsLensImageNode",
@@ -102,7 +103,7 @@ def _get_model_class(model):
     """
     if model not in _LENS_MODEL_REGISTRY:
         raise ValueError(f"Requested model {model!r} is not supported currently.")
-    caustics = _import_caustics()
+    caustics = _runtime._import_caustics()
     return getattr(caustics, model)
 
 
@@ -243,155 +244,6 @@ _RECOVERY_ROOT_REFINEMENTS = 8
 _INITIAL_FOV_PADDING = 1.1
 
 
-def _import_caustics():
-    """Lazily import the optional Caustics package.
-
-    Returns
-    -------
-    caustics : module
-        Imported top-level Caustics package.
-
-    Raises
-    ------
-    ImportError
-        If Caustics itself or an import-time dependency is unavailable. The
-        original ``ImportError`` is retained as the exception cause.
-    """
-    try:
-        import caustics
-    except ImportError as err:  # pragma: no cover
-        raise ImportError(
-            "Caustics-backed lens nodes require the optional 'caustics' package. "
-            "Install it with `pip install caustics`."
-        ) from err
-    return caustics
-
-
-def _import_caustics_dependencies():
-    """Lazily import the optional Caustics runtime dependencies.
-
-    Returns
-    -------
-    caustics : module
-        Imported Caustics package.
-    torch : module
-        Imported PyTorch backend used by the installed Caustics package.
-
-    Raises
-    ------
-    ImportError
-        If either Caustics or its PyTorch backend cannot be imported. The
-        original import error is retained as the exception cause.
-
-    Notes
-    -----
-    A successful call sets Torch's process-wide default dtype to
-    ``torch.float64``. The previous default is neither recorded nor restored.
-    """
-    caustics = _import_caustics()
-    try:
-        import torch
-
-        torch.set_default_dtype(torch.float64)
-    except ImportError as err:  # pragma: no cover
-        raise ImportError(
-            "Caustics-backed lens nodes require the optional 'caustics' package. "
-            "Install it with `pip install caustics`."
-        ) from err
-    return caustics, torch
-
-
-def _to_numpy(tensor):
-    """Convert a Caustics backend tensor to a detached CPU NumPy array.
-
-    Parameters
-    ----------
-    tensor : torch.Tensor
-        Tensor returned by Caustics. It may reside on any Torch device or be
-        attached to an autograd graph.
-
-    Returns
-    -------
-    numpy.ndarray
-        Detached CPU array with the same shape and dtype as the tensor's NumPy
-        representation.
-
-    Notes
-    -----
-    A CPU tensor's NumPy array can share its storage; moving a non-CPU tensor to
-    the CPU necessarily allocates CPU storage. This helper does not request an
-    independent copy after that device transfer.
-    """
-    return tensor.detach().cpu().numpy()
-
-
-def _sample_value(value, sample_index, num_samples):
-    """Extract one lens realization from a sampled graph input.
-
-    Parameters
-    ----------
-    value : object or array-like
-        A scalar/single-system value when ``num_samples == 1`` or an object
-        whose first axis indexes graph samples otherwise.
-    sample_index : int
-        Zero-based sample index to extract from a multi-sample value.
-    num_samples : int
-        Number of samples represented by the current ``GraphState``.
-
-    Returns
-    -------
-    object
-        ``value`` unchanged for a single-sample state, otherwise
-        ``value[sample_index]``.
-
-    Notes
-    -----
-    Single-sample extraction preserves exact object identity, including for an
-    array-valued sample. Multi-sample indexing is not copied and may therefore
-    return a scalar or a view according to ``value``'s indexing contract.
-    """
-    if num_samples == 1:
-        return value
-    return value[sample_index]
-
-
-def _validate_optional_positive_fraction(name, value):
-    """Normalize an optional positive dimensionless fraction.
-
-    Parameters
-    ----------
-    name : str
-        Public argument name used in contextual error messages.
-    value : object or None
-        Ordinary float-convertible scalar, including a zero-dimensional NumPy
-        array, or ``None`` to disable relative scaling.
-
-    Returns
-    -------
-    float or None
-        Finite positive dimensionless fraction, or ``None`` unchanged.
-
-    Raises
-    ------
-    TypeError
-        If ``value`` is a non-scalar NumPy array or cannot be converted to a
-        scalar float.
-    ValueError
-        If the normalized fraction is non-finite or not strictly positive.
-    """
-    if value is None:
-        return None
-    if isinstance(value, np.ndarray) and value.ndim != 0:
-        raise TypeError(f"{name} must be None or a scalar value convertible to float.")
-    try:
-        normalized = float(value)
-    except (TypeError, ValueError, OverflowError) as err:
-        raise TypeError(f"{name} must be None or a scalar value convertible to float.") from err
-    if not np.isfinite(normalized) or normalized <= 0.0:
-        raise ValueError(f"{name} must be finite and positive.")
-    return normalized
-
-
 def _recovery_neighborhoods_are_empty(coordinates, recovery_points, radius):
     """Identify recovery neighborhoods without a global image.
 
@@ -475,17 +327,17 @@ def _validated_recovery_images(
     trusted Caustics and registered-adapter postconditions. Passing candidates
     retain their input order and are not deduplicated.
     """
-    candidate_coordinates = np.column_stack((_to_numpy(image_x), _to_numpy(image_y)))
+    candidate_coordinates = np.column_stack((_runtime._to_numpy(image_x), _runtime._to_numpy(image_y)))
 
     mapped_x, mapped_y = lens.raytrace(
         torch.as_tensor(candidate_coordinates[:, 0], dtype=torch.float64),
         torch.as_tensor(candidate_coordinates[:, 1], dtype=torch.float64),
     )
-    mapped_x = _to_numpy(mapped_x)
-    mapped_y = _to_numpy(mapped_y)
+    mapped_x = _runtime._to_numpy(mapped_x)
+    mapped_y = _runtime._to_numpy(mapped_y)
 
-    source_x = float(_to_numpy(beta_x))
-    source_y = float(_to_numpy(beta_y))
+    source_x = float(_runtime._to_numpy(beta_x))
+    source_y = float(_runtime._to_numpy(beta_y))
     residuals = np.hypot(mapped_x - source_x, mapped_y - source_y)
     distances = np.linalg.norm(candidate_coordinates - recovery_points, axis=1)
     valid = (residuals < epsilon) & (distances <= neighborhood_radius)
@@ -615,68 +467,6 @@ def _is_retryable_forward_raytrace_error(error):
     return isinstance(error, IndexError) and "index 0 is out of bounds" in str(error).lower()
 
 
-def _import_contourpy():
-    """Lazily import the contour implementation used for critical curves.
-
-    Returns
-    -------
-    contourpy : module
-        Imported ContourPy package.
-
-    Raises
-    ------
-    ImportError
-        If ContourPy itself or an import-time dependency is unavailable. The
-        original import error is retained as the exception cause.
-    """
-    try:
-        import contourpy
-    except ImportError as err:  # pragma: no cover
-        raise ImportError(
-            "Caustics source-position sampling requires the optional 'contourpy' "
-            "package. Install it with `pip install contourpy`."
-        ) from err
-    return contourpy
-
-
-def _raytrace_curve(lens, coordinates):
-    """Map one image-plane curve through the Caustics lens equation.
-
-    Parameters
-    ----------
-    lens : object
-        Realized Caustics lens implementing ``raytrace(x, y)``.
-    coordinates : array-like, shape (N, 2)
-        Image-plane x/y angular offsets in arcseconds.
-
-    Returns
-    -------
-    numpy.ndarray, shape (N, 2)
-        Source-plane x/y angular offsets in arcseconds on the CPU.
-
-    Raises
-    ------
-    ImportError
-        If the optional Caustics runtime dependencies are unavailable.
-
-    Notes
-    -----
-    The production caller supplies a trusted ``(N, 2)`` curve. Caustics'
-    paired output shapes, types, and finiteness are trusted. Coordinates are
-    coerced through a floating NumPy array and float64 Torch tensors before the
-    raytrace, and outputs are detached onto the CPU. Loading the runtime also
-    sets Torch's process-wide default dtype to float64.
-    """
-    _, torch = _import_caustics_dependencies()
-    coordinates = np.asarray(coordinates, dtype=float)
-
-    source_x, source_y = lens.raytrace(
-        torch.as_tensor(coordinates[:, 0], dtype=torch.float64),
-        torch.as_tensor(coordinates[:, 1], dtype=torch.float64),
-    )
-    return np.column_stack((_to_numpy(source_x), _to_numpy(source_y)))
-
-
 def _recovery_image_seeds(lens, recovery_points, *, source_x, source_y, radius):
     """Select one targeted image seed per recovery point.
 
@@ -719,7 +509,7 @@ def _recovery_image_seeds(lens, recovery_points, *, source_x, source_y, radius):
     seeds = []
     for recovery_point in recovery_points:
         circle = np.asarray(recovery_point, dtype=float) + radius * directions
-        mapped_circle = _raytrace_curve(lens, circle)
+        mapped_circle = _runtime._raytrace_curve(lens, circle)
         nearest = np.argmin(np.linalg.norm(mapped_circle - source_position, axis=1))
         seeds.append(circle[nearest])
     return np.asarray(seeds, dtype=float).reshape(-1, 2)
@@ -1998,12 +1788,12 @@ def _trace_pseudo_caustics(
             radius = epsilon
         else:
             radius = min(epsilon, generator.max_initial_radius)
-        previous_curve = _raytrace_curve(lens, center + radius * directions)
+        previous_curve = _runtime._raytrace_curve(lens, center + radius * directions)
         last_change = np.inf
 
         for _ in range(32):
             radius *= 0.5
-            current_curve = _raytrace_curve(lens, center + radius * directions)
+            current_curve = _runtime._raytrace_curve(lens, center + radius * directions)
             last_change = float(np.max(np.linalg.norm(current_curve - previous_curve, axis=1)))
             if last_change <= geometry_tolerance:
                 pseudo_caustics.append(np.concatenate((current_curve, current_curve[:1]), axis=0))
@@ -2031,7 +1821,7 @@ def _caustics_scalar(value):
     float
         Detached CPU scalar with Python ``float`` representation.
     """
-    return float(np.asarray(_to_numpy(value)).item())
+    return float(np.asarray(_runtime._to_numpy(value)).item())
 
 
 def _sis_geometry_adapter(lens, values):
@@ -2739,7 +2529,7 @@ def _build_lens_system(lens_spec, *, cosmology, values):
     objects and performs no node-level caching. Importing the runtime also sets
     Torch's process-wide default dtype to float64.
     """
-    caustics, torch = _import_caustics_dependencies()
+    caustics, torch = _runtime._import_caustics_dependencies()
     lens = _construct_lens_tree(
         lens_spec,
         values,
@@ -2888,8 +2678,8 @@ def _find_all_caustics(
     type, and finiteness remain trusted backend postconditions apart from the
     endpoint-gap calculation.
     """
-    contourpy = _import_contourpy()
-    _, torch = _import_caustics_dependencies()
+    contourpy = _runtime._import_contourpy()
+    _, torch = _runtime._import_caustics_dependencies()
 
     center_x, center_y = center
     num_intervals = int(np.ceil(fov / pixelscale))
@@ -2912,10 +2702,10 @@ def _find_all_caustics(
     grid_y, grid_x = torch.meshgrid(y_axis, x_axis, indexing="ij")
 
     jacobian = lens.jacobian_lens_equation(grid_x, grid_y, method="autograd")
-    determinant = _to_numpy(torch.linalg.det(jacobian))
+    determinant = _runtime._to_numpy(torch.linalg.det(jacobian))
 
-    x_coordinates = _to_numpy(x_axis)
-    y_coordinates = _to_numpy(y_axis)
+    x_coordinates = _runtime._to_numpy(x_axis)
+    y_coordinates = _runtime._to_numpy(y_axis)
     invalid = ~np.isfinite(determinant)
     for mask_x, mask_y in jacobian_mask_points:
         squared_distance = (x_coordinates[np.newaxis, :] - mask_x) ** 2 + (
@@ -2927,7 +2717,7 @@ def _find_all_caustics(
         raise RuntimeError("The lens-equation Jacobian grid contains no finite values.")
 
     symmetric_jacobian = 0.5 * (jacobian + jacobian.transpose(-1, -2))
-    eigenvalues = _to_numpy(torch.linalg.eigvalsh(symmetric_jacobian))
+    eigenvalues = _runtime._to_numpy(torch.linalg.eigvalsh(symmetric_jacobian))
 
     boundary_invalid = _outer_grid_boundary(invalid)
     boundary_eigenvalues = _outer_grid_boundary(eigenvalues)
@@ -2985,37 +2775,13 @@ def _find_all_caustics(
         if critical_gap > 0.0:
             critical_curve = np.concatenate((critical_curve, critical_curve[:1]), axis=0)
 
-        caustic_curve = _raytrace_curve(lens, critical_curve)
+        caustic_curve = _runtime._raytrace_curve(lens, critical_curve)
         caustic_gap = float(np.linalg.norm(caustic_curve[0] - caustic_curve[-1]))
         if caustic_gap > geometry_tolerance:
             raise RuntimeError(f"A mapped caustic is open with endpoint gap {caustic_gap} arcsec.")
         caustic_curves.append(caustic_curve)
 
     return caustic_curves
-
-
-def _import_shapely():
-    """Lazily import Shapely for source-plane topology operations.
-
-    Returns
-    -------
-    shapely : module
-        Imported Shapely package.
-
-    Raises
-    ------
-    ImportError
-        If Shapely is unavailable. The original import error is retained as the
-        exception cause.
-    """
-    try:
-        import shapely
-    except ImportError as err:  # pragma: no cover
-        raise ImportError(
-            "Caustics source-position sampling requires the optional 'shapely' "
-            "package. Install it with `pip install shapely`."
-        ) from err
-    return shapely
 
 
 @dataclass(frozen=True)
@@ -3485,7 +3251,7 @@ def _boundary_regions(curves, *, geometry_tolerance):
     curve normalization. Final union snapping belongs to
     ``_build_strong_lensing_region``.
     """
-    shapely = _import_shapely()
+    shapely = _runtime._import_shapely()
     regions = []
     for boundary_index, curve in enumerate(curves):
         coordinates = _close_curve(curve, tolerance=geometry_tolerance)
@@ -3552,7 +3318,7 @@ def _match_boundary_curves(reference_curves, candidate_curves, *, geometry_toler
         return tuple(candidate_curves), np.inf, False, False
     if not reference_curves:
         return (), 0.0, True, True
-    shapely = _import_shapely()
+    shapely = _runtime._import_shapely()
     reference_coordinates = [_close_curve(curve, tolerance=geometry_tolerance) for curve in reference_curves]
     candidate_coordinates = [_close_curve(curve, tolerance=geometry_tolerance) for curve in candidate_curves]
     reference_lines = [shapely.LineString(coordinates) for coordinates in reference_coordinates]
@@ -3790,7 +3556,7 @@ def _source_boundary_clearance(source_x, source_y, geometry, geometry_tolerance)
     they have no radius or boundary uncertainty.
     """
     curves = (*geometry.caustic_curves, *geometry.pseudo_caustic_curves)
-    shapely = _import_shapely()
+    shapely = _runtime._import_shapely()
     source = shapely.Point(source_x, source_y)
     return min(
         float(source.distance(shapely.LineString(_close_curve(curve, tolerance=geometry_tolerance))))
@@ -3846,7 +3612,7 @@ def _build_strong_lensing_region(
     An empty input set reaches the same final non-positive-area
     ``RuntimeError`` guard.
     """
-    shapely = _import_shapely()
+    shapely = _runtime._import_shapely()
     curves = [*caustic_curves, *pseudo_caustic_curves]
 
     enclosed_regions = _boundary_regions(
@@ -3920,7 +3686,7 @@ def _sample_position(
     draw. The returned attempt count is one-based, and the supplied sample-local
     generator isolates variable rejection counts from other graph samples.
     """
-    shapely = _import_shapely()
+    shapely = _runtime._import_shapely()
     bounds = tuple(float(value) for value in region.bounds)
     area = float(region.area)
     min_x, min_y, max_x, max_y = bounds
@@ -4419,7 +4185,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         _validate_root_lens_spec(lens)
         lens_graph_inputs = _lens_graph_inputs(lens)
 
-        pixelscale_fraction = _validate_optional_positive_fraction(
+        pixelscale_fraction = _runtime._validate_optional_positive_fraction(
             "pixelscale_fraction",
             pixelscale_fraction,
         )
@@ -5106,7 +4872,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         boundary_refinements = np.empty(num_samples, dtype=int)
         for sample_index, sample_seed in enumerate(sample_seeds):
             values = {
-                name: _sample_value(value, sample_index, num_samples) for name, value in input_values.items()
+                name: _runtime._sample_value(value, sample_index, num_samples)
+                for name, value in input_values.items()
             }
             (
                 geometry_adapter,
@@ -5525,11 +5292,11 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         _validate_root_lens_spec(lens)
         lens_graph_inputs = _lens_graph_inputs(lens)
 
-        pixelscale_fraction = _validate_optional_positive_fraction(
+        pixelscale_fraction = _runtime._validate_optional_positive_fraction(
             "pixelscale_fraction",
             pixelscale_fraction,
         )
-        epsilon_fraction = _validate_optional_positive_fraction(
+        epsilon_fraction = _runtime._validate_optional_positive_fraction(
             "epsilon_fraction",
             epsilon_fraction,
         )
@@ -5721,7 +5488,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             divisions=divisions,
             max_depth=self.max_depth,
         )
-        return np.column_stack((_to_numpy(image_x), _to_numpy(image_y)))
+        return np.column_stack((_runtime._to_numpy(image_x), _runtime._to_numpy(image_y)))
 
     def _solve_one(self, values):
         """Solve active macro-images for one realized lens system.
@@ -5842,7 +5609,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             cosmology=self.cosmology,
             values=values,
         )
-        _, torch = _import_caustics_dependencies()
+        _, torch = _runtime._import_caustics_dependencies()
 
         realized_fov = values["fov"]
         if realized_fov is None:
@@ -6211,8 +5978,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         image_x = coordinates[:, 0]
         image_y = coordinates[:, 1]
-        magnifications = _to_numpy(magnifications)
-        time_delays = _to_numpy(time_delays)
+        magnifications = _runtime._to_numpy(magnifications)
+        time_delays = _runtime._to_numpy(time_delays)
 
         time_delays = time_delays - np.min(time_delays)
         # np.lexsort uses the final key as the primary key: delay, then x, then y.
@@ -6343,7 +6110,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
 
         for sample_index in range(num_samples):
             current_values = {
-                name: _sample_value(value, sample_index, num_samples) for name, value in input_values.items()
+                name: _runtime._sample_value(value, sample_index, num_samples)
+                for name, value in input_values.items()
             }
             current_x, current_y, current_mu, current_delay, diagnostics = self._solve_one(current_values)
             count = len(current_x)
