@@ -92,6 +92,29 @@ def _make_expansion_survey():
     )
 
 
+def _make_spectrograph_survey():
+    observations = FakeObsTable(
+        {
+            "time": [10.0],
+            "ra": [12.0],
+            "dec": [-5.0],
+            "filter": ["spectra"],
+        },
+        bandflux_error=0.0,
+        radius=1.0,
+    )
+    return SurveyInfo(
+        obstable=observations,
+        passbands=Spectrograph.from_regular_grid(
+            4_000.0,
+            6_000.0,
+            100.0,
+            instrument="test",
+        ),
+        noise_model=GivenNoiseModel(),
+    )
+
+
 def _make_expanding_model():
     repeats = GivenValueList(
         [2, 3, 1],
@@ -598,6 +621,33 @@ def test_simulation_metadata_requires_explicit_opt_in():
     assert "image_id" not in results
     assert results["params"].iloc[0]["ordinary.system_id"] == 17
     assert results["params"].iloc[0]["ordinary.image_id"] == 4
+
+
+@pytest.mark.parametrize("metadata_param", ["lightcurve", "params", "spectra"])
+def test_simulation_metadata_rejects_later_standard_columns(metadata_param):
+    """Test metadata cannot claim columns materialized later by simulation."""
+    model = ConstantSEDModel(
+        brightness=10.0,
+        ra=12.0,
+        dec=-5.0,
+        redshift=0.0,
+        t0=0.0,
+        node_label="conflict",
+    )
+    model.simulation_metadata_params = (metadata_param,)
+    model.add_parameter(metadata_param, 17, allow_gradient=False)
+    survey = _make_spectrograph_survey() if metadata_param == "spectra" else _make_expansion_survey()
+
+    with pytest.raises(
+        ValueError,
+        match=rf"Simulation metadata column {metadata_param} conflicts with a standard result column\.",
+    ):
+        simulate_lightcurves(
+            model,
+            1,
+            survey,
+            progress_bar=False,
+        )
 
 
 def test_expanded_simulation_batches_requested_systems():

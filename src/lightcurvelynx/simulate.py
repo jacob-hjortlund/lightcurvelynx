@@ -363,6 +363,7 @@ def _simulate_lightcurves_batch(simulation_info):
     metadata_param_cols = {
         f"{model.node_string}.{param_name}": param_name for param_name in model.simulation_metadata_params
     }
+    reserved_result_cols = {*results_dict, "lightcurve", "params", "spectra"}
     for state_name, output_name in metadata_param_cols.items():
         if state_name not in sample_states:
             raise KeyError(
@@ -370,7 +371,7 @@ def _simulate_lightcurves_batch(simulation_info):
                 f"parameters. Available parameters are: "
                 f"{sample_states.get_all_params_names()}."
             )
-        if output_name in results_dict:
+        if output_name in reserved_result_cols:
             raise ValueError(
                 f"Simulation metadata column {output_name} conflicts with a standard result column."
             )
