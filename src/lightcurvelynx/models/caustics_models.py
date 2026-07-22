@@ -24,6 +24,9 @@ default dtype to ``torch.float64``; this side effect is not restored by this
 module.
 """
 
+# TODO: Add the Caustics archival DOI/paper and ContourPy credit to the relevant
+# public-node reference sections.
+
 import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass

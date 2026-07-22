@@ -3989,6 +3989,8 @@ def test_image_compute_single_sample_packs_padding_and_preserves_fixed_output(
         fixed_cosmology,
         max_images=4,
         expected_num_images=None,
+        pixelscale=0.25,
+        max_fov_expansions=1,
     )
     solved = (
         np.array([2.0, 1.0]),
@@ -4058,6 +4060,9 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
         max_images=4,
         min_images=1,
         expected_num_images=None,
+        pixelscale=0.25,
+        max_fov_expansions=2,
+        max_pixelscale_refinements=1,
     )
     solved = iter(
         [
