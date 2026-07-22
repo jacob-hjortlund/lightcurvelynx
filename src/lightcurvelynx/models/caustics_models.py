@@ -736,6 +736,12 @@ class _PseudoCausticGenerator:
     max_initial_radius : float or None
         Optional upper bound on the first image-plane loop radius in
         arcseconds. ``None`` leaves the caller's configured radius uncapped.
+
+    Notes
+    -----
+    ``frozen=True`` prevents field reassignment but does not copy or deeply
+    freeze supplied objects. The documented tuple-of-floats ``center`` contract
+    is therefore caller-owned, and both fields are retained by identity.
     """
 
     center: tuple[float, float]
@@ -771,6 +777,12 @@ class _GeometryAdapter:
         -------
         x, y : tuple of float
             Image-plane center in arcseconds.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this base capability; concrete adapters must
+            override it.
         """
         raise NotImplementedError
 
@@ -787,6 +799,12 @@ class _GeometryAdapter:
         float or None
             Full square-search width in arcseconds, or ``None`` when the
             component has no independent finite extent.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this base capability; concrete adapters must
+            override it.
         """
         raise NotImplementedError
 
@@ -803,6 +821,12 @@ class _GeometryAdapter:
         float or None
             Characteristic angular scale in arcseconds, or ``None`` when the
             component supplies no independent scale.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this base capability; concrete adapters must
+            override it.
         """
         raise NotImplementedError
 
@@ -819,6 +843,12 @@ class _GeometryAdapter:
         tuple of tuple of float
             Image-plane ``(x, y)`` points in arcseconds. An empty tuple means
             no explicit Jacobian masking is required.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this base capability; concrete adapters must
+            override it.
         """
         raise NotImplementedError
 
@@ -835,6 +865,12 @@ class _GeometryAdapter:
         tuple of tuple of float
             Image-plane ``(x, y)`` points in arcseconds. An empty tuple disables
             targeted recovery.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this base capability; concrete adapters must
+            override it.
         """
         raise NotImplementedError
 
@@ -851,6 +887,12 @@ class _GeometryAdapter:
         tuple of _PseudoCausticGenerator
             Ordered component-owned generators. An empty tuple means the lens
             contributes no pseudo-caustic boundary.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this base capability; concrete adapters must
+            override it.
         """
         raise NotImplementedError
 
@@ -867,6 +909,12 @@ class _GeometryAdapter:
         tuple of float or None
             Exact image-plane ``(x, y)`` center in arcseconds, or ``None`` when
             the total geometry is not certified as axisymmetric.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this base capability; concrete adapters must
+            override it.
         """
         raise NotImplementedError
 
@@ -882,6 +930,12 @@ class _GeometryAdapter:
         -------
         bool
             Whether this component can preserve a peer's exact axisymmetry.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this base capability; concrete adapters must
+            override it.
         """
         raise NotImplementedError
 
@@ -925,6 +979,12 @@ class _GeometryAdapter:
         -------
         int
             Reference number of regular images.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised by this base capability; concrete adapters must
+            override it.
         """
         raise NotImplementedError
 
@@ -990,6 +1050,9 @@ class _PointSingularityGeometryAdapter(_GeometryAdapter):
     Notes
     -----
     The adapter is fully realized and ignores its methods' ``values`` mapping.
+    ``frozen=True`` prevents field reassignment but does not copy or deeply
+    freeze supplied objects; in particular, ``center`` is retained by identity
+    under its documented tuple-of-floats contract.
     """
 
     center: tuple[float, float]
@@ -1001,41 +1064,148 @@ class _PointSingularityGeometryAdapter(_GeometryAdapter):
     axisymmetric: bool = False
 
     def search_center(self, values):
-        """Return the stored image-plane center in arcseconds."""
+        """Implement the base search-center capability with the stored center.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of float, length 2
+            Stored image-plane ``(x, y)`` center in arcseconds.
+        """
         return self.center
 
     def initial_fov(self, values):
-        """Return the stored full image-plane extent in arcseconds."""
+        """Implement the base initial-FOV capability with the stored extent.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        float
+            Stored full square image-plane extent in arcseconds; this concrete
+            adapter never returns ``None``.
+        """
         return self.extent
 
     def resolution_scale(self, values):
-        """Return the stored image-plane resolution scale in arcseconds."""
+        """Implement the base resolution capability with the stored scale.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        float
+            Stored image-plane resolution scale in arcseconds; this concrete
+            adapter never returns ``None``.
+        """
         return self.resolution
 
     def jacobian_mask_points(self, values):
-        """Return ``(center,)`` when masking is enabled, otherwise ``()``."""
+        """Implement the base Jacobian-mask capability at the stored center.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of tuple of float
+            One image-plane ``(x, y)`` point in arcseconds when center masking
+            is enabled, otherwise the empty tuple required by the base contract.
+        """
         return (self.center,) if self.mask_center else ()
 
     def root_recovery_points(self, values):
-        """Return ``(center,)`` when recovery is enabled, otherwise ``()``."""
+        """Implement the base root-recovery capability at the stored center.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of tuple of float
+            One image-plane ``(x, y)`` point in arcseconds when center recovery
+            is enabled, otherwise the empty tuple that disables base-contract
+            targeted recovery.
+        """
         return (self.center,) if self.recover_center else ()
 
     def pseudo_caustic_generators(self, values):
-        """Return one centered generator when enabled, otherwise ``()``."""
+        """Implement the base pseudo-caustic capability at the stored center.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of _PseudoCausticGenerator
+            One generator centered in image-plane arcseconds when enabled,
+            otherwise the empty tuple denoting no pseudo-caustic boundary.
+        """
         if self.generate_pseudo_caustic:
             return (_PseudoCausticGenerator(self.center),)
         return ()
 
     def axisymmetry_center(self, values):
-        """Return ``center`` for exact axisymmetry, otherwise ``None``."""
+        """Implement the base exact-axisymmetry-center capability.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of float, length 2, or None
+            Stored image-plane center in arcseconds when exact axisymmetry is
+            certified, otherwise ``None`` as required by the base contract.
+        """
         return self.center if self.axisymmetric else None
 
     def preserves_axisymmetry(self, values):
-        """Return false because this is a non-affine adapter."""
+        """Implement the base peer-axisymmetry-preservation capability.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        bool
+            Always ``False`` because this non-affine adapter cannot serve as an
+            affine symmetry-preserving peer.
+        """
         return False
 
     def reference_num_images(self, values):
-        """Return the one-image reference count for an atomic lens."""
+        """Implement the base regular-image reference-count capability.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        int
+            Dimensionless one-image reference count for this atomic lens.
+        """
         return 1
 
 
@@ -1062,6 +1232,9 @@ class _SmoothCuspGeometryAdapter(_GeometryAdapter):
     -----
     The adapter is fully realized, ignores its methods' ``values`` mapping,
     and always returns an empty pseudo-caustic-generator tuple.
+    ``frozen=True`` prevents field reassignment but does not copy or deeply
+    freeze supplied objects; in particular, ``center`` is retained by identity
+    under its documented tuple-of-floats contract.
     """
 
     center: tuple[float, float]
@@ -1072,39 +1245,146 @@ class _SmoothCuspGeometryAdapter(_GeometryAdapter):
     axisymmetric: bool = False
 
     def search_center(self, values):
-        """Return the stored image-plane center in arcseconds."""
+        """Implement the base search-center capability with the stored center.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of float, length 2
+            Stored image-plane ``(x, y)`` center in arcseconds.
+        """
         return self.center
 
     def initial_fov(self, values):
-        """Return the stored full image-plane extent in arcseconds."""
+        """Implement the base initial-FOV capability with the stored extent.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        float
+            Stored full square image-plane extent in arcseconds; this concrete
+            adapter never returns ``None``.
+        """
         return self.extent
 
     def resolution_scale(self, values):
-        """Return the stored image-plane resolution scale in arcseconds."""
+        """Implement the base resolution capability with the stored scale.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        float
+            Stored image-plane resolution scale in arcseconds; this concrete
+            adapter never returns ``None``.
+        """
         return self.resolution
 
     def jacobian_mask_points(self, values):
-        """Return ``(center,)`` when masking is enabled, otherwise ``()``."""
+        """Implement the base Jacobian-mask capability at the stored center.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of tuple of float
+            One image-plane ``(x, y)`` point in arcseconds when center masking
+            is enabled, otherwise the empty tuple required by the base contract.
+        """
         return (self.center,) if self.mask_center else ()
 
     def root_recovery_points(self, values):
-        """Return ``(center,)`` when recovery is enabled, otherwise ``()``."""
+        """Implement the base root-recovery capability at the stored center.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of tuple of float
+            One image-plane ``(x, y)`` point in arcseconds when center recovery
+            is enabled, otherwise the empty tuple that disables base-contract
+            targeted recovery.
+        """
         return (self.center,) if self.recover_center else ()
 
     def pseudo_caustic_generators(self, values):
-        """Return ``()`` because a smooth cusp has no pseudo-caustic."""
+        """Implement the base pseudo-caustic capability for a smooth cusp.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of _PseudoCausticGenerator
+            Always the empty tuple because a smooth cusp contributes no
+            pseudo-caustic boundary to the base adapter contract.
+        """
         return ()
 
     def axisymmetry_center(self, values):
-        """Return ``center`` for exact axisymmetry, otherwise ``None``."""
+        """Implement the base exact-axisymmetry-center capability.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        tuple of float, length 2, or None
+            Stored image-plane center in arcseconds when exact axisymmetry is
+            certified, otherwise ``None`` as required by the base contract.
+        """
         return self.center if self.axisymmetric else None
 
     def preserves_axisymmetry(self, values):
-        """Return false because this is a non-affine adapter."""
+        """Implement the base peer-axisymmetry-preservation capability.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        bool
+            Always ``False`` because this non-affine adapter cannot serve as an
+            affine symmetry-preserving peer.
+        """
         return False
 
     def reference_num_images(self, values):
-        """Return the one-image reference count for an atomic lens."""
+        """Implement the base regular-image reference-count capability.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this adapter is fully realized.
+
+        Returns
+        -------
+        int
+            Dimensionless one-image reference count for this atomic lens.
+        """
         return 1
 
 
@@ -1123,44 +1403,166 @@ class _AffinePerturbationGeometryAdapter(_GeometryAdapter):
     ``search_center`` reads ``x0`` and ``y0`` from the realized ``values``
     mapping. Affine perturbations provide no independent extent, resolution,
     mask point, recovery point, pseudo-caustic generator, or symmetry center.
+    ``frozen=True`` prevents field reassignment; the documented Boolean field is
+    retained without normalization or copying.
     """
 
     axisymmetry_preserving: bool = False
 
     def search_center(self, values):
-        """Return the realized affine center in image-plane arcseconds."""
+        """Implement the base search-center capability from realized values.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Realized adapter-owned mapping containing float-convertible ``x0``
+            and ``y0`` coordinates in image-plane arcseconds.
+
+        Returns
+        -------
+        tuple of float, length 2
+            Realized image-plane ``(x0, y0)`` center in arcseconds.
+
+        Raises
+        ------
+        KeyError
+            If either required center coordinate is absent.
+        TypeError
+            If a center coordinate is not float-convertible.
+        ValueError
+            If a center coordinate's conversion to ``float`` rejects its value.
+        OverflowError
+            If a center coordinate overflows during conversion to ``float``.
+        """
         return float(values["x0"]), float(values["y0"])
 
     def initial_fov(self, values):
-        """Return ``None`` because an affine perturbation has no extent."""
+        """Implement the base initial-FOV capability without a finite extent.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because affine geometry supplies no independent extent.
+
+        Returns
+        -------
+        None
+            Always ``None``, the base-contract sentinel for no independent
+            finite image-plane FOV.
+        """
         return None
 
     def resolution_scale(self, values):
-        """Return ``None`` because an affine perturbation has no scale."""
+        """Implement the base resolution capability without an angular scale.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because affine geometry supplies no independent resolution.
+
+        Returns
+        -------
+        None
+            Always ``None``, the base-contract sentinel for no independent
+            image-plane resolution scale.
+        """
         return None
 
     def jacobian_mask_points(self, values):
-        """Return ``()`` because an affine perturbation needs no mask."""
+        """Implement the base Jacobian-mask capability with no mask points.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because affine geometry requires no Jacobian mask.
+
+        Returns
+        -------
+        tuple of tuple of float
+            Always the empty tuple, denoting no image-plane mask points under
+            the base adapter contract.
+        """
         return ()
 
     def root_recovery_points(self, values):
-        """Return ``()`` because an affine perturbation needs no recovery."""
+        """Implement the base root-recovery capability with no recovery points.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because affine geometry requires no targeted recovery.
+
+        Returns
+        -------
+        tuple of tuple of float
+            Always the empty tuple, which disables base-contract targeted
+            image-plane recovery.
+        """
         return ()
 
     def pseudo_caustic_generators(self, values):
-        """Return ``()`` because an affine perturbation has no pseudo-caustic."""
+        """Implement the base pseudo-caustic capability with no generators.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because affine geometry contributes no pseudo-caustic.
+
+        Returns
+        -------
+        tuple of _PseudoCausticGenerator
+            Always the empty tuple, denoting no pseudo-caustic boundary under
+            the base adapter contract.
+        """
         return ()
 
     def axisymmetry_center(self, values):
-        """Return ``None`` because the perturbation has no symmetry center."""
+        """Implement the base exact-axisymmetry-center capability without one.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because an affine perturbation has no independent center of
+            rotational symmetry.
+
+        Returns
+        -------
+        None
+            Always ``None``, the base-contract sentinel for no independently
+            certified image-plane symmetry center.
+        """
         return None
 
     def preserves_axisymmetry(self, values):
-        """Return whether this perturbation preserves rotational symmetry."""
+        """Implement the base peer-axisymmetry-preservation capability.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this capability is fixed on the realized adapter.
+
+        Returns
+        -------
+        bool
+            Whether this affine perturbation preserves a non-affine peer's exact
+            rotational symmetry under the base adapter contract.
+        """
         return self.axisymmetry_preserving
 
     def reference_num_images(self, values):
-        """Return zero excess over the single-plane reference image."""
+        """Implement the base regular-image reference-count capability.
+
+        Parameters
+        ----------
+        values : Mapping[str, object]
+            Ignored because this capability is fixed on the realized adapter.
+
+        Returns
+        -------
+        int
+            Dimensionless reference count of one, contributing zero excess over
+            the enclosing single-plane reference image.
+        """
         return 1
 
 
@@ -1177,6 +1579,12 @@ class _GeometryComponent:
         Fresh realized adapter for the atomic or nested component.
     affine : bool
         Effective affinity of the complete component subtree.
+
+    Notes
+    -----
+    ``frozen=True`` prevents field reassignment but is only a shallow ownership
+    boundary. ``name`` and ``adapter`` are retained by identity, and any mutable
+    state reachable through the adapter is neither copied nor deeply frozen.
     """
 
     name: str
@@ -1200,6 +1608,9 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
     concatenated in component order. Numerical search bounds and resolution
     ignore affine components because those components supply neither an
     independent finite extent nor a scale.
+    ``frozen=True`` prevents field reassignment but does not copy or deeply
+    freeze the supplied component tuple or objects reachable through its
+    component adapters.
     """
 
     components: tuple[_GeometryComponent, ...]
@@ -1266,7 +1677,20 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
         )
 
     def reference_num_images(self, values):
-        """Return one plus each ordered component's reference-count excess."""
+        """Implement the base regular-image reference-count capability.
+
+        Parameters
+        ----------
+        values : Mapping[str, Mapping[str, object]]
+            Realized adapter-owned values keyed by generated component name.
+
+        Returns
+        -------
+        int
+            Dimensionless count equal to one plus each ordered component's
+            excess over its own one-image reference. An empty component tuple
+            therefore returns one.
+        """
         return 1 + sum(
             component.adapter.reference_num_images(values[component.name]) - 1
             for component in self.components
@@ -1391,12 +1815,58 @@ class _SinglePlaneGeometryAdapter(_GeometryAdapter):
         )
 
     def search_center(self, values):
-        """Return the midpoint of the non-affine envelope in arcseconds."""
+        """Implement the base search-center capability from the plane envelope.
+
+        Parameters
+        ----------
+        values : Mapping[str, Mapping[str, object]]
+            Realized adapter-owned values keyed by generated component name.
+
+        Returns
+        -------
+        tuple of float, length 2
+            Midpoint ``(x, y)`` of the aggregate non-affine image-plane envelope
+            in arcseconds.
+
+        Raises
+        ------
+        ValueError
+            If no non-affine component contributes envelope bounds and the
+            delegated minimum or maximum reduction receives an empty sequence.
+
+        Notes
+        -----
+        This concrete implementation fulfills ``_GeometryAdapter.search_center``
+        by delegating its bounds calculation to ``_search_envelope``.
+        """
         min_x, max_x, min_y, max_y = self._search_envelope(values)
         return 0.5 * (min_x + max_x), 0.5 * (min_y + max_y)
 
     def initial_fov(self, values):
-        """Return the envelope's larger full width in arcseconds."""
+        """Implement the base initial-FOV capability from the plane envelope.
+
+        Parameters
+        ----------
+        values : Mapping[str, Mapping[str, object]]
+            Realized adapter-owned values keyed by generated component name.
+
+        Returns
+        -------
+        float
+            Larger full width of the aggregate non-affine image-plane envelope
+            in arcseconds; a valid non-affine plane never returns ``None``.
+
+        Raises
+        ------
+        ValueError
+            If no non-affine component contributes envelope bounds and the
+            delegated minimum or maximum reduction receives an empty sequence.
+
+        Notes
+        -----
+        This concrete implementation fulfills ``_GeometryAdapter.initial_fov``
+        by delegating its bounds calculation to ``_search_envelope``.
+        """
         min_x, max_x, min_y, max_y = self._search_envelope(values)
         return max(max_x - min_x, max_y - min_y)
 
@@ -1502,6 +1972,9 @@ def _trace_pseudo_caustics(
 
     Raises
     ------
+    ImportError
+        If a registered generator is present and the optional Caustics or Torch
+        runtime needed to map its loop is unavailable.
     RuntimeError
         If a shrinking-loop sequence does not converge within 32
         refinements.
@@ -1866,6 +2339,12 @@ class _RegisteredLensModel:
         factories accept ``(lens, values)``; ``SinglePlane`` stores
         ``_SinglePlaneGeometryAdapter``, which accepts an ordered component
         tuple.
+
+    Notes
+    -----
+    ``frozen=True`` prevents field reassignment but does not copy or deeply
+    freeze the supplied callable. ``geometry_factory`` is retained by identity,
+    including any mutable state reachable through a callable object.
     """
 
     affine: bool
@@ -2282,14 +2761,15 @@ def _build_lens_system(lens_spec, *, cosmology, values):
 
 
 class _CausticFOVError(RuntimeError):
-    """Signal that critical-curve completeness requires a larger search FOV.
+    """Signal a critical-curve state selected for bounded FOV retry.
 
     Notes
     -----
     ``_find_all_caustics`` raises this private control-flow exception only for
-    conditions recoverable by enlarging the square image-plane field of view:
-    an exterior boundary that is not yet positive definite, no detected
-    critical curve, or a critical curve that reaches the grid boundary.
+    conditions treated as potentially recoverable by enlarging the square
+    image-plane field of view: an exterior boundary that is not yet positive
+    definite, no detected critical curve, or a critical curve that reaches the
+    grid boundary. Expansion is bounded and need not resolve every such state.
     ``CausticsSourcePositionNode`` owns the bounded expansion policy and
     converts final exhaustion to a public ``RuntimeError``. Structural contour
     and mapping failures remain ordinary ``RuntimeError`` instances and are
@@ -2827,9 +3307,10 @@ def _close_curve(curve, *, tolerance):
     Returns
     -------
     numpy.ndarray, shape (M, 2)
-        Floating-point coordinates with at least three unique vertices and an
-        exactly repeated first/last vertex. Consecutive vertices within
-        ``tolerance`` are removed, so ``M`` may be smaller than ``N``.
+        Source-plane floating-point coordinates in arcseconds, with at least
+        three unique vertices and an exactly repeated first/last vertex.
+        Consecutive vertices within ``tolerance`` are removed, so ``M`` may be
+        smaller than ``N``.
 
     Raises
     ------
