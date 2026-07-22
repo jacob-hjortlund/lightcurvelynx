@@ -3,7 +3,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from lightcurvelynx.models import caustics_models as caustics_models
 from lightcurvelynx.models._caustics import lens_system, runtime, source_geometry
 
 
@@ -28,23 +27,6 @@ class _FakeTensor:
     def __getitem__(self, key):
         """Return a tensor double for indexed root-refinement values."""
         return _FakeTensor(self.values[key])
-
-
-class _FakeTorch:
-    """Provide tensor conversion and absolute-value operations under test."""
-
-    float64 = np.float64
-
-    @staticmethod
-    def as_tensor(values, dtype=None):
-        """Convert values to the minimal tensor double."""
-        del dtype
-        return _FakeTensor(values)
-
-    @staticmethod
-    def abs(values):
-        """Return elementwise absolute values through the tensor protocol."""
-        return _FakeTensor(np.abs(values.values))
 
 
 class _RecordingParameter:

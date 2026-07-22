@@ -164,24 +164,6 @@ class _FakeTorch:
         return _FakeTensor(np.abs(values.values))
 
 
-class _RecordingParameter:
-    """Record dtype staticization for one fake Caustics parameter."""
-
-    def __init__(self, value, *, events=None, owner=None, name=None):
-        self.value = _FakeTensor(value)
-        self.dtype_calls = []
-        self.events = events
-        self.owner = owner
-        self.name = name
-
-    def to(self, *, dtype):
-        """Record the requested dtype and preserve parameter identity."""
-        self.dtype_calls.append(dtype)
-        if self.events is not None:
-            self.events.append(("parameter_to", self.owner, self.name, dtype))
-        return self
-
-
 class _FakeGeometryAdapter:
     """Supply deterministic geometry capabilities for node unit tests."""
 
