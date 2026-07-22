@@ -18,6 +18,25 @@ class _LinearTimeSEDModel(SEDModel):
         return times[:, np.newaxis] + wavelengths[np.newaxis, :] / 1_000.0
 
 
+class _RecordingLinearTimeSEDModel(_LinearTimeSEDModel):
+    """Record observer- and rest-frame coordinates around real SED evaluation."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.evaluate_calls = []
+        self.compute_calls = []
+
+    def evaluate_sed(self, times, wavelengths, *args, **kwargs):
+        """Record observer-frame inputs before running the real SED pipeline."""
+        self.evaluate_calls.append((np.asarray(times).copy(), np.asarray(wavelengths).copy()))
+        return super().evaluate_sed(times, wavelengths, *args, **kwargs)
+
+    def compute_sed(self, times, wavelengths, graph_state, **kwargs):
+        """Record coordinates before evaluating the same analytic SED."""
+        self.compute_calls.append((np.asarray(times).copy(), np.asarray(wavelengths).copy()))
+        return super().compute_sed(times, wavelengths, graph_state, **kwargs)
+
+
 class _LinearTimeBandfluxModel(BandfluxModel):
     """Return deterministic time- and filter-dependent bandfluxes."""
 
@@ -323,6 +342,49 @@ def test_evaluate_sed_returns_exact_weighted_image_sum():
     assert result.shape == (2, 2)
     np.testing.assert_allclose(result, expected)
     np.testing.assert_allclose(result, [[51.0, 56.0], [56.0, 61.0]])
+
+
+def test_evaluate_sed_child_owns_nonzero_redshift_conversion_once():
+    """Apply redshift once in the child around the unresolved image sum."""
+    source = _RecordingLinearTimeSEDModel(
+        redshift=1.0,
+        t0=4.0,
+        node_label="source",
+    )
+    _, lens = _make_sed_lens(source=source)
+    state = lens.sample_parameters()
+    observer_times = np.array([10.0, 14.0])
+    observer_wavelengths = np.array([1_000.0, 3_000.0])
+
+    result = lens.evaluate_sed(observer_times, observer_wavelengths, state)
+
+    assert source.apply_redshift is True
+    assert lens.apply_redshift is False
+    assert len(source.evaluate_calls) == 1
+    shifted_observer_times, shifted_observer_wavelengths = source.evaluate_calls[0]
+    np.testing.assert_array_equal(shifted_observer_times, [10.0, 14.0, 8.0, 12.0])
+    np.testing.assert_array_equal(
+        shifted_observer_wavelengths,
+        [1_000.0, 3_000.0],
+    )
+    assert len(source.compute_calls) == 1
+    rest_times, rest_wavelengths = source.compute_calls[0]
+    image_major_rest_times = np.array([7.0, 9.0, 6.0, 8.0])
+    np.testing.assert_array_equal(rest_times, np.sort(image_major_rest_times))
+    np.testing.assert_array_equal(rest_wavelengths, [500.0, 1_500.0])
+
+    rest_frame_sed = np.array(
+        [
+            [7.5, 8.5],
+            [9.5, 10.5],
+            [6.5, 7.5],
+            [8.5, 9.5],
+        ]
+    )
+    observer_frame_sed = 2.0 * rest_frame_sed
+    expected = 3.0 * observer_frame_sed[:2] + 2.0 * observer_frame_sed[2:]
+    np.testing.assert_allclose(result, expected)
+    np.testing.assert_allclose(result, [[71.0, 81.0], [91.0, 101.0]])
 
 
 def test_evaluate_bandfluxes_preserves_image_major_filter_alignment():

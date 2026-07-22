@@ -4056,6 +4056,7 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
         valid_sis_spec,
         fixed_cosmology,
         max_images=4,
+        min_images=1,
         expected_num_images=None,
     )
     solved = iter(
@@ -4066,7 +4067,7 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
                 np.array([5.0, 6.0]),
                 np.array([0.0, 3.0]),
                 {
-                    "image_count_deficit": 0,
+                    "image_count_deficit": -1,
                     "solver_fov": 8.0,
                     "solver_pixelscale": 0.25,
                     "solver_attempts": 3,
@@ -4124,7 +4125,7 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
         results[4],
         [[0.0, 3.0, np.nan, np.nan], [0.0, np.nan, np.nan, np.nan]],
     )
-    np.testing.assert_array_equal(results[5], [0, -1])
+    np.testing.assert_array_equal(results[5], [-1, -1])
     np.testing.assert_array_equal(results[6], [8.0, 16.0])
     np.testing.assert_array_equal(results[7], [0.25, 0.125])
     np.testing.assert_array_equal(results[8], [3, 5])
@@ -4147,7 +4148,7 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
         saved["time_delays"],
         [[0.0, 3.0, np.nan, np.nan], [0.0, np.nan, np.nan, np.nan]],
     )
-    np.testing.assert_array_equal(saved["image_count_deficit"], [0, -1])
+    np.testing.assert_array_equal(saved["image_count_deficit"], [-1, -1])
     np.testing.assert_array_equal(saved["solver_fov"], [8.0, 16.0])
     np.testing.assert_array_equal(saved["solver_pixelscale"], [0.25, 0.125])
     np.testing.assert_array_equal(saved["solver_attempts"], [3, 5])
