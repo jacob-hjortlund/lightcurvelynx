@@ -1,4 +1,6 @@
+import numpy as np
 import pytest
+
 from lightcurvelynx.base_models import FunctionNode, ParameterizedNode
 from lightcurvelynx.math_nodes.given_sampler import GivenValueList
 from lightcurvelynx.math_nodes.single_value_node import SingleVariableNode
@@ -199,3 +201,50 @@ def test_state_expansion_node_subparameters_chaining():
     assert state["add_uneven"]["value1"].tolist() == [0, 0, 10, 10, 10, 30]
     assert state["add_uneven"]["value2"].tolist() == [0, 1, 10, 11, 12, 30]
     assert state["add_uneven"]["value_sum"].tolist() == [0, 1, 20, 21, 22, 60]
+
+
+def test_state_expansion_node_uses_sample_offset():
+    """Test that provenance indices include the graph state's sample offset."""
+    node = StateExpansionNode(repeats=2, node_label="exp")
+
+    state = node.sample_parameters(num_samples=2, sample_offset=5)
+
+    assert state.sample_offset == 5
+    assert state["exp.org_inds"].tolist() == [5, 5, 6, 6]
+    assert state["exp.sub_inds"].tolist() == [0, 1, 0, 1]
+
+
+def test_state_expansion_node_accepts_single_mapping_from_sampler():
+    """Test that a single mapping returned by a sampler is expanded."""
+    node = StateExpansionNode(
+        param_names=["a", "b"],
+        param_values=GivenValueList([{"a": [1, 2], "b": [3, 4]}]),
+        node_label="exp",
+    )
+
+    state = node.sample_parameters(num_samples=1)
+
+    assert state.num_samples == 2
+    assert state["exp.org_inds"].tolist() == [0, 0]
+    assert state["exp.sub_inds"].tolist() == [0, 1]
+    assert state["exp.a"].tolist() == [1, 2]
+    assert state["exp.b"].tolist() == [3, 4]
+
+
+def test_state_expansion_node_single_to_single_stores_scalars():
+    """Test that a one-row expansion stores scalar output values."""
+    node = StateExpansionNode(
+        param_names=["a"],
+        param_values=[{"a": [7]}],
+        node_label="exp",
+    )
+
+    state = node.sample_parameters(num_samples=1, sample_offset=8)
+
+    assert state.num_samples == 1
+    assert np.isscalar(state["exp.org_inds"])
+    assert np.isscalar(state["exp.sub_inds"])
+    assert np.isscalar(state["exp.a"])
+    assert state["exp.org_inds"] == 8
+    assert state["exp.sub_inds"] == 0
+    assert state["exp.a"] == 7

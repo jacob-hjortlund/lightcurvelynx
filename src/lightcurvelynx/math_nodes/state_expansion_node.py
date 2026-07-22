@@ -9,6 +9,8 @@ Note
 This class is experimental and may be removed in the future.
 """
 
+from collections.abc import Mapping
+
 import numpy as np
 
 from lightcurvelynx.base_models import FunctionNode
@@ -111,10 +113,13 @@ class StateExpansionNode(FunctionNode):
         # If new parameters to add are not None, we compute the repeats array from the length
         # of the subparameters for each sample.
         if len(self.new_param_names) > 0:
+            if graph_state.num_samples == 1 and isinstance(param_values, Mapping):
+                param_values = [param_values]
             if len(param_values) != graph_state.num_samples:
                 raise ValueError(
-                    f"The number of subparameter dictionaries ({len(param_values)}) must match the "
-                    f"number of samples in the graph state ({graph_state.num_samples})."
+                    f"The number of subparameter dictionaries ({len(param_values)}) must "
+                    f"match the number of samples in the graph state "
+                    f"({graph_state.num_samples})."
                 )
             repeats = [0] * graph_state.num_samples
 
@@ -151,16 +156,20 @@ class StateExpansionNode(FunctionNode):
 
         # Use the repeats list to expand the graph state. Save the information about the
         # original indices and the sub-indices for each sample before and after expansion.
-        org_inds = np.arange(graph_state.num_samples).repeat(repeats)
-        sub_inds = np.concatenate([np.arange(r) for r in repeats])
+        sample_offset = graph_state.sample_offset
+        if sample_offset is None:
+            sample_offset = 0
+        original_indices = np.arange(
+            sample_offset,
+            sample_offset + graph_state.num_samples,
+        )
+        org_inds = np.repeat(original_indices, repeats)
+        sub_inds = np.concatenate([np.arange(repeat) for repeat in repeats])
+
         graph_state.repeat(repeats)
-        results = [org_inds, sub_inds]
+        results = [org_inds, sub_inds, *concat_values.values()]
+        if graph_state.num_samples == 1:
+            results = [value[0] for value in results]
 
-        # Add columns for any subparameters we need to concatenate.
-        for col, values in concat_values.items():
-            graph_state.set(self.node_string, col, values)
-            results.append(values)
-
-        # Save and return the old indices and the subindices as the result.
         self._save_results(results, graph_state)
         return results
