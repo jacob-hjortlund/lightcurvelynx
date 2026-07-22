@@ -593,17 +593,14 @@ class GraphState:
         # repeating the values according to repeats.
         for node_name, node_vars in self.states.items():
             for var_name, value in node_vars.items():
-                # Compute the new values as an array.
+                value_array = np.asarray(value)
                 if self.num_samples == 1:
-                    new_values = np.full(repeats[0], value)
-                else:
-                    new_values = np.repeat(value, repeats)
+                    value_array = np.expand_dims(value_array, axis=0)
 
-                # If we only have a single sample at the end, store its value.
+                new_values = np.repeat(value_array, repeats, axis=0)
                 if new_num_samples == 1:
                     new_values = new_values[0]
 
-                # Save the updated values.
                 self.states[node_name][var_name] = new_values
 
         # Update the number of samples.

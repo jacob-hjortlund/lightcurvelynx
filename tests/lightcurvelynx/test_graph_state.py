@@ -6,6 +6,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from astropy.table import Table
+
 from lightcurvelynx.graph_state import DependencyGraph, GraphState, transpose_dict_of_list
 
 
@@ -942,6 +943,61 @@ def test_graph_state_repeat_integer_shortcut():
     state.repeat(2)
     assert state.num_samples == 6
     assert np.array_equal(state["a"]["v1"], [1.0, 1.0, 2.0, 2.0, 3.0, 3.0])
+
+
+def test_graph_state_repeat_preserves_trailing_dimensions():
+    """Test that repeat preserves trailing value dimensions and fixed metadata."""
+    state = GraphState(num_samples=3)
+    values = np.arange(12).reshape(3, 2, 2)
+    state.set("a", "matrix", values, fixed=True)
+
+    state.repeat([2, 0, 1])
+
+    assert state.num_samples == 3
+    assert state["a.matrix"].shape == (3, 2, 2)
+    np.testing.assert_array_equal(state["a.matrix"], values[[0, 0, 2]])
+    assert state.fixed_vars == {"a": {"matrix"}}
+
+
+@pytest.mark.parametrize("repeats", [1, 3])
+def test_graph_state_repeat_preserves_single_sample_array(repeats):
+    """Test that repeat preserves a single-sample array value."""
+    state = GraphState(num_samples=1)
+    value = np.array([[1, 2], [3, 4]])
+    state.set("a", "matrix", value)
+
+    state.repeat(repeats)
+
+    expected = value if repeats == 1 else np.repeat(value[None, ...], repeats, axis=0)
+    np.testing.assert_array_equal(state["a.matrix"], expected)
+
+
+def test_graph_state_repeat_array_multi_to_single():
+    """Test that repeat stores trailing dimensions after reducing to one sample."""
+    state = GraphState(num_samples=3)
+    values = np.arange(12).reshape(3, 2, 2)
+    state.set("a", "matrix", values)
+
+    state.repeat([0, 1, 0])
+
+    assert state.num_samples == 1
+    assert state["a.matrix"].shape == (2, 2)
+    np.testing.assert_array_equal(state["a.matrix"], values[1])
+
+
+def test_graph_state_repeat_preserves_object_values():
+    """Test that repeat preserves object dtype and identity."""
+    first = object()
+    second = object()
+    values = np.empty(2, dtype=object)
+    values[:] = [first, second]
+    state = GraphState(num_samples=2)
+    state.set("a", "objects", values)
+
+    state.repeat([2, 1])
+
+    assert state["a.objects"].dtype == object
+    assert state["a.objects"].tolist() == [first, first, second]
 
 
 def test_graph_to_from_file(tmp_path):
