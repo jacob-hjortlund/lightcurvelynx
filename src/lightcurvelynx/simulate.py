@@ -315,7 +315,7 @@ def _simulate_lightcurves_batch(simulation_info):
     # Extract the parameters from the SimulationInfo that are used repeated
     # (so we have shorter names).
     model = simulation_info.model
-    num_samples = simulation_info.num_samples
+    requested_num_samples = simulation_info.num_samples
     obstable = [info.obstable for info in simulation_info.survey_info]
     passbands = [info.passbands for info in simulation_info.survey_info]
     obstable_save_cols = simulation_info.obstable_save_cols
@@ -324,17 +324,25 @@ def _simulate_lightcurves_batch(simulation_info):
 
     # Sample the parameter space of this model if it is not already provided. We do this once for
     # all surveys, so each object uses the same parameters across all observations.
-    if num_samples <= 0:
+    if requested_num_samples <= 0:
         raise ValueError("Invalid number of samples.")
     if simulation_info.graph_state is not None:
         logger.info("Using provided graph state to sample parameters.")
         sample_states = simulation_info.graph_state
     else:
-        logger.info(f"Sampling {num_samples} parameter sets from the model.")
+        logger.info(f"Sampling {requested_num_samples} parameter sets from the model.")
         sample_states = model.sample_parameters(
-            num_samples=num_samples,
+            num_samples=requested_num_samples,
             rng_info=rng,
             sample_offset=sample_offset,
+        )
+
+    realized_num_samples = sample_states.num_samples
+    if realized_num_samples != requested_num_samples:
+        logger.info(
+            "Sampled %d requested parameter sets into %d realized rows.",
+            requested_num_samples,
+            realized_num_samples,
         )
 
     # Create a dictionary for the object level information, including any saved parameters.
@@ -345,21 +353,38 @@ def _simulate_lightcurves_batch(simulation_info):
     ra = np.atleast_1d(model.get_param(sample_states, "ra"))
     dec = np.atleast_1d(model.get_param(sample_states, "dec"))
     results_dict = {
-        "id": [i for i in range(num_samples)],
+        "id": list(range(realized_num_samples)),
         "ra": ra.tolist(),
         "dec": dec.tolist(),
-        "nobs": [0] * num_samples,
+        "nobs": [0] * realized_num_samples,
         "t0": np.atleast_1d(model.get_param(sample_states, "t0")).tolist(),
         "z": np.atleast_1d(model.get_param(sample_states, "redshift")).tolist(),
     }
-    if simulation_info.param_cols is not None:
-        for col in simulation_info.param_cols:
-            if col not in sample_states:
-                raise KeyError(
-                    f"Parameter column {col} not found in model parameters. "
-                    f"Available parameters are: {sample_states.get_all_params_names()}."
-                )
-            results_dict[col.replace(".", "_")] = np.atleast_1d(sample_states[col]).tolist()
+    metadata_param_cols = {
+        f"{model.node_string}.{param_name}": param_name for param_name in model.simulation_metadata_params
+    }
+    for state_name, output_name in metadata_param_cols.items():
+        if state_name not in sample_states:
+            raise KeyError(
+                f"Simulation metadata parameter {state_name} was not found in model "
+                f"parameters. Available parameters are: "
+                f"{sample_states.get_all_params_names()}."
+            )
+        if output_name in results_dict:
+            raise ValueError(
+                f"Simulation metadata column {output_name} conflicts with a standard result column."
+            )
+        results_dict[output_name] = np.atleast_1d(sample_states[state_name]).tolist()
+
+    for col in simulation_info.param_cols or ():
+        if col in metadata_param_cols:
+            continue
+        if col not in sample_states:
+            raise KeyError(
+                f"Parameter column {col} not found in model parameters. "
+                f"Available parameters are: {sample_states.get_all_params_names()}."
+            )
+        results_dict[col.replace(".", "_")] = np.atleast_1d(sample_states[col]).tolist()
 
     # Set up the nested array for the per-observation data, including ObsTable information.
     nested_index = []
@@ -410,7 +435,7 @@ def _simulate_lightcurves_batch(simulation_info):
     logger.info("Simulating light curves for each object.")
     for idx, state in tqdm(
         enumerate(sample_states),
-        total=num_samples,
+        total=realized_num_samples,
         desc="Simulating",
         unit="obj",
         disable=not simulation_info.progress_bar,
@@ -545,7 +570,7 @@ def _simulate_lightcurves_batch(simulation_info):
 
     # Create the nested frame and either save it to a file or return it directly.
     logger.info("Compiling results.")
-    results = NestedFrame(data=results_dict, index=[i for i in range(num_samples)])
+    results = NestedFrame(data=results_dict, index=range(realized_num_samples))
     nested_frame = pd.DataFrame(data=nested_dict, index=nested_index)
     results = results.join_nested(nested_frame, "lightcurve")
 
@@ -642,7 +667,8 @@ def simulate_lightcurves(
         sampled with each draw. This object's parameters (e.g., ra, dec) will be saved
         to the result columns.
     num_samples : int
-        The number of samples.
+        The number of initially requested parameter sets. State expansion during
+        sampling can produce more result rows.
     survey_info : SurveyInfo, ObsTable, List of SurveyInfo, or List of ObsTable
         The SurveyInfo object(s) from which to extract information for the samples. If ObsTables
         are passed instead, they will be converted to SurveyInfo objects internally using

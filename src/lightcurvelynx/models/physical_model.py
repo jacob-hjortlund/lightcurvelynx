@@ -33,6 +33,13 @@ class BasePhysicalModel(ParameterizedNode, ABC):
 
     Physical models also support adding and applying a variety of effects, such as redshift.
 
+    Attributes
+    ----------
+    simulation_metadata_params : tuple of str
+        Names of outer-model parameters explicitly promoted to top-level
+        ``simulate_lightcurves`` result metadata. Metadata is never inferred from
+        parameter names.
+
     Parameterized values include:
 
     * dec - The object's declination in degrees.
@@ -62,6 +69,8 @@ class BasePhysicalModel(ParameterizedNode, ABC):
     **kwargs : dict, optional
         Any additional keyword arguments.
     """
+
+    simulation_metadata_params: tuple[str, ...] = ()
 
     def __init__(
         self,

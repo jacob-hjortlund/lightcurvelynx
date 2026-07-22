@@ -2,10 +2,12 @@ import tempfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
-import lightcurvelynx.simulate as simulate_module
 import numpy as np
 import pandas as pd
 import pytest
+from nested_pandas import NestedFrame, read_parquet
+
+import lightcurvelynx.simulate as simulate_module
 from lightcurvelynx.astro_utils.mag_flux import mag2flux
 from lightcurvelynx.astro_utils.passbands import Passband, PassbandGroup
 from lightcurvelynx.astro_utils.spectrograph import Spectrograph
@@ -17,6 +19,7 @@ from lightcurvelynx.math_nodes.given_sampler import (
     TableSampler,
 )
 from lightcurvelynx.math_nodes.np_random import NumpyRandomFunc
+from lightcurvelynx.math_nodes.state_expansion_node import StateExpansionNode
 from lightcurvelynx.models.basic_models import ConstantSEDModel, SinWaveModel, StepModel
 from lightcurvelynx.models.physical_model import SEDModel
 from lightcurvelynx.models.static_sed_model import StaticBandfluxModel
@@ -32,7 +35,77 @@ from lightcurvelynx.simulate import (
     simulate_lightcurves,
 )
 from lightcurvelynx.survey_info import SurveyInfo
-from nested_pandas import NestedFrame, read_parquet
+
+
+class _ExpandedConstantSEDModel(ConstantSEDModel):
+    simulation_metadata_params = ("system_id", "image_id")
+
+    def __init__(self, *, repeats, **kwargs):
+        super().__init__(brightness=10.0, **kwargs)
+        self.sample_calls = []
+        self.expansion = StateExpansionNode(
+            repeats=repeats,
+            node_label="test_expansion",
+        )
+        self.add_parameter("system_id", self.expansion.org_inds, allow_gradient=False)
+        self.add_parameter("image_id", self.expansion.sub_inds, allow_gradient=False)
+
+    def sample_parameters(self, *args, num_samples=1, sample_offset=0, **kwargs):
+        self.sample_calls.append((num_samples, sample_offset))
+        return super().sample_parameters(
+            *args,
+            num_samples=num_samples,
+            sample_offset=sample_offset,
+            **kwargs,
+        )
+
+
+class _SynchronousExecutor:
+    def map(self, function, iterable):
+        return [function(item) for item in iterable]
+
+
+def _make_expansion_survey():
+    passbands = PassbandGroup(
+        [
+            Passband(
+                np.array([[4_000.0, 0.5], [5_000.0, 1.0], [6_000.0, 0.5]]),
+                "test",
+                "g",
+            )
+        ]
+    )
+    observations = FakeObsTable(
+        {
+            "time": [10.0],
+            "ra": [12.0],
+            "dec": [-5.0],
+            "filter": ["g"],
+        },
+        bandflux_error=0.0,
+        radius=1.0,
+    )
+    return SurveyInfo(
+        obstable=observations,
+        passbands=passbands,
+        noise_model=GivenNoiseModel(),
+    )
+
+
+def _make_expanding_model():
+    repeats = GivenValueList(
+        [2, 3, 1],
+        stateful=False,
+        node_label="repeat_values",
+    )
+    return _ExpandedConstantSEDModel(
+        repeats=repeats,
+        ra=12.0,
+        dec=-5.0,
+        redshift=0.0,
+        t0=0.0,
+        node_label="expanded",
+    )
 
 
 def test_get_time_windows():
@@ -478,6 +551,110 @@ def test_simulate_lightcurves(test_data_dir):
     assert "source2.dec" in str(excinfo.value)
 
 
+def test_simulate_lightcurves_uses_realized_sample_count():
+    """Test that expanded graph states determine the number of result rows."""
+    model = _make_expanding_model()
+
+    results = simulate_lightcurves(
+        model,
+        3,
+        _make_expansion_survey(),
+        param_cols=["expanded.system_id", "expanded.image_id"],
+        progress_bar=False,
+    )
+
+    assert model.sample_calls == [(3, 0)]
+    assert len(results) == 6
+    np.testing.assert_array_equal(results["id"], np.arange(6))
+    np.testing.assert_array_equal(results["system_id"], [0, 0, 1, 1, 1, 2])
+    np.testing.assert_array_equal(results["image_id"], [0, 1, 0, 1, 2, 0])
+    assert "expanded_system_id" not in results
+    assert "expanded_image_id" not in results
+    assert len(results["params"]) == 6
+
+
+def test_simulation_metadata_requires_explicit_opt_in():
+    """Test that parameter names alone do not promote simulation metadata."""
+    model = ConstantSEDModel(
+        brightness=10.0,
+        ra=12.0,
+        dec=-5.0,
+        redshift=0.0,
+        t0=0.0,
+        node_label="ordinary",
+    )
+    model.add_parameter("system_id", 17, allow_gradient=False)
+    model.add_parameter("image_id", 4, allow_gradient=False)
+
+    results = simulate_lightcurves(
+        model,
+        1,
+        _make_expansion_survey(),
+        progress_bar=False,
+    )
+
+    assert model.simulation_metadata_params == ()
+    assert "system_id" not in results
+    assert "image_id" not in results
+    assert results["params"].iloc[0]["ordinary.system_id"] == 17
+    assert results["params"].iloc[0]["ordinary.image_id"] == 4
+
+
+def test_expanded_simulation_batches_requested_systems():
+    """Test that batching and offsets use requested system counts."""
+    model = _make_expanding_model()
+    serial = simulate_lightcurves(model, 3, _make_expansion_survey(), progress_bar=False)
+    model.sample_calls.clear()
+
+    batched = simulate_lightcurves(
+        model,
+        3,
+        _make_expansion_survey(),
+        executor=_SynchronousExecutor(),
+        batch_size=2,
+        progress_bar=False,
+    )
+
+    assert model.sample_calls == [(2, 0), (1, 2)]
+    np.testing.assert_array_equal(batched["id"], np.arange(6))
+    np.testing.assert_array_equal(batched["system_id"], [0, 0, 1, 1, 1, 2])
+    np.testing.assert_array_equal(batched["image_id"], [0, 1, 0, 1, 2, 0])
+    for column in ("ra", "dec", "t0", "system_id", "image_id"):
+        np.testing.assert_allclose(batched[column], serial[column])
+
+
+def test_expanded_simulation_replay_uses_realized_count():
+    """Test replay validation and rows use the realized graph-state count."""
+    model = _make_expanding_model()
+    results = simulate_lightcurves(model, 3, _make_expansion_survey(), progress_bar=False)
+    state = GraphState.from_list(results["params"].values)
+    model.sample_calls.clear()
+
+    with pytest.raises(ValueError, match="Graph state has 6 samples"):
+        simulate_lightcurves(
+            model,
+            3,
+            _make_expansion_survey(),
+            graph_state=state,
+            progress_bar=False,
+        )
+
+    replay = simulate_lightcurves(
+        model,
+        6,
+        _make_expansion_survey(),
+        graph_state=state,
+        progress_bar=False,
+    )
+    assert model.sample_calls == []
+    np.testing.assert_array_equal(replay["system_id"], results["system_id"])
+    np.testing.assert_array_equal(replay["image_id"], results["image_id"])
+    np.testing.assert_allclose(
+        replay["lightcurve.flux_perfect"],
+        results["lightcurve.flux_perfect"],
+    )
+
+
 def test_replay_simulate_lightcurves(test_data_dir):
     """Test an end to end run of simulating the light curves using a given state."""
     # Load the OpSim data.
@@ -614,6 +791,32 @@ def test_simulate_lightcurves_uses_single_progress_bar(test_data_dir, monkeypatc
     assert DummyTqdm.instances[0].total == 5
     assert sum(DummyTqdm.instances[0].updates) == 5
 
+    DummyTqdm.instances.clear()
+
+    expanded_model = _make_expanding_model()
+    _ = simulate_lightcurves(
+        expanded_model,
+        3,
+        _make_expansion_survey(),
+        progress_bar=True,
+    )
+    assert len(DummyTqdm.instances) == 1
+    assert DummyTqdm.instances[0].total == 6
+
+    DummyTqdm.instances.clear()
+
+    _ = simulate_lightcurves(
+        expanded_model,
+        3,
+        _make_expansion_survey(),
+        executor=_SynchronousExecutor(),
+        batch_size=2,
+        progress_bar=True,
+    )
+    assert len(DummyTqdm.instances) == 1
+    assert DummyTqdm.instances[0].total == 3
+    assert sum(DummyTqdm.instances[0].updates) == 3
+
 
 def test_simulate_lightcurves_to_file(test_data_dir):
     """Test an end to end run of simulating the light curves, saving them to a file."""
@@ -663,6 +866,32 @@ def test_simulate_lightcurves_to_file(test_data_dir):
         assert np.allclose(results_df["dec"].to_numpy(), opsim_db["dec"].values[0:5])
         assert np.allclose(results_df["z"].to_numpy(), 0.0)
         assert np.allclose(results_df["t0"].to_numpy(), 0.0)
+
+
+def test_expanded_simulation_file_parts_preserve_local_ids(tmp_path):
+    """Test expanded file parts retain batch-local IDs and global system IDs."""
+    output_path = tmp_path / "expanded.parquet"
+
+    part_paths = simulate_lightcurves(
+        _make_expanding_model(),
+        3,
+        _make_expansion_survey(),
+        executor=_SynchronousExecutor(),
+        batch_size=2,
+        output_file_path=output_path,
+        progress_bar=False,
+    )
+
+    assert part_paths == [
+        tmp_path / "expanded_part0.parquet",
+        tmp_path / "expanded_part1.parquet",
+    ]
+    first_part = read_parquet(part_paths[0])
+    second_part = read_parquet(part_paths[1])
+    np.testing.assert_array_equal(first_part["system_id"], [0, 0, 1, 1, 1])
+    np.testing.assert_array_equal(second_part["system_id"], [2])
+    np.testing.assert_array_equal(first_part["id"], np.arange(5))
+    np.testing.assert_array_equal(second_part["id"], [0])
 
 
 def test_simulate_lightcurves_reproduce(test_data_dir):
