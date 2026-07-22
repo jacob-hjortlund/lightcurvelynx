@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -100,6 +101,10 @@ class _FakeTensor:
         """Return the stored NumPy representation."""
         return self.values
 
+    def __getitem__(self, key):
+        """Return a tensor double for indexed root-refinement values."""
+        return _FakeTensor(self.values[key])
+
 
 class _FakeTorch:
     """Provide tensor conversion and absolute-value operations under test."""
@@ -116,6 +121,89 @@ class _FakeTorch:
     def abs(values):
         """Return elementwise absolute values through the tensor protocol."""
         return _FakeTensor(np.abs(values.values))
+
+
+class _RecordingTorch(_FakeTorch):
+    """Record scalar values and dtypes used during lens-system realization."""
+
+    events = None
+
+    @classmethod
+    def as_tensor(cls, values, dtype=None):
+        """Record tensorization before returning the minimal tensor double."""
+        normalized = np.asarray(values)
+        recorded_value = normalized.item() if normalized.ndim == 0 else normalized.copy()
+        if cls.events is not None:
+            cls.events.append(("as_tensor", recorded_value, dtype))
+        return _FakeTensor(values)
+
+
+class _RecordingParameter:
+    """Record dtype staticization for one fake Caustics parameter."""
+
+    def __init__(self, value, *, events=None, owner=None, name=None):
+        self.value = _FakeTensor(value)
+        self.dtype_calls = []
+        self.events = events
+        self.owner = owner
+        self.name = name
+
+    def to(self, *, dtype):
+        """Record the requested dtype and preserve parameter identity."""
+        self.dtype_calls.append(dtype)
+        if self.events is not None:
+            self.events.append(("parameter_to", self.owner, self.name, dtype))
+        return self
+
+
+class _RecordingSIS:
+    """Record recursive construction and atomic staticization for an SIS."""
+
+    events = None
+
+    def __init__(self, cosmology, z_l, z_s, x0, y0, Rein, s=0.0, name=None):
+        self.cosmology = cosmology
+        self.z_l = z_l
+        self.z_s = z_s
+        self.x0 = _RecordingParameter(
+            x0,
+            events=self.events,
+            owner=name,
+            name="x0",
+        )
+        self.y0 = _RecordingParameter(
+            y0,
+            events=self.events,
+            owner=name,
+            name="y0",
+        )
+        self.Rein = _RecordingParameter(
+            Rein,
+            events=self.events,
+            owner=name,
+            name="Rein",
+        )
+        self.s = s
+        self.name = name
+        self.static_calls = 0
+
+    def to_static(self):
+        """Record conversion of the realized atomic lens to static mode."""
+        self.static_calls += 1
+        if self.events is not None:
+            self.events.append(("to_static", self.name))
+        return self
+
+
+class _RecordingSinglePlane:
+    """Record redshift ownership and recursive names for a fake lens plane."""
+
+    def __init__(self, cosmology, z_l, z_s, lenses, name=None):
+        self.cosmology = cosmology
+        self.z_l = z_l
+        self.z_s = z_s
+        self.lenses = tuple(lenses)
+        self.name = name
 
 
 class _FakeGeometryAdapter:
@@ -244,6 +332,25 @@ def fake_caustics_registry(monkeypatch):
     )
     monkeypatch.setattr(caustics_models, "_import_caustics", lambda: registry)
     return registry
+
+
+@pytest.fixture
+def recording_caustics_runtime(monkeypatch):
+    """Install recording constructors for full recursive lens realization."""
+    events = []
+    monkeypatch.setattr(_RecordingSIS, "events", events)
+    monkeypatch.setattr(_RecordingTorch, "events", events)
+    runtime = SimpleNamespace(
+        SIS=_RecordingSIS,
+        SinglePlane=_RecordingSinglePlane,
+    )
+    monkeypatch.setattr(caustics_models, "_import_caustics", lambda: runtime)
+    monkeypatch.setattr(
+        caustics_models,
+        "_import_caustics_dependencies",
+        lambda: (runtime, _RecordingTorch),
+    )
+    return SimpleNamespace(module=runtime, events=events)
 
 
 @pytest.fixture
@@ -825,6 +932,165 @@ def test_lens_graph_inputs_preserve_mapping_order_and_recursive_paths(fake_caust
     assert "lens_lenses" not in tuple(name for name, _ in flattened)
 
 
+def test_build_lens_system_owns_root_redshifts_names_staticization_and_adapter_values(
+    recording_caustics_runtime,
+    fixed_cosmology,
+):
+    """Realize one nested tree with node-owned redshifts and positional metadata."""
+    events = recording_caustics_runtime.events
+    first = caustics_models.CausticsLensSpec(
+        "SIS",
+        {"x0": -1.0, "y0": 0.25, "Rein": 1.5, "s": 0.0},
+    )
+    nested_atomic = caustics_models.CausticsLensSpec(
+        "SIS",
+        {"x0": 2.0, "y0": -0.5, "Rein": 0.75, "s": 0.1},
+    )
+    inner = caustics_models.CausticsLensSpec(
+        "SinglePlane",
+        {"lenses": (nested_atomic,), "name": "configured-inner"},
+    )
+    root = caustics_models.CausticsLensSpec(
+        "SinglePlane",
+        {"z_l": 0.45, "lenses": (first, inner)},
+    )
+    values = {
+        "lens_z_l": 0.45,
+        "lens_0_x0": -1.0,
+        "lens_0_y0": 0.25,
+        "lens_0_Rein": 1.5,
+        "lens_0_s": 0.0,
+        "lens_1_name": "configured-inner",
+        "lens_1_0_x0": 2.0,
+        "lens_1_0_y0": -0.5,
+        "lens_1_0_Rein": 0.75,
+        "lens_1_0_s": 0.1,
+        "source_redshift": 1.8,
+    }
+
+    lens, adapter, adapter_values = caustics_models._build_lens_system(
+        root,
+        cosmology=fixed_cosmology,
+        values=values,
+    )
+
+    first_lens = lens.lenses[0]
+    inner_lens = lens.lenses[1]
+    nested_lens = inner_lens.lenses[0]
+    assert lens.name == "lens"
+    assert first_lens.name == "lens_0"
+    assert inner_lens.name == "configured-inner"
+    assert nested_lens.name == "lens_1_0"
+    assert all(
+        realized.cosmology is fixed_cosmology for realized in (lens, first_lens, inner_lens, nested_lens)
+    )
+    np.testing.assert_array_equal(lens.z_l.values, 0.45)
+    np.testing.assert_array_equal(lens.z_s.values, 1.8)
+    assert all("z_s" not in spec.parameters for spec in (root, first, inner, nested_atomic))
+    assert first_lens.z_l is first_lens.z_s is None
+    assert inner_lens.z_l is inner_lens.z_s is None
+    assert nested_lens.z_l is nested_lens.z_s is None
+    assert first_lens.static_calls == nested_lens.static_calls == 1
+    for atomic_lens in (first_lens, nested_lens):
+        for parameter in (atomic_lens.x0, atomic_lens.y0, atomic_lens.Rein):
+            assert parameter.dtype_calls == [np.float64]
+    assert events == [
+        ("as_tensor", 1.8, np.float64),
+        ("as_tensor", 0.45, np.float64),
+        ("parameter_to", "lens_0", "x0", np.float64),
+        ("parameter_to", "lens_0", "y0", np.float64),
+        ("parameter_to", "lens_0", "Rein", np.float64),
+        ("to_static", "lens_0"),
+        ("parameter_to", "lens_1_0", "x0", np.float64),
+        ("parameter_to", "lens_1_0", "y0", np.float64),
+        ("parameter_to", "lens_1_0", "Rein", np.float64),
+        ("to_static", "lens_1_0"),
+    ]
+
+    assert isinstance(adapter, caustics_models._SinglePlaneGeometryAdapter)
+    assert tuple(component.name for component in adapter.components) == (
+        "lens_0",
+        "lens_1",
+    )
+    first_adapter = adapter.components[0].adapter
+    nested_adapter = adapter.components[1].adapter
+    assert tuple(component.name for component in nested_adapter.components) == ("lens_1_0",)
+    assert first_adapter.jacobian_mask_points(adapter_values["lens_0"]) == ((-1.0, 0.25),)
+    assert first_adapter.root_recovery_points(adapter_values["lens_0"]) == ((-1.0, 0.25),)
+    assert first_adapter.pseudo_caustic_generators(adapter_values["lens_0"]) == (
+        caustics_models._PseudoCausticGenerator((-1.0, 0.25)),
+    )
+    nested_atomic_adapter = nested_adapter.components[0].adapter
+    nested_atomic_values = adapter_values["lens_1"]["lens_1_0"]
+    assert nested_atomic_adapter.jacobian_mask_points(nested_atomic_values) == ()
+    assert nested_atomic_adapter.root_recovery_points(nested_atomic_values) == ()
+    assert nested_atomic_adapter.pseudo_caustic_generators(nested_atomic_values) == ()
+    assert tuple(adapter_values) == ("lens_0", "lens_1")
+    assert tuple(adapter_values["lens_0"]) == ("x0", "y0", "Rein", "s")
+    assert tuple(adapter_values["lens_1"]) == ("lens_1_0",)
+    assert tuple(nested_atomic_values) == ("x0", "y0", "Rein", "s")
+    assert dict(adapter_values["lens_0"]) == {
+        "x0": -1.0,
+        "y0": 0.25,
+        "Rein": 1.5,
+        "s": 0.0,
+    }
+    assert dict(adapter_values["lens_1"]["lens_1_0"]) == {
+        "x0": 2.0,
+        "y0": -0.5,
+        "Rein": 0.75,
+        "s": 0.1,
+    }
+    with pytest.raises(TypeError, match="does not support item assignment"):
+        adapter_values["new"] = {}
+    with pytest.raises(TypeError, match="does not support item assignment"):
+        adapter_values["lens_0"]["x0"] = 99.0
+    with pytest.raises(TypeError, match="does not support item assignment"):
+        adapter_values["lens_1"]["new"] = {}
+    with pytest.raises(TypeError, match="does not support item assignment"):
+        nested_atomic_values["x0"] = 99.0
+
+
+def test_build_lens_system_rejects_exact_non_affine_center_collision(
+    recording_caustics_runtime,
+    fixed_cosmology,
+):
+    """Name both generated components when realized non-affine centers collide."""
+    del recording_caustics_runtime
+    children = tuple(
+        caustics_models.CausticsLensSpec(
+            "SIS",
+            {"x0": 0.0, "y0": 0.0, "Rein": radius},
+        )
+        for radius in (1.0, 2.0)
+    )
+    root = caustics_models.CausticsLensSpec(
+        "SinglePlane",
+        {"z_l": 0.5, "lenses": children},
+    )
+    values = {
+        "lens_z_l": 0.5,
+        "lens_0_x0": 1.25,
+        "lens_0_y0": -0.75,
+        "lens_0_Rein": 1.0,
+        "lens_1_x0": 1.25,
+        "lens_1_y0": -0.75,
+        "lens_1_Rein": 2.0,
+        "source_redshift": 2.0,
+    }
+
+    with pytest.raises(ValueError) as error:
+        caustics_models._build_lens_system(
+            root,
+            cosmology=fixed_cosmology,
+            values=values,
+        )
+
+    message = str(error.value)
+    assert "Non-affine lens components 'lens_0' and 'lens_1'" in message
+    assert "exactly coincident centers" in message
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -924,6 +1190,110 @@ def test_recovery_neighborhoods_handle_empty_and_occupied_inputs():
         ),
         [False, False, False, True],
     )
+
+
+def test_recovery_image_seeds_selects_nearest_circle_point_per_recovery_point(
+    monkeypatch,
+):
+    """Choose each seed from its own mapped circle with no cross-point coupling."""
+    recovery_points = np.array([[1.0, 1.0], [4.0, -2.0]])
+    source_position = np.array([2.0, -3.0])
+    selected_indices = (64, 128)
+    traced_circles = []
+
+    def raytrace_curve(lens, circle):
+        assert lens is fake_lens
+        traced_circles.append(circle.copy())
+        mapped = np.full((256, 2), 100.0)
+        mapped[selected_indices[len(traced_circles) - 1]] = source_position
+        return mapped
+
+    fake_lens = object()
+    monkeypatch.setattr(caustics_models, "_raytrace_curve", raytrace_curve)
+
+    empty = caustics_models._recovery_image_seeds(
+        fake_lens,
+        (),
+        source_x=source_position[0],
+        source_y=source_position[1],
+        radius=0.5,
+    )
+    seeds = caustics_models._recovery_image_seeds(
+        fake_lens,
+        recovery_points,
+        source_x=source_position[0],
+        source_y=source_position[1],
+        radius=0.5,
+    )
+
+    assert empty.shape == (0, 2)
+    assert len(traced_circles) == 2
+    for circle, center in zip(traced_circles, recovery_points, strict=True):
+        assert circle.shape == (256, 2)
+        np.testing.assert_allclose(np.linalg.norm(circle - center, axis=1), 0.5)
+    np.testing.assert_allclose(seeds, [[1.0, 1.5], [3.5, -2.0]], atol=1.0e-15)
+
+
+def test_refine_image_seeds_runs_eight_passes_then_hands_roots_to_certification(
+    monkeypatch,
+):
+    """Preserve paired roots through the fixed refinement count and handoff."""
+    rootfind_calls = []
+    raytrace = object()
+    lens = SimpleNamespace(raytrace=raytrace)
+    beta_x = _FakeTensor(0.25)
+    beta_y = _FakeTensor(-0.5)
+    recovery_points = np.array([[0.0, 0.0], [10.0, 10.0]])
+
+    def rootfind(image_x, image_y, passed_beta_x, passed_beta_y, passed_raytrace):
+        rootfind_calls.append((image_x.values.copy(), image_y.values.copy()))
+        assert passed_beta_x is beta_x
+        assert passed_beta_y is beta_y
+        assert passed_raytrace is raytrace
+        return _FakeTensor(np.column_stack((image_x.values + 1.0, image_y.values - 1.0)))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "caustics.lenses.func",
+        SimpleNamespace(forward_raytrace_rootfind=rootfind),
+    )
+    certification_calls = []
+    certified = np.array([[9.0, -6.0]])
+
+    def certify(*args):
+        certification_calls.append(args)
+        return certified
+
+    monkeypatch.setattr(caustics_models, "_validated_recovery_images", certify)
+
+    result = caustics_models._refine_image_seeds(
+        lens,
+        _FakeTorch,
+        np.array([[1.0, 2.0], [3.0, 4.0]]),
+        recovery_points,
+        beta_x,
+        beta_y,
+        0.01,
+        0.2,
+    )
+
+    assert caustics_models._RECOVERY_ROOT_REFINEMENTS == 8
+    assert len(rootfind_calls) == 8
+    np.testing.assert_array_equal(rootfind_calls[0][0], [1.0, 3.0])
+    np.testing.assert_array_equal(rootfind_calls[0][1], [2.0, 4.0])
+    np.testing.assert_array_equal(rootfind_calls[-1][0], [8.0, 10.0])
+    np.testing.assert_array_equal(rootfind_calls[-1][1], [-5.0, -3.0])
+    assert len(certification_calls) == 1
+    handoff = certification_calls[0]
+    assert handoff[0] is lens
+    assert handoff[1] is _FakeTorch
+    np.testing.assert_array_equal(handoff[2].values, [9.0, 11.0])
+    np.testing.assert_array_equal(handoff[3].values, [-6.0, -4.0])
+    assert handoff[4] is recovery_points
+    assert handoff[5] is beta_x
+    assert handoff[6] is beta_y
+    assert handoff[7:] == (0.01, 0.2)
+    assert result is certified
 
 
 def test_validated_recovery_images_applies_strict_residual_and_inclusive_locality():
@@ -1050,6 +1420,113 @@ def test_smooth_cusp_geometry_adapter_exposes_atomic_capabilities():
     assert adapter.axisymmetry_center({}) is None
     assert adapter.preserves_axisymmetry({}) is False
     assert adapter.reference_num_images({}) == 1
+
+
+def test_registered_sie_factory_derives_extent_and_unsoftened_policy():
+    """Map realized SIE tensors to ellipticity, scale, and singular policies."""
+    lens = SimpleNamespace(
+        x0=_RecordingParameter(1.0),
+        y0=_RecordingParameter(-2.0),
+        Rein=_RecordingParameter(2.0),
+        q=_RecordingParameter(0.25),
+        s=0.0,
+    )
+    registration = caustics_models._LENS_MODEL_REGISTRY["SIE"]
+
+    adapter = registration.geometry_factory(lens, {})
+
+    assert registration.affine is False
+    assert adapter.search_center({}) == (1.0, -2.0)
+    assert adapter.resolution_scale({}) == 2.0
+    assert adapter.initial_fov({}) == pytest.approx(8.8)
+    assert adapter.jacobian_mask_points({}) == ((1.0, -2.0),)
+    assert adapter.root_recovery_points({}) == ((1.0, -2.0),)
+    assert adapter.pseudo_caustic_generators({}) == (caustics_models._PseudoCausticGenerator((1.0, -2.0)),)
+    assert adapter.axisymmetry_center({}) is None
+
+
+@pytest.mark.parametrize(
+    ("slope", "singular", "pseudo_caustic"),
+    [(0.8, True, False), (1.0, True, True), (1.2, False, False)],
+)
+def test_registered_epl_factory_applies_slope_policy(
+    slope,
+    singular,
+    pseudo_caustic,
+):
+    """Distinguish EPL center recovery from its exact isothermal pseudo-loop."""
+    lens = SimpleNamespace(
+        x0=_RecordingParameter(0.5),
+        y0=_RecordingParameter(-0.25),
+        Rein=_RecordingParameter(2.0),
+        q=_RecordingParameter(1.0),
+        t=_RecordingParameter(slope),
+    )
+    registration = caustics_models._LENS_MODEL_REGISTRY["EPL"]
+
+    adapter = registration.geometry_factory(lens, {})
+
+    assert registration.affine is False
+    assert adapter.initial_fov({}) == pytest.approx(4.4)
+    assert bool(adapter.jacobian_mask_points({})) is singular
+    assert bool(adapter.root_recovery_points({})) is singular
+    assert bool(adapter.pseudo_caustic_generators({})) is pseudo_caustic
+    assert adapter.axisymmetry_center({}) == (0.5, -0.25)
+
+
+@pytest.mark.parametrize(
+    ("softening", "singular", "pseudo_caustic"),
+    [(0.0, True, False), (0.2, False, True)],
+)
+def test_registered_tnfw_factory_switches_softening_policy(
+    softening,
+    singular,
+    pseudo_caustic,
+):
+    """Invert TNFW singular-center and pseudo-caustic capabilities at softening."""
+    lens = SimpleNamespace(
+        x0=_RecordingParameter(-1.0),
+        y0=_RecordingParameter(3.0),
+        Rs=_RecordingParameter(0.5),
+        tau=_RecordingParameter(4.0),
+        s=softening,
+    )
+    registration = caustics_models._LENS_MODEL_REGISTRY["TNFW"]
+
+    adapter = registration.geometry_factory(lens, {})
+
+    assert registration.affine is False
+    assert adapter.resolution_scale({}) == 0.5
+    assert adapter.initial_fov({}) == pytest.approx(4.4)
+    assert bool(adapter.jacobian_mask_points({})) is singular
+    assert bool(adapter.root_recovery_points({})) is singular
+    assert bool(adapter.pseudo_caustic_generators({})) is pseudo_caustic
+    assert adapter.axisymmetry_center({}) == (-1.0, 3.0)
+
+
+@pytest.mark.parametrize(
+    ("gamma_1", "gamma_2", "preserves_axisymmetry"),
+    [(0.0, 0.0, True), (0.0, 0.1, False), (-0.2, 0.0, False)],
+)
+def test_registered_affine_factories_encode_exact_symmetry_policy(
+    gamma_1,
+    gamma_2,
+    preserves_axisymmetry,
+):
+    """Require exactly zero shear while every mass sheet preserves symmetry."""
+    shear_registration = caustics_models._LENS_MODEL_REGISTRY["ExternalShear"]
+    sheet_registration = caustics_models._LENS_MODEL_REGISTRY["MassSheet"]
+    shear_lens = SimpleNamespace(
+        gamma_1=_RecordingParameter(gamma_1),
+        gamma_2=_RecordingParameter(gamma_2),
+    )
+
+    shear = shear_registration.geometry_factory(shear_lens, {})
+    sheet = sheet_registration.geometry_factory(object(), {})
+
+    assert shear_registration.affine is sheet_registration.affine is True
+    assert shear.preserves_axisymmetry({}) is preserves_axisymmetry
+    assert sheet.preserves_axisymmetry({}) is True
 
 
 def test_affine_geometry_adapter_exposes_only_center_and_symmetry_policy():
@@ -1201,6 +1678,96 @@ def test_single_plane_geometry_adapter_aggregates_reference_count_excesses():
     }
 
     assert plane.reference_num_images(values) == 4
+
+
+def test_trace_pseudo_caustics_caps_initial_radius_halves_to_convergence_and_closes(
+    monkeypatch,
+):
+    """Apply the generator cap, refine by halves, and repeat the final vertex."""
+    values = object()
+    lens = object()
+    center = np.array([1.0, -2.0])
+    traced_loops = []
+
+    class GeneratorAdapter:
+        def pseudo_caustic_generators(self, passed_values):
+            assert passed_values is values
+            return (
+                caustics_models._PseudoCausticGenerator(
+                    center=tuple(center),
+                    max_initial_radius=0.4,
+                ),
+            )
+
+    def raytrace_curve(passed_lens, coordinates):
+        assert passed_lens is lens
+        traced_loops.append(coordinates.copy())
+        return coordinates.copy()
+
+    monkeypatch.setattr(caustics_models, "_raytrace_curve", raytrace_curve)
+
+    (curve,) = caustics_models._trace_pseudo_caustics(
+        lens,
+        GeneratorAdapter(),
+        values,
+        num_points=4,
+        epsilon=1.0,
+        geometry_tolerance=0.11,
+    )
+
+    assert len(traced_loops) == 3
+    np.testing.assert_allclose(
+        [np.linalg.norm(loop[0] - center) for loop in traced_loops],
+        [0.4, 0.2, 0.1],
+    )
+    np.testing.assert_allclose(
+        curve,
+        [
+            [1.1, -2.0],
+            [1.0, -1.9],
+            [0.9, -2.0],
+            [1.0, -2.1],
+            [1.1, -2.0],
+        ],
+        atol=1.0e-15,
+    )
+
+
+def test_trace_pseudo_caustics_reports_bounded_halving_exhaustion(monkeypatch):
+    """Stop after exactly 32 failed refinements and report final movement."""
+    lens = object()
+    traced_loops = []
+    adapter = SimpleNamespace(
+        pseudo_caustic_generators=lambda values: (caustics_models._PseudoCausticGenerator(center=(0.0, 0.0)),)
+    )
+
+    def nonconverging_raytrace(passed_lens, coordinates):
+        assert passed_lens is lens
+        traced_loops.append(coordinates.copy())
+        return coordinates + np.array([len(traced_loops), 0.0])
+
+    monkeypatch.setattr(
+        caustics_models,
+        "_raytrace_curve",
+        nonconverging_raytrace,
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        caustics_models._trace_pseudo_caustics(
+            lens,
+            adapter,
+            {},
+            num_points=4,
+            epsilon=0.8,
+            geometry_tolerance=0.01,
+        )
+
+    assert len(traced_loops) == 33
+    assert np.linalg.norm(traced_loops[0][0]) == pytest.approx(0.8)
+    assert np.linalg.norm(traced_loops[-1][0]) == pytest.approx(0.8 / 2**32)
+    message = str(error.value)
+    assert "did not converge after 32 refinements" in message
+    assert "final boundary change" in message
 
 
 def test_outer_grid_boundary_uses_rows_then_side_interiors():
@@ -1798,6 +2365,38 @@ def test_source_node_accepts_documented_constructor_boundaries(valid_sis_spec, f
     assert node.max_attempts == 1
 
 
+def test_validate_source_geometry_support_rejects_nested_steep_epl_with_component_path():
+    """Report the recursive generated name of the first unsupported EPL."""
+    ordinary_spec = SimpleNamespace(model="SIS", parameters={})
+    epl_spec = SimpleNamespace(model="EPL", parameters={})
+    inner_spec = SimpleNamespace(
+        model="SinglePlane",
+        parameters={"lenses": (epl_spec,)},
+    )
+    root_spec = SimpleNamespace(
+        model="SinglePlane",
+        parameters={"lenses": (ordinary_spec, inner_spec)},
+    )
+    epl_lens = SimpleNamespace(t=_RecordingParameter(1.0))
+    root_lens = SimpleNamespace(
+        lenses=(
+            SimpleNamespace(),
+            SimpleNamespace(lenses=(epl_lens,)),
+        )
+    )
+
+    assert caustics_models._validate_source_geometry_support(root_spec, root_lens) is None
+
+    epl_lens.t.value = _FakeTensor(1.2)
+    with pytest.raises(NotImplementedError) as error:
+        caustics_models._validate_source_geometry_support(root_spec, root_lens)
+
+    message = str(error.value)
+    assert "Component 'lens_1_0'" in message
+    assert "EPL slope t=1.2 > 1" in message
+    assert "Restrict the prior to t <= 1 or use CausticsLensImageNode" in message
+
+
 def test_image_node_rejects_non_spec_lens(fixed_cosmology):
     """Reject invalid public lens objects before registering graph inputs."""
     with pytest.raises(TypeError, match="lens must be a CausticsLensSpec"):
@@ -2179,6 +2778,140 @@ def test_source_boundary_certification_reports_nonconverging_snapshots(
     assert "current_critical_curve_fov=6.0 arcsec" in message
 
 
+def test_axisymmetric_boundary_certification_partitions_stable_point_and_converges(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Use three snapshots to separate a stable contraction from regular area."""
+    pytest.importorskip("shapely")
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale=1.0,
+        boundary_tolerance=0.1,
+        max_boundary_refinements=3,
+    )
+
+    class AxisymmetricAdapter(_FakeGeometryAdapter):
+        def axisymmetry_center(self, values):
+            assert values is adapter_values
+            return (100.0, -100.0)
+
+    point_curves = (
+        _closed_square(center=(0.0, 0.0), half_width=4.0),
+        _closed_square(center=(0.04, 0.0), half_width=2.0),
+        _closed_square(center=(0.08, 0.0), half_width=1.0),
+    )
+    regular_curves = (
+        _closed_square(center=(10.0, 0.0), half_width=1.0),
+        _closed_square(center=(10.02, 0.0), half_width=1.0),
+        _closed_square(center=(10.05, 0.0), half_width=1.0),
+    )
+    snapshots = [
+        caustics_models._BoundaryGeometry(
+            caustic_curves=(point_curve, regular_curve),
+            pseudo_caustic_curves=(),
+            critical_curve_fov=4.0 + index,
+            pixelscale=1.0 / 2**index,
+            pseudo_caustic_points=8 * 2**index,
+        )
+        for index, (point_curve, regular_curve) in enumerate(zip(point_curves, regular_curves, strict=True))
+    ]
+    calls = []
+    lens = object()
+    adapter = AxisymmetricAdapter()
+    adapter_values = object()
+
+    def boundary_snapshot(passed_lens, passed_adapter, passed_values, **kwargs):
+        assert passed_lens is lens
+        assert passed_adapter is adapter
+        assert passed_values is adapter_values
+        calls.append(kwargs)
+        return snapshots[len(calls) - 1]
+
+    monkeypatch.setattr(node, "_boundary_geometry_for_one_lens", boundary_snapshot)
+
+    previous, current, uncertainty, refinements = node._certified_boundary_geometry_for_one_lens(
+        lens,
+        adapter,
+        adapter_values,
+        sample_index=2,
+        pixelscale=1.0,
+    )
+
+    assert [call["pixelscale"] for call in calls] == [1.0, 0.5, 0.25]
+    assert [call["pseudo_caustic_points"] for call in calls] == [8, 16, 32]
+    assert [call["initial_fov"] for call in calls] == [None, 4.0, 5.0]
+    assert previous.caustic_curves == (regular_curves[1],)
+    assert current.caustic_curves == (regular_curves[2],)
+    np.testing.assert_allclose(previous.point_caustics, [[0.04, 0.0]])
+    np.testing.assert_allclose(current.point_caustics, [[0.08, 0.0]])
+    assert uncertainty == pytest.approx(0.03)
+    assert refinements == 2
+
+
+def test_axisymmetric_boundary_certification_exhausts_on_partition_count_change(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Treat a three-snapshot curve-count mismatch as unstable until exhaustion."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale=1.0,
+        boundary_tolerance=0.1,
+        max_boundary_refinements=2,
+    )
+
+    class AxisymmetricAdapter(_FakeGeometryAdapter):
+        def axisymmetry_center(self, values):
+            del values
+            return (0.0, 0.0)
+
+    snapshots = [
+        caustics_models._BoundaryGeometry(
+            caustic_curves=curves,
+            pseudo_caustic_curves=(),
+            critical_curve_fov=4.0 + index,
+            pixelscale=1.0 / 2**index,
+            pseudo_caustic_points=8 * 2**index,
+        )
+        for index, curves in enumerate(
+            (
+                (_closed_square(),),
+                (_closed_square(), _closed_square(center=(10.0, 0.0))),
+                (_closed_square(),),
+            )
+        )
+    ]
+    calls = []
+
+    def boundary_snapshot(*args, **kwargs):
+        del args
+        calls.append(kwargs)
+        return snapshots[len(calls) - 1]
+
+    monkeypatch.setattr(node, "_boundary_geometry_for_one_lens", boundary_snapshot)
+
+    with pytest.raises(RuntimeError) as error:
+        node._certified_boundary_geometry_for_one_lens(
+            object(),
+            AxisymmetricAdapter(),
+            {},
+            sample_index=6,
+            pixelscale=1.0,
+        )
+
+    assert len(calls) == 3
+    message = str(error.value)
+    assert "lens model 'SIS' sample 6 at node 'source_node'" in message
+    assert "last displacement=inf arcsec, topology_stable=False" in message
+    assert "previous_pixelscale=0.5 arcsec" in message
+    assert "current_pixelscale=0.25 arcsec" in message
+
+
 def test_source_compute_draws_all_subseeds_before_sample_work(
     monkeypatch,
     valid_sis_spec,
@@ -2436,6 +3169,189 @@ def test_image_node_resolves_absolute_and_relative_angular_settings(
     assert absolute._realized_angular_settings(adapter, {}) == (0.8, 0.3)
     assert relative._realized_angular_settings(adapter, {}) == (0.5, 0.2)
     assert capped._realized_angular_settings(adapter, {}) == (0.8, 0.3)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "error_type", "message"),
+    [
+        (
+            "source_x",
+            "not-numeric",
+            TypeError,
+            "source_x must realize to a scalar numeric value in arcseconds",
+        ),
+        (
+            "source_y",
+            object(),
+            TypeError,
+            "source_y must realize to a scalar numeric value in arcseconds",
+        ),
+        (
+            "source_x",
+            np.inf,
+            ValueError,
+            "source_x must realize to a finite value in arcseconds",
+        ),
+        (
+            "source_y",
+            np.nan,
+            ValueError,
+            "source_y must realize to a finite value in arcseconds",
+        ),
+    ],
+)
+def test_image_solve_validates_realized_source_coordinates_before_lens_build(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+    name,
+    value,
+    error_type,
+    message,
+):
+    """Assign conversion and finiteness failures to each source coordinate."""
+    node = _image_node(valid_sis_spec, fixed_cosmology)
+    values = _image_values()
+    values[name] = value
+    monkeypatch.setattr(
+        caustics_models,
+        "_build_lens_system",
+        lambda *args, **kwargs: pytest.fail("invalid coordinates must fail before lens build"),
+    )
+
+    with pytest.raises(error_type, match=message):
+        node._solve_one(values)
+
+
+@pytest.mark.parametrize("expected_num_images", [1.5, np.int64(1), 5])
+def test_image_solve_rejects_invalid_realized_expected_counts_before_lens_build(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+    expected_num_images,
+):
+    """Require a realized integer count within the configured inclusive range."""
+    node = _image_node(valid_sis_spec, fixed_cosmology)
+    monkeypatch.setattr(
+        caustics_models,
+        "_build_lens_system",
+        lambda *args, **kwargs: pytest.fail("invalid count must fail before lens build"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="expected_num_images must be None or an integer between min_images and max_images",
+    ):
+        node._solve_one(_image_values(expected_num_images=expected_num_images))
+
+
+@pytest.mark.parametrize(
+    ("realized_fov", "expected_initial_fov", "uses_adapter"),
+    [(None, 9.0, True), ("5.0", 7.5, False)],
+)
+def test_image_solve_derives_none_fov_or_converts_explicit_fov(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+    realized_fov,
+    expected_initial_fov,
+    uses_adapter,
+):
+    """Derive only a realized ``None`` while accepting float-convertible FOVs."""
+    node = _image_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        fov_multiplier=1.5,
+        pixelscale=1.0,
+    )
+    lens = _ArrayLens([1.0, 2.0], [0.0, 1.0])
+    adapter_values = object()
+
+    class RecordingAdapter(_FakeGeometryAdapter):
+        def __init__(self):
+            self.initial_fov_calls = []
+
+        def initial_fov(self, values):
+            self.initial_fov_calls.append(values)
+            return 6.0
+
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(
+        caustics_models,
+        "_build_lens_system",
+        lambda *args, **kwargs: (lens, adapter, adapter_values),
+    )
+    monkeypatch.setattr(
+        caustics_models,
+        "_import_caustics_dependencies",
+        lambda: (object(), _FakeTorch),
+    )
+    forward_calls = []
+
+    def forward(*args, **kwargs):
+        del args
+        forward_calls.append(kwargs)
+        return np.array([[0.0, 0.0], [1.0, 0.0]])
+
+    monkeypatch.setattr(node, "_forward_raytrace_images", forward)
+
+    result = node._solve_one(_image_values(fov=realized_fov))
+
+    assert adapter.initial_fov_calls == ([adapter_values] if uses_adapter else [])
+    assert len(forward_calls) == 1
+    assert forward_calls[0]["current_fov"] == expected_initial_fov
+    assert result[4]["solver_fov"] == expected_initial_fov
+
+
+@pytest.mark.parametrize(
+    ("realized_fov", "error_type", "message"),
+    [
+        (object(), TypeError, "fov must realize to None or a scalar numeric value"),
+        (0.0, ValueError, "fov must realize to None or a positive finite value"),
+        (-1.0, ValueError, "fov must realize to None or a positive finite value"),
+        (np.inf, ValueError, "fov must realize to None or a positive finite value"),
+    ],
+)
+def test_image_solve_rejects_invalid_explicit_realized_fov(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+    realized_fov,
+    error_type,
+    message,
+):
+    """Reject explicit FOV conversion and positive-finite domain failures."""
+    node = _image_node(valid_sis_spec, fixed_cosmology)
+    _patch_image_runtime(monkeypatch, _FakeLens(), _FakeGeometryAdapter())
+    monkeypatch.setattr(
+        node,
+        "_forward_raytrace_images",
+        lambda *args, **kwargs: pytest.fail("invalid FOV must fail before solving"),
+    )
+
+    with pytest.raises(error_type, match=message):
+        node._solve_one(_image_values(fov=realized_fov))
+
+
+def test_image_solve_rejects_initial_fov_not_larger_than_realized_pixelscale(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Apply the realized FOV/scale relation before creating source tensors."""
+    node = _image_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale=2.0,
+        fov_multiplier=0.5,
+    )
+    _patch_image_runtime(monkeypatch, _FakeLens(), _FakeGeometryAdapter())
+
+    with pytest.raises(
+        ValueError,
+        match="Initial solver fov=2.0 arcsec must be larger than pixelscale=2.0 arcsec",
+    ):
+        node._solve_one(_image_values(fov=4.0))
 
 
 def test_image_one_attempt_uses_actual_spacing_and_sorts_all_observables(
@@ -2880,6 +3796,56 @@ def test_image_retryable_targeted_failure_retains_deficient_global_result(
     np.testing.assert_array_equal(image_x, [4.0, 0.0])
     assert diagnostics["image_count_deficit"] == 1
     assert diagnostics["solver_attempts"] == 2
+
+
+def test_image_unclassified_targeted_refinement_error_propagates_without_outer_retry(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Propagate a targeted exception outside both exact retry classifiers."""
+    node = _image_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        min_images=2,
+        expected_num_images=3,
+        max_fov_expansions=2,
+        max_pixelscale_refinements=2,
+    )
+    lens = _ArrayLens([1.0, 2.0], [0.0, 1.0])
+    _patch_image_runtime(
+        monkeypatch,
+        lens,
+        _RecoveryGeometryAdapter(((2.0, 0.0),)),
+    )
+    global_calls = []
+
+    def forward(*args, **kwargs):
+        del args
+        global_calls.append(kwargs)
+        return np.array([[0.0, 0.0], [4.0, 0.0]])
+
+    monkeypatch.setattr(node, "_forward_raytrace_images", forward)
+    monkeypatch.setattr(
+        caustics_models,
+        "_recovery_image_seeds",
+        lambda *args, **kwargs: np.array([[2.0, 0.0]]),
+    )
+    unexpected = ArithmeticError("targeted refinement produced invalid state")
+    refinement_calls = []
+
+    def refine(*args, **kwargs):
+        refinement_calls.append((args, kwargs))
+        raise unexpected
+
+    monkeypatch.setattr(caustics_models, "_refine_image_seeds", refine)
+
+    with pytest.raises(ArithmeticError) as error:
+        node._solve_one(_image_values(expected_num_images=3))
+
+    assert error.value is unexpected
+    assert len(global_calls) == 1
+    assert len(refinement_calls) == 1
 
 
 @pytest.mark.parametrize(
