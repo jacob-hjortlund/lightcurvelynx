@@ -11,6 +11,7 @@ import lightcurvelynx.simulate as simulate_module
 from lightcurvelynx.astro_utils.mag_flux import mag2flux
 from lightcurvelynx.astro_utils.passbands import Passband, PassbandGroup
 from lightcurvelynx.astro_utils.spectrograph import Spectrograph
+from lightcurvelynx.base_models import ParameterizedNode
 from lightcurvelynx.graph_state import GraphState
 from lightcurvelynx.math_nodes.basic_math_node import BasicMathNode
 from lightcurvelynx.math_nodes.given_sampler import (
@@ -621,6 +622,103 @@ def test_simulation_metadata_requires_explicit_opt_in():
     assert "image_id" not in results
     assert results["params"].iloc[0]["ordinary.system_id"] == 17
     assert results["params"].iloc[0]["ordinary.image_id"] == 4
+
+
+@pytest.mark.parametrize(
+    ("metadata_name", "state_name"),
+    [
+        ("system_id", "system.id"),
+        ("image_id", "image.id"),
+    ],
+)
+def test_param_cols_cannot_overwrite_normalized_simulation_metadata(metadata_name, state_name):
+    """Reject a distinct state name that normalizes over opted-in provenance."""
+    model = _make_expanding_model()
+    node_name, parameter_name = state_name.split(".")
+    shadow = ParameterizedNode(node_label=node_name)
+    shadow.add_parameter(parameter_name, 99)
+    model.add_parameter(
+        f"shadow_{metadata_name}",
+        getattr(shadow, parameter_name),
+        allow_gradient=False,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"Parameter column '{state_name}' normalizes to result column "
+            rf"'{metadata_name}', which conflicts with an existing or reserved result column\."
+        ),
+    ):
+        simulate_lightcurves(
+            model,
+            3,
+            _make_expansion_survey(),
+            param_cols=[state_name],
+            progress_bar=False,
+        )
+
+
+@pytest.mark.parametrize("reserved_name", ["lightcurve", "params", "spectra"])
+def test_param_cols_rejects_reserved_future_result_columns(reserved_name):
+    """Reject parameter output names reserved for later simulation columns."""
+    model = ConstantSEDModel(
+        brightness=10.0,
+        ra=12.0,
+        dec=-5.0,
+        redshift=0.0,
+        t0=0.0,
+        node_label="ordinary",
+    )
+    model.add_parameter(reserved_name, 17, allow_gradient=False)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"Parameter column '{reserved_name}' normalizes to result column "
+            rf"'{reserved_name}', which conflicts with an existing or reserved result column\."
+        ),
+    ):
+        simulate_lightcurves(
+            model,
+            1,
+            _make_expansion_survey(),
+            param_cols=[reserved_name],
+            progress_bar=False,
+        )
+
+
+def test_param_cols_rejects_distinct_names_with_duplicate_normalization():
+    """Reject two requested state names that normalize to one output name."""
+    model = ConstantSEDModel(
+        brightness=10.0,
+        ra=12.0,
+        dec=-5.0,
+        redshift=0.0,
+        t0=0.0,
+        node_label="ordinary",
+    )
+    first = ParameterizedNode(node_label="alpha")
+    first.add_parameter("beta_gamma", 11)
+    second = ParameterizedNode(node_label="alpha_beta")
+    second.add_parameter("gamma", 22)
+    model.add_parameter("first_shadow", first.beta_gamma, allow_gradient=False)
+    model.add_parameter("second_shadow", second.gamma, allow_gradient=False)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Parameter columns 'alpha.beta_gamma' and 'alpha_beta.gamma' "
+            "normalize to duplicate result column 'alpha_beta_gamma'\\."
+        ),
+    ):
+        simulate_lightcurves(
+            model,
+            1,
+            _make_expansion_survey(),
+            param_cols=["alpha.beta_gamma", "alpha_beta.gamma"],
+            progress_bar=False,
+        )
 
 
 @pytest.mark.parametrize("metadata_param", ["lightcurve", "params", "spectra"])

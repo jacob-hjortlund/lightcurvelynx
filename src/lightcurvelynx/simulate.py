@@ -29,7 +29,9 @@ class SimulationInfo:
         The model to draw from. This may have its own parameters which
         will be randomly sampled with each draw.
     num_samples : int
-        The number of samples.
+        The number of initially requested parameter sets for fresh sampling.
+        State expansion may produce more realized rows. For replay, this must
+        equal the supplied ``GraphState.num_samples``.
     survey_info : List of SurveyInfo
         The SurveyInfo objects from which to extract information for the samples.
     obs_time_window_offset : tuple(float, float), optional
@@ -363,7 +365,8 @@ def _simulate_lightcurves_batch(simulation_info):
     metadata_param_cols = {
         f"{model.node_string}.{param_name}": param_name for param_name in model.simulation_metadata_params
     }
-    reserved_result_cols = {*results_dict, "lightcurve", "params", "spectra"}
+    future_result_cols = {"lightcurve", "params", "spectra"}
+    reserved_result_cols = {*results_dict, *future_result_cols}
     for state_name, output_name in metadata_param_cols.items():
         if state_name not in sample_states:
             raise KeyError(
@@ -377,15 +380,32 @@ def _simulate_lightcurves_batch(simulation_info):
             )
         results_dict[output_name] = np.atleast_1d(sample_states[state_name]).tolist()
 
+    normalized_param_cols = {}
     for col in simulation_info.param_cols or ():
         if col in metadata_param_cols:
             continue
+        output_name = col.replace(".", "_")
         if col not in sample_states:
             raise KeyError(
                 f"Parameter column {col} not found in model parameters. "
                 f"Available parameters are: {sample_states.get_all_params_names()}."
             )
-        results_dict[col.replace(".", "_")] = np.atleast_1d(sample_states[col]).tolist()
+        previous_col = normalized_param_cols.get(output_name)
+        if previous_col is not None:
+            if previous_col == col:
+                continue
+            raise ValueError(
+                f"Parameter columns '{previous_col}' and '{col}' normalize to "
+                f"duplicate result column '{output_name}'."
+            )
+        if output_name in results_dict or output_name in future_result_cols:
+            raise ValueError(
+                f"Parameter column '{col}' normalizes to result column "
+                f"'{output_name}', which conflicts with an existing or reserved "
+                "result column."
+            )
+        normalized_param_cols[output_name] = col
+        results_dict[output_name] = np.atleast_1d(sample_states[col]).tolist()
 
     # Set up the nested array for the per-observation data, including ObsTable information.
     nested_index = []

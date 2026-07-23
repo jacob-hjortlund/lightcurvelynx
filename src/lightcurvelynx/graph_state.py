@@ -394,16 +394,21 @@ class GraphState:
         for full_name in all_param_full_names:
             node_name, param_name = full_name.split(".")
 
-            # Create a numpy array that is the concatenation of all the values
-            # from each of the GraphStates.
-            values_list = []
-            for current in graph_states:
-                if total_samples > 1 and current.num_samples == 1:
-                    current_values = np.expand_dims(current[full_name], axis=0)
-                else:
-                    current_values = np.atleast_1d(current[full_name])
-                values_list.append(current_values)
-            values = np.concatenate(values_list)
+            if total_samples == 1:
+                # Preserve the single sample exactly so a scalar remains
+                # distinguishable from a genuine one-component vector.
+                values = copy.deepcopy(graph_states[0][full_name])
+            else:
+                # Create a numpy array that is the concatenation of all the values
+                # from each of the GraphStates.
+                values_list = []
+                for current in graph_states:
+                    if current.num_samples == 1:
+                        current_values = np.expand_dims(current[full_name], axis=0)
+                    else:
+                        current_values = np.atleast_1d(current[full_name])
+                    values_list.append(current_values)
+                values = np.concatenate(values_list)
             result.set(node_name, param_name, values, force_copy=False, fixed=False)
         return result
 

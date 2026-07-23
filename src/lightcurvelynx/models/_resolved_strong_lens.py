@@ -8,6 +8,24 @@ from lightcurvelynx.effects.effect_model import EffectModel
 from lightcurvelynx.graph_state import GraphState
 from lightcurvelynx.models.physical_model import BasePhysicalModel
 
+_RESOLVED_OUTER_PARAMETER_NAMES = (
+    "ra",
+    "dec",
+    "redshift",
+    "t0",
+    "distance",
+    "system_id",
+    "image_id",
+    "source_x",
+    "source_y",
+    "lens_ra",
+    "lens_dec",
+    "image_x",
+    "image_y",
+    "macro_magnification",
+    "time_delay",
+)
+
 
 def _build_dependency_graph_without_mutation(source_model):
     """Inspect dependencies while preserving every reachable node identity."""
@@ -50,15 +68,25 @@ def _validate_source_for_resolved_lensing(source_model):
     if not isinstance(source_model, BasePhysicalModel):
         raise TypeError("source_model must be a BasePhysicalModel.")
 
-    reserved = [
+    reserved_setters = [
         name
         for name in ("base_ra", "base_dec", "base_t0", "macro_magnification")
         if name in source_model.setters
     ]
-    if reserved:
+    reserved_attributes = [
+        name
+        for name in ("base_ra", "base_dec", "base_t0", "macro_magnification")
+        if name not in source_model.setters and hasattr(source_model, name)
+    ]
+    if reserved_setters or reserved_attributes:
+        collision_details = []
+        if reserved_setters:
+            collision_details.append(f"registered parameters: {', '.join(reserved_setters)}")
+        if reserved_attributes:
+            collision_details.append(f"class attributes: {', '.join(reserved_attributes)}")
         raise ValueError(
             "source_model is already decorated or uses reserved resolved-lens "
-            f"parameters: {', '.join(reserved)}."
+            f"names ({'; '.join(collision_details)})."
         )
 
     dependency_graph, source_node_string = _build_dependency_graph_without_mutation(source_model)
@@ -74,6 +102,15 @@ def _validate_source_for_resolved_lensing(source_model):
                 f"{parameter_name} has dependent parameters: "
                 f"{', '.join(sorted(dependents))}."
             )
+
+
+def _validate_resolved_wrapper_parameter_names(wrapper_model):
+    collisions = [name for name in _RESOLVED_OUTER_PARAMETER_NAMES if hasattr(wrapper_model, name)]
+    if collisions:
+        details = ", ".join(f"outer parameter '{name}'" for name in collisions)
+        raise ValueError(
+            f"Cannot construct resolved strong lens because {details} conflicts with a class attribute."
+        )
 
 
 def _coerce_scalar_samples(value, num_samples, name):
@@ -148,6 +185,37 @@ def _normalized_image_rows(
     time_delays,
     num_images,
 ):
+    """Validate and normalize fixed-width resolved-image realizations.
+
+    Parameters
+    ----------
+    num_samples : int
+        Number of input system rows, ``S``.
+    source_t0 : float or array-like
+        Source epoch in days, scalar for one row or shape ``(S,)``.
+    source_x, source_y : float or array-like
+        Source tangent-plane offsets in arcseconds, scalar for one row or
+        shape ``(S,)``.
+    image_x, image_y : array-like
+        Fixed-width image tangent-plane offsets in arcseconds, shape ``(I,)``
+        for one row or ``(S, I)`` for multiple rows.
+    macro_magnifications : array-like
+        Absolute dimensionless magnifications with the same shape as
+        ``image_x``.
+    time_delays : array-like
+        Observer-frame arrival delays in days with the same shape as
+        ``image_x``.
+    num_images : int, array-like, or None
+        Active leading-image count, scalar for one row or shape ``(S,)``.
+
+    Returns
+    -------
+    rows : list of dict
+        One mapping per input row. Each mapping contains active ``image_x`` and
+        ``image_y`` arrays in arcseconds, dimensionless
+        ``macro_magnification``, and normalized ``time_delay`` in days, each
+        with shape ``(A,)`` for that row's active-image count ``A``.
+    """
     source_t0_values = _coerce_scalar_samples(source_t0, num_samples, "source_t0")
     source_x_values = _coerce_scalar_samples(source_x, num_samples, "source_x")
     source_y_values = _coerce_scalar_samples(source_y, num_samples, "source_y")
@@ -248,6 +316,20 @@ _COORDINATE_TOLERANCE_ARCSEC = 1.0e-6
 
 
 def _solve_lens_origin(source_ra, source_dec, source_x, source_y):
+    """Infer the scalar lens origin from one unlensed source coordinate.
+
+    Parameters
+    ----------
+    source_ra, source_dec : float
+        Unlensed source right ascension and declination in degrees.
+    source_x, source_y : float
+        Source tangent-plane east and north offsets in arcseconds.
+
+    Returns
+    -------
+    lens_origin : astropy.coordinates.SkyCoord
+        Scalar ICRS lens-origin coordinate whose RA and Dec are in degrees.
+    """
     source = SkyCoord(ra=source_ra * u.deg, dec=source_dec * u.deg, frame="icrs")
     initial = source.spherical_offsets_by(-source_x * u.arcsec, -source_y * u.arcsec)
 
@@ -299,6 +381,29 @@ def _resolved_coordinates(
     image_x,
     image_y,
 ):
+    """Compute lens origins and image offsets for one or more realized rows.
+
+    Parameters
+    ----------
+    num_samples : int
+        Number of realized image rows, ``S``.
+    source_ra, source_dec : float or array-like
+        Unlensed source right ascension and declination in degrees, scalar for
+        one row or shape ``(S,)``.
+    source_x, source_y : float or array-like
+        Source tangent-plane east and north offsets in arcseconds, scalar for
+        one row or shape ``(S,)``.
+    image_x, image_y : float or array-like
+        Current image tangent-plane east and north offsets in arcseconds,
+        scalar for one row or shape ``(S,)``.
+
+    Returns
+    -------
+    coordinates : list
+        ``[lens_ra, lens_dec, ra_offset, dec_offset]`` in degrees. Entries are
+        scalars for one row and arrays with shape ``(S,)`` for multiple rows;
+        angular offsets are relative to the unlensed source RA and Dec.
+    """
     values = {
         name: _coerce_scalar_samples(value, num_samples, name)
         for name, value in {
@@ -356,6 +461,26 @@ class _ResolvedCoordinatesNode(FunctionNode):
         )
 
     def compute(self, graph_state, rng_info=None, **kwargs):
+        """Compute and persist resolved coordinates for the current state.
+
+        Parameters
+        ----------
+        graph_state : GraphState
+            State containing one realized image row or ``S`` rows.
+        rng_info : object, optional
+            Unused random-number information.
+        **kwargs : dict, optional
+            Setter overrides. Source RA/Dec are in degrees; source and image
+            tangent x/y are in arcseconds. Values are scalar for one row or
+            shape ``(S,)`` for multiple rows.
+
+        Returns
+        -------
+        results : list
+            Lens RA/Dec and source-relative RA/Dec offsets in degrees. Each
+            entry is scalar for one row or has shape ``(S,)`` for multiple
+            rows.
+        """
         del rng_info
         results = _resolved_coordinates(
             num_samples=graph_state.num_samples,
@@ -372,6 +497,21 @@ class _MacroMagnificationEffect(EffectModel):
 
     @staticmethod
     def _scale(values, macro_magnification):
+        """Scale one image's flux by its macro-magnification.
+
+        Parameters
+        ----------
+        values : array-like
+            SED flux density with shape ``(T, W)`` or bandflux with shape
+            ``(T,)``, in nJy.
+        macro_magnification : float
+            Scalar absolute dimensionless magnification.
+
+        Returns
+        -------
+        scaled_values : numpy.ndarray
+            Scaled nJy flux values with the same shape as ``values``.
+        """
         if macro_magnification is None:
             raise ValueError("macro_magnification must be provided.")
         return np.asarray(values) * macro_magnification
@@ -384,6 +524,26 @@ class _MacroMagnificationEffect(EffectModel):
         macro_magnification=None,
         **kwargs,
     ):
+        """Apply macro-magnification to one image's SED.
+
+        Parameters
+        ----------
+        flux_density : array-like
+            Flux density in nJy with shape ``(T, W)``.
+        times : array-like, optional
+            Observer-frame times in days with shape ``(T,)``.
+        wavelengths : array-like, optional
+            Wavelengths in Angstroms with shape ``(W,)``.
+        macro_magnification : float, optional
+            Scalar absolute dimensionless magnification.
+        **kwargs : dict, optional
+            Additional effect parameters, ignored.
+
+        Returns
+        -------
+        flux_density : numpy.ndarray
+            Magnified flux density in nJy with shape ``(T, W)``.
+        """
         del times, wavelengths, kwargs
         return self._scale(flux_density, macro_magnification)
 
@@ -396,5 +556,25 @@ class _MacroMagnificationEffect(EffectModel):
         macro_magnification=None,
         **kwargs,
     ):
+        """Apply macro-magnification to one image's bandfluxes.
+
+        Parameters
+        ----------
+        bandfluxes : array-like
+            Bandflux values in nJy with shape ``(T,)``.
+        times : array-like, optional
+            Observer-frame times in days with shape ``(T,)``.
+        filters : array-like, optional
+            Filter names with shape ``(T,)``.
+        macro_magnification : float, optional
+            Scalar absolute dimensionless magnification.
+        **kwargs : dict, optional
+            Additional effect parameters, ignored.
+
+        Returns
+        -------
+        bandfluxes : numpy.ndarray
+            Magnified bandflux values in nJy with shape ``(T,)``.
+        """
         del times, filters, kwargs
         return self._scale(bandfluxes, macro_magnification)

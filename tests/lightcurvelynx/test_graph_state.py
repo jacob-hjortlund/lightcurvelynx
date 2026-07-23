@@ -530,19 +530,57 @@ def test_graph_state_from_list_preserves_single_row_parameter_shapes(input_kind)
         "node.matrix": np.array([[1.0, 2.0], [3.0, 4.0]]),
     }
     input_row = GraphState.from_dict(row) if input_kind == "graph_state" else row
+    vector_before = row["node.vector"].copy()
+    matrix_before = row["node.matrix"].copy()
 
     state = GraphState.from_list([input_row])
 
     assert state.num_samples == 1
-    assert state["node.scalar"].shape == (1,)
+    assert np.ndim(state["node.scalar"]) == 0
     assert state["node.vector"].shape == (2,)
     assert state["node.matrix"].shape == (2, 2)
-    np.testing.assert_array_equal(state["node.scalar"], [1.0])
+    assert state["node.scalar"] == 1.0
     np.testing.assert_array_equal(state["node.vector"], [1.0, 2.0])
     np.testing.assert_array_equal(
         state["node.matrix"],
         [[1.0, 2.0], [3.0, 4.0]],
     )
+
+    state["node.vector"][0] = -1.0
+    state["node.matrix"][0, 0] = -1.0
+    np.testing.assert_array_equal(row["node.vector"], vector_before)
+    np.testing.assert_array_equal(row["node.matrix"], matrix_before)
+    if input_kind == "graph_state":
+        np.testing.assert_array_equal(input_row["node.vector"], vector_before)
+        np.testing.assert_array_equal(input_row["node.matrix"], matrix_before)
+
+
+def test_graph_state_from_list_chains_scalar_singleton_with_scalar_samples():
+    """Keep a chained singleton scalar on the scalar sample axis."""
+    first = GraphState()
+    first.set("node", "value", 1.0)
+    singleton = GraphState.from_list([first])
+    remaining = GraphState(num_samples=2)
+    remaining.set("node", "value", np.array([2.0, 3.0]))
+
+    combined = GraphState.from_list([singleton, remaining])
+
+    assert combined["node.value"].shape == (3,)
+    np.testing.assert_array_equal(combined["node.value"], [1.0, 2.0, 3.0])
+
+
+def test_graph_state_from_list_chains_singleton_vector_with_vector_samples():
+    """Keep a genuine one-component vector distinct from a scalar singleton."""
+    first = GraphState()
+    first.set("node", "value", np.array([1.0]))
+    singleton = GraphState.from_list([first])
+    remaining = GraphState(num_samples=2)
+    remaining.set("node", "value", np.array([[2.0], [3.0]]))
+
+    combined = GraphState.from_list([singleton, remaining])
+
+    assert combined["node.value"].shape == (3, 1)
+    np.testing.assert_array_equal(combined["node.value"], [[1.0], [2.0], [3.0]])
 
 
 def test_graph_state_from_list_preserves_quantity_concatenation():
@@ -557,7 +595,8 @@ def test_graph_state_from_list_preserves_quantity_concatenation():
     np.testing.assert_array_equal(state["node.distance"], [1.0, 1.0])
     assert isinstance(singleton["node.distance"], u.Quantity)
     assert singleton["node.distance"].unit == u.m
-    np.testing.assert_array_equal(singleton["node.distance"].value, [1.0])
+    assert singleton["node.distance"].shape == ()
+    assert singleton["node.distance"].value == 1.0
 
 
 def test_create_multi_sample_graph_state_reference():

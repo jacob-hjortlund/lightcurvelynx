@@ -44,6 +44,7 @@ from lightcurvelynx.models._resolved_strong_lens import (
     _MacroMagnificationEffect,
     _ResolvedCoordinatesNode,
     _ResolvedImageDataNode,
+    _validate_resolved_wrapper_parameter_names,
     _validate_source_for_resolved_lensing,
 )
 from lightcurvelynx.models.multi_object_model import MultiObjectModel
@@ -802,6 +803,7 @@ class ResolvedStrongLensModel(MultiObjectModel):
         instance as its sole child. Realization-dependent input validation
         occurs during sampling before state expansion.
         """
+        _validate_resolved_wrapper_parameter_names(self)
         _validate_source_for_resolved_lensing(source_model)
 
         image_data = _ResolvedImageDataNode(

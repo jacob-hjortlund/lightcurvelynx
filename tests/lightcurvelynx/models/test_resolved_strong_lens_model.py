@@ -249,6 +249,82 @@ def _source_configuration(source):
     )
 
 
+_RESOLVED_OUTER_PARAMETER_NAMES = (
+    "ra",
+    "dec",
+    "redshift",
+    "t0",
+    "distance",
+    "system_id",
+    "image_id",
+    "source_x",
+    "source_y",
+    "lens_ra",
+    "lens_dec",
+    "image_x",
+    "image_y",
+    "macro_magnification",
+    "time_delay",
+)
+
+
+def _strict_source_snapshot(source):
+    effect_attributes = (
+        "rest_frame_effects",
+        "obs_frame_effects",
+        "band_pass_effects",
+    )
+    return {
+        "setter_keys": tuple(source.setters),
+        "setters": tuple(
+            (
+                name,
+                setter,
+                setter.dependency,
+                setter.node_name,
+            )
+            for name, setter in source.setters.items()
+        ),
+        "effect_lists": tuple(
+            (
+                attribute,
+                getattr(source, attribute),
+                tuple(getattr(source, attribute)),
+            )
+            for attribute in effect_attributes
+            if hasattr(source, attribute)
+        ),
+        "node_pos": source.node_pos,
+        "node_string": source.node_string,
+    }
+
+
+def _assert_strict_source_snapshot(source, snapshot):
+    assert tuple(source.setters) == snapshot["setter_keys"]
+    for name, setter, dependency, node_name in snapshot["setters"]:
+        assert source.setters[name] is setter
+        assert source.setters[name].dependency is dependency
+        assert source.setters[name].node_name == node_name
+    for attribute, effect_list, effects in snapshot["effect_lists"]:
+        assert getattr(source, attribute) is effect_list
+        assert len(effect_list) == len(effects)
+        assert all(current is expected for current, expected in zip(effect_list, effects, strict=True))
+    assert source.node_pos == snapshot["node_pos"]
+    assert source.node_string == snapshot["node_string"]
+
+
+def _make_source_for_strict_rejection(source_class=_PhaseSEDModel):
+    source = source_class(
+        ra=20.0,
+        dec=10.0,
+        redshift=GivenValueList([0.0], stateful=False),
+        t0=100.0,
+    )
+    source.add_effect(ScaleFluxEffect(flux_scale=2.0))
+    source.add_effect(_SEDOnlyEffect())
+    return source
+
+
 def _record_effect_application(monkeypatch, effect, method_name, call_order, marker):
     """Record one real effect method without replacing its implementation."""
     original_method = getattr(effect, method_name)
@@ -1195,6 +1271,50 @@ def test_resolved_lens_rejects_reserved_source_parameters_without_mutation(reser
         ResolvedStrongLensModel(source, **_resolved_constructor_kwargs())
 
     assert _source_configuration(source) == before
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    ["base_ra", "base_dec", "base_t0", "macro_magnification"],
+)
+def test_resolved_lens_rejects_reserved_source_class_attributes_without_mutation(reserved_name):
+    """Preflight source class attributes before changing any owned source state."""
+    source_class = type(
+        f"_SourceWithReserved{reserved_name.title().replace('_', '')}",
+        (_PhaseSEDModel,),
+        {reserved_name: object()},
+    )
+    source = _make_source_for_strict_rejection(source_class)
+    before = _strict_source_snapshot(source)
+
+    with pytest.raises(Exception) as exc_info:
+        ResolvedStrongLensModel(source, **_resolved_constructor_kwargs())
+
+    _assert_strict_source_snapshot(source, before)
+    assert type(exc_info.value) is ValueError
+    assert "source_model" in str(exc_info.value)
+    assert "class attribute" in str(exc_info.value)
+    assert reserved_name in str(exc_info.value)
+
+
+@pytest.mark.parametrize("parameter_name", _RESOLVED_OUTER_PARAMETER_NAMES)
+def test_resolved_lens_rejects_outer_class_attributes_without_source_mutation(parameter_name):
+    """Preflight every outer parameter class attribute before source decoration."""
+    wrapper_class = type(
+        f"_ResolvedWithReserved{parameter_name.title().replace('_', '')}",
+        (ResolvedStrongLensModel,),
+        {parameter_name: object()},
+    )
+    source = _make_source_for_strict_rejection()
+    before = _strict_source_snapshot(source)
+
+    with pytest.raises(Exception) as exc_info:
+        wrapper_class(source, **_resolved_constructor_kwargs())
+
+    _assert_strict_source_snapshot(source, before)
+    assert type(exc_info.value) is ValueError
+    assert f"outer parameter '{parameter_name}'" in str(exc_info.value)
+    assert "class attribute" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("parameter_name", ["ra", "dec", "t0"])
