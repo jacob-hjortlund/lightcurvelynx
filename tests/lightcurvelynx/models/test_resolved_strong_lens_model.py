@@ -519,11 +519,8 @@ def test_resolved_lens_simulation_replay_uses_expanded_state(monkeypatch):
         survey,
         **simulation_kwargs,
     )
-    params_rows = results["params"].tolist()
-    state = GraphState.from_dict(
-        {name: [params[name] for params in params_rows] for name in params_rows[0]},
-        num_samples=len(params_rows),
-    )
+    state = GraphState.from_list(results["params"].values)
+    assert state.num_samples == 5
 
     def fail_if_called(*args, **kwargs):
         del args, kwargs

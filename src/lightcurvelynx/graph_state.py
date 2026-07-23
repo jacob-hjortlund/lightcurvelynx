@@ -398,7 +398,11 @@ class GraphState:
             # from each of the GraphStates.
             values_list = []
             for current in graph_states:
-                values_list.append(np.atleast_1d(current[full_name]))
+                if total_samples > 1 and current.num_samples == 1:
+                    current_values = np.expand_dims(current[full_name], axis=0)
+                else:
+                    current_values = np.atleast_1d(current[full_name])
+                values_list.append(current_values)
             values = np.concatenate(values_list)
             result.set(node_name, param_name, values, force_copy=False, fixed=False)
         return result

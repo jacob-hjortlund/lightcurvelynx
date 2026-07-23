@@ -5,6 +5,7 @@ matplotlib.use("Agg")  # Suppress the plots
 import numpy as np
 import pyarrow as pa
 import pytest
+from astropy import units as u
 from astropy.table import Table
 
 from lightcurvelynx.graph_state import DependencyGraph, GraphState, transpose_dict_of_list
@@ -473,6 +474,90 @@ def test_create_single_graph_state_from_list():
     # Fail on empty list.
     with pytest.raises(ValueError):
         _ = GraphState.from_list([])
+
+
+def test_graph_state_from_list_preserves_parameter_dimensions_and_inputs():
+    """Preserve trailing parameter dimensions without mutating input rows."""
+    first_vector = np.array([1.0, 2.0])
+    first_matrix = np.array([[1.0, 2.0], [3.0, 4.0]])
+    first_state = GraphState()
+    first_state.set("node", "scalar", 1.0)
+    first_state.set("node", "vector", first_vector)
+    first_state.set("node", "matrix", first_matrix)
+
+    second_vector = np.array([3.0, 4.0])
+    second_matrix = np.array([[5.0, 6.0], [7.0, 8.0]])
+    second_row = {
+        "node.scalar": 2.0,
+        "node.vector": second_vector,
+        "node.matrix": second_matrix,
+    }
+    first_vector_before = first_vector.copy()
+    first_matrix_before = first_matrix.copy()
+    second_vector_before = second_vector.copy()
+    second_matrix_before = second_matrix.copy()
+
+    state = GraphState.from_list([first_state, second_row])
+
+    assert state.num_samples == 2
+    np.testing.assert_array_equal(state["node.scalar"], [1.0, 2.0])
+    np.testing.assert_array_equal(
+        state["node.vector"],
+        [[1.0, 2.0], [3.0, 4.0]],
+    )
+    np.testing.assert_array_equal(
+        state["node.matrix"],
+        [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[5.0, 6.0], [7.0, 8.0]],
+        ],
+    )
+
+    state["node.vector"][0, 0] = -1.0
+    state["node.matrix"][1, 0, 0] = -1.0
+    np.testing.assert_array_equal(first_state["node.vector"], first_vector_before)
+    np.testing.assert_array_equal(first_state["node.matrix"], first_matrix_before)
+    np.testing.assert_array_equal(second_row["node.vector"], second_vector_before)
+    np.testing.assert_array_equal(second_row["node.matrix"], second_matrix_before)
+
+
+@pytest.mark.parametrize("input_kind", ["graph_state", "dict"])
+def test_graph_state_from_list_preserves_single_row_parameter_shapes(input_kind):
+    """Retain existing scalar, vector, and matrix shapes for one input row."""
+    row = {
+        "node.scalar": 1.0,
+        "node.vector": np.array([1.0, 2.0]),
+        "node.matrix": np.array([[1.0, 2.0], [3.0, 4.0]]),
+    }
+    input_row = GraphState.from_dict(row) if input_kind == "graph_state" else row
+
+    state = GraphState.from_list([input_row])
+
+    assert state.num_samples == 1
+    assert state["node.scalar"].shape == (1,)
+    assert state["node.vector"].shape == (2,)
+    assert state["node.matrix"].shape == (2, 2)
+    np.testing.assert_array_equal(state["node.scalar"], [1.0])
+    np.testing.assert_array_equal(state["node.vector"], [1.0, 2.0])
+    np.testing.assert_array_equal(
+        state["node.matrix"],
+        [[1.0, 2.0], [3.0, 4.0]],
+    )
+
+
+def test_graph_state_from_list_preserves_quantity_concatenation():
+    """Retain array-function unit conversion and singleton metadata."""
+    meter_state = GraphState()
+    meter_state.set("node", "distance", 1.0 * u.m)
+    centimeter_row = {"node.distance": 100.0 * u.cm}
+
+    state = GraphState.from_list([meter_state, centimeter_row])
+    singleton = GraphState.from_list([meter_state])
+
+    np.testing.assert_array_equal(state["node.distance"], [1.0, 1.0])
+    assert isinstance(singleton["node.distance"], u.Quantity)
+    assert singleton["node.distance"].unit == u.m
+    np.testing.assert_array_equal(singleton["node.distance"].value, [1.0])
 
 
 def test_create_multi_sample_graph_state_reference():
