@@ -3,6 +3,8 @@ import pytest
 from astropy import units as u
 from astropy.coordinates import SkyCoord, SkyOffsetFrame
 
+from lightcurvelynx.effects.basic_effects import ScaleFluxEffect
+from lightcurvelynx.effects.effect_model import EffectModel
 from lightcurvelynx.math_nodes.basic_math_node import BasicMathNode
 from lightcurvelynx.math_nodes.given_sampler import GivenValueList
 from lightcurvelynx.models._resolved_strong_lens import (
@@ -31,6 +33,142 @@ class _PhaseBandfluxModel(BandfluxModel):
         """Return phase plus a fixed filter-dependent offset."""
         t0 = self.get_param(state, "t0")
         return times - t0 + {"g": 1.0, "r": 10.0}[filter]
+
+
+class _RecordingSEDModel(SEDModel):
+    """Record the rest-frame coordinates used for an analytic SED."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.compute_calls = []
+
+    def compute_sed(self, times, wavelengths, graph_state, **kwargs):
+        """Record inputs and return ``time + wavelength / 1000``."""
+        del graph_state, kwargs
+        times = np.asarray(times, dtype=float)
+        wavelengths = np.asarray(wavelengths, dtype=float)
+        self.compute_calls.append((times.copy(), wavelengths.copy()))
+        return times[:, None] + wavelengths[None, :] / 1_000.0
+
+
+class _RecordingScaleEffect(EffectModel):
+    """Scale an SED while recording the realized image metadata."""
+
+    def __init__(self, scale, *, call_order=None, marker="scale"):
+        super().__init__(rest_frame=True, scale=scale)
+        self.calls = []
+        self.call_order = call_order
+        self.marker = marker
+
+    def apply(
+        self,
+        flux_density,
+        *,
+        times=None,
+        wavelengths=None,
+        scale=None,
+        ra=None,
+        dec=None,
+        t0=None,
+        **kwargs,
+    ):
+        """Record image coordinates and apply the realized scale."""
+        del kwargs
+        if self.call_order is not None:
+            self.call_order.append(self.marker)
+        self.calls.append(
+            {
+                "times": np.asarray(times).copy(),
+                "wavelengths": np.asarray(wavelengths).copy(),
+                "scale": scale,
+                "ra": ra,
+                "dec": dec,
+                "t0": t0,
+            }
+        )
+        return np.asarray(flux_density) * scale
+
+    def apply_bandflux(
+        self,
+        bandfluxes,
+        *,
+        times=None,
+        filters=None,
+        scale=None,
+        ra=None,
+        dec=None,
+        t0=None,
+        **kwargs,
+    ):
+        """Record image metadata and scale observer-frame bandfluxes."""
+        del kwargs
+        if self.call_order is not None:
+            self.call_order.append(self.marker)
+        self.calls.append(
+            {
+                "times": np.asarray(times).copy(),
+                "filters": np.asarray(filters).copy(),
+                "scale": scale,
+                "ra": ra,
+                "dec": dec,
+                "t0": t0,
+            }
+        )
+        return np.asarray(bandfluxes) * scale
+
+
+class _RecordingAdditiveEffect(EffectModel):
+    """Add one named sampled offset and record effect execution order."""
+
+    def __init__(self, parameter_name, setter, *, call_order, marker):
+        super().__init__(rest_frame=False)
+        self.add_effect_parameter(parameter_name, setter)
+        self.parameter_name = parameter_name
+        self.call_order = call_order
+        self.marker = marker
+        self.calls = []
+
+    def _apply(self, values, **params):
+        offset = params[self.parameter_name]
+        self.call_order.append(self.marker)
+        self.calls.append(offset)
+        return np.asarray(values) + offset
+
+    def apply(self, flux_density, times=None, wavelengths=None, **kwargs):
+        """Add the realized offset to an SED."""
+        del times, wavelengths
+        return self._apply(flux_density, **kwargs)
+
+    def apply_bandflux(self, bandfluxes, *, times=None, filters=None, **kwargs):
+        """Add the realized offset to bandfluxes."""
+        del times, filters
+        return self._apply(bandfluxes, **kwargs)
+
+
+class _BoundedPhaseSEDModel(_PhaseSEDModel):
+    """Return fixed wavelength bounds and record their supplied state."""
+
+    def minwave(self, graph_state=None):
+        """Record and return the exact minimum wavelength."""
+        self.minwave_state = graph_state
+        return 900.0
+
+    def maxwave(self, graph_state=None):
+        """Record and return the exact maximum wavelength."""
+        self.maxwave_state = graph_state
+        return 2_100.0
+
+
+class _SEDOnlyEffect(EffectModel):
+    """Implement only SED application to exercise the bandflux guard."""
+
+    def __init__(self):
+        super().__init__(rest_frame=False)
+
+    def apply(self, flux_density, **kwargs):
+        """Leave SED values unchanged."""
+        del kwargs
+        return flux_density
 
 
 def _make_resolved_lens(*, source=None, node_label="resolved"):
@@ -88,6 +226,17 @@ def _source_configuration(source):
     )
 
 
+def _record_effect_application(monkeypatch, effect, method_name, call_order, marker):
+    """Record one real effect method without replacing its implementation."""
+    original_method = getattr(effect, method_name)
+
+    def recording_method(*args, **kwargs):
+        call_order.append(marker)
+        return original_method(*args, **kwargs)
+
+    monkeypatch.setattr(effect, method_name, recording_method)
+
+
 def test_resolved_lens_owns_and_decorates_source():
     """Retain and decorate the exact source as the wrapper's only child."""
     source, model = _make_resolved_lens()
@@ -122,6 +271,407 @@ def test_resolved_lens_expands_systems_and_exposes_sorted_image_metadata():
         state["source.t0"],
         [100.0, 102.0, 200.0, 201.0, 202.0],
     )
+
+
+def test_resolved_lens_exact_sed_evaluation():
+    """Evaluate every expanded image with its exact delay and magnification."""
+    source = _PhaseSEDModel(
+        ra=20.0,
+        dec=10.0,
+        redshift=0.0,
+        t0=100.0,
+        node_label="source",
+    )
+    model = ResolvedStrongLensModel(
+        source,
+        source_x=0.0,
+        source_y=0.0,
+        image_x=[0.0, 1.0, 2.0],
+        image_y=[0.0, 1.0, 2.0],
+        macro_magnifications=[1.0, 2.0, 3.0],
+        time_delays=[4.0, 0.0, 2.0],
+        node_label="resolved",
+    )
+    state = model.sample_parameters()
+    times = np.array([105.0, 106.0])
+    wavelengths = np.array([4_000.0, 5_000.0])
+    expected_t0 = np.array([100.0, 102.0, 104.0])
+    expected_magnification = np.array([2.0, 3.0, 1.0])
+    expected = np.stack(
+        [
+            mu * ((times - image_t0)[:, None] + wavelengths[None, :] / 1_000.0)
+            for image_t0, mu in zip(
+                expected_t0,
+                expected_magnification,
+                strict=True,
+            )
+        ]
+    )
+
+    np.testing.assert_array_equal(
+        model.evaluate_sed(times, wavelengths, state),
+        expected,
+    )
+
+
+def test_resolved_lens_exact_bandflux_evaluation():
+    """Evaluate every expanded image's exact filter flux and magnification."""
+    source = _PhaseBandfluxModel(
+        ra=20.0,
+        dec=10.0,
+        redshift=0.0,
+        t0=100.0,
+        node_label="source",
+    )
+    model = ResolvedStrongLensModel(
+        source,
+        source_x=0.0,
+        source_y=0.0,
+        image_x=[0.0, 1.0, 2.0],
+        image_y=[0.0, 1.0, 2.0],
+        macro_magnifications=[1.0, 2.0, 3.0],
+        time_delays=[4.0, 0.0, 2.0],
+        node_label="resolved",
+    )
+    state = model.sample_parameters()
+    passbands = None
+    times = np.array([105.0, 106.0])
+    filters = np.array(["g", "r"])
+    expected_t0 = np.array([100.0, 102.0, 104.0])
+    expected_magnification = np.array([2.0, 3.0, 1.0])
+    expected = np.stack(
+        [
+            mu * (times - image_t0 + np.array([1.0, 10.0]))
+            for image_t0, mu in zip(
+                expected_t0,
+                expected_magnification,
+                strict=True,
+            )
+        ]
+    )
+
+    np.testing.assert_array_equal(
+        model.evaluate_bandfluxes(passbands, times, filters, state),
+        expected,
+    )
+
+
+def test_resolved_lens_applies_redshift_and_source_effect_once():
+    """Share pre-wrapper latents while evaluating each final image once."""
+    source = _RecordingSEDModel(
+        ra=GivenValueList([20.0, 30.0], stateful=False),
+        dec=GivenValueList([10.0, -5.0], stateful=False),
+        redshift=1.0,
+        t0=GivenValueList([4.0, 4.0], stateful=False),
+        node_label="source",
+    )
+    effect = _RecordingScaleEffect(
+        GivenValueList([2.0, 5.0], stateful=False),
+    )
+    source.add_effect(effect)
+    _, model = _make_resolved_lens(source=source)
+    state = model.sample_parameters(num_samples=2)
+    observer_times = np.array([10.0, 14.0])
+    observer_wavelengths = np.array([1_000.0, 3_000.0])
+
+    result = model.evaluate_sed(
+        observer_times,
+        observer_wavelengths,
+        state,
+    )
+
+    expected_scales = np.array([2.0, 2.0, 5.0, 5.0, 5.0])
+    np.testing.assert_array_equal(state["source.scale"], expected_scales)
+    np.testing.assert_allclose(
+        [call["ra"] for call in effect.calls],
+        state["source.ra"],
+    )
+    np.testing.assert_allclose(
+        [call["dec"] for call in effect.calls],
+        state["source.dec"],
+    )
+    np.testing.assert_array_equal(
+        [call["t0"] for call in effect.calls],
+        state["source.t0"],
+    )
+
+    expected_rest_times = np.array(
+        [
+            [7.0, 9.0],
+            [8.0, 10.0],
+            [7.0, 9.0],
+            [7.5, 9.5],
+            [8.0, 10.0],
+        ]
+    )
+    expected_rest_wavelengths = np.array([500.0, 1_500.0])
+    np.testing.assert_array_equal(
+        np.stack([call[0] for call in source.compute_calls]),
+        expected_rest_times,
+    )
+    for _, rest_wavelengths in source.compute_calls:
+        np.testing.assert_array_equal(
+            rest_wavelengths,
+            expected_rest_wavelengths,
+        )
+
+    rest_frame_flux = expected_rest_times[:, :, None] + expected_rest_wavelengths[None, None, :] / 1_000.0
+    expected_magnifications = np.array([2.0, 3.0, 4.0, 6.0, 5.0])
+    expected = expected_magnifications[:, None, None] * 2.0 * expected_scales[:, None, None] * rest_frame_flux
+    np.testing.assert_allclose(result, expected)
+
+
+def test_post_wrapper_sed_effects_are_image_specific_and_ordered(monkeypatch):
+    """Sample post-expansion SED effects per image in frame order."""
+    source, model = _make_resolved_lens()
+    call_order = []
+    scale_values = np.array([2.0, 3.0, 4.0, 5.0, 6.0])
+    first_offsets = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
+    second_offsets = np.array([100.0, 200.0, 300.0, 400.0, 500.0])
+    scale_effect = _RecordingScaleEffect(
+        GivenValueList(scale_values, stateful=False),
+        call_order=call_order,
+        marker="rest_scale",
+    )
+    first_effect = _RecordingAdditiveEffect(
+        "first_offset",
+        GivenValueList(first_offsets, stateful=False),
+        call_order=call_order,
+        marker="first_observer",
+    )
+    second_effect = _RecordingAdditiveEffect(
+        "second_offset",
+        GivenValueList(second_offsets, stateful=False),
+        call_order=call_order,
+        marker="second_observer",
+    )
+    model.add_effect(scale_effect)
+    model.add_effect(first_effect)
+    model.add_effect(second_effect)
+    _record_effect_application(
+        monkeypatch,
+        model._macro_magnification_effect,
+        "apply",
+        call_order,
+        "macro",
+    )
+
+    state = model.sample_parameters(num_samples=2)
+    times = np.array([205.0, 206.0])
+    wavelengths = np.array([4_000.0, 5_000.0])
+    result = model.evaluate_sed(times, wavelengths, state)
+
+    np.testing.assert_array_equal(state["source.scale"], scale_values)
+    np.testing.assert_array_equal(state["resolved.first_offset"], first_offsets)
+    np.testing.assert_array_equal(state["resolved.second_offset"], second_offsets)
+    assert source.rest_frame_effects == [scale_effect]
+    assert source.obs_frame_effects == [model._macro_magnification_effect]
+    assert source.list_effects() == [
+        scale_effect,
+        model._macro_magnification_effect,
+    ]
+    assert model.obs_frame_effects == [first_effect, second_effect]
+    assert call_order == [
+        marker for _ in range(5) for marker in ("rest_scale", "macro", "first_observer", "second_observer")
+    ]
+
+    image_t0 = np.asarray(state["source.t0"])
+    magnifications = np.asarray(state["source.macro_magnification"])
+    unlensed = np.stack([(times - t0)[:, None] + wavelengths[None, :] / 1_000.0 for t0 in image_t0])
+    expected = (
+        magnifications[:, None, None] * scale_values[:, None, None] * unlensed
+        + first_offsets[:, None, None]
+        + second_offsets[:, None, None]
+    )
+    np.testing.assert_array_equal(result, expected)
+
+
+def test_post_wrapper_bandflux_effects_are_image_specific_and_ordered(monkeypatch):
+    """Keep bandflux effects in one registration-ordered child pipeline."""
+    source = _PhaseBandfluxModel(
+        ra=GivenValueList([20.0, 30.0], stateful=False),
+        dec=GivenValueList([10.0, -5.0], stateful=False),
+        redshift=0.0,
+        t0=GivenValueList([100.0, 200.0], stateful=False),
+        node_label="source",
+    )
+    _, model = _make_resolved_lens(source=source)
+    call_order = []
+    scale_values = np.array([2.0, 3.0, 4.0, 5.0, 6.0])
+    first_offsets = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
+    second_offsets = np.array([100.0, 200.0, 300.0, 400.0, 500.0])
+    scale_effect = _RecordingScaleEffect(
+        GivenValueList(scale_values, stateful=False),
+        call_order=call_order,
+        marker="delegated_scale",
+    )
+    first_effect = _RecordingAdditiveEffect(
+        "first_offset",
+        GivenValueList(first_offsets, stateful=False),
+        call_order=call_order,
+        marker="first_observer",
+    )
+    second_effect = _RecordingAdditiveEffect(
+        "second_offset",
+        GivenValueList(second_offsets, stateful=False),
+        call_order=call_order,
+        marker="second_observer",
+    )
+    model.add_effect(scale_effect)
+    model.add_effect(first_effect)
+    model.add_effect(second_effect)
+    _record_effect_application(
+        monkeypatch,
+        model._macro_magnification_effect,
+        "apply_bandflux",
+        call_order,
+        "macro",
+    )
+
+    state = model.sample_parameters(num_samples=2)
+    times = np.array([205.0, 206.0])
+    filters = np.array(["g", "r"])
+    result = model.evaluate_bandfluxes(None, times, filters, state)
+
+    np.testing.assert_array_equal(state["source.scale"], scale_values)
+    np.testing.assert_array_equal(state["resolved.first_offset"], first_offsets)
+    np.testing.assert_array_equal(state["resolved.second_offset"], second_offsets)
+    assert source.band_pass_effects == [
+        model._macro_magnification_effect,
+        scale_effect,
+    ]
+    assert model.obs_frame_effects == [first_effect, second_effect]
+    assert call_order == [
+        marker
+        for _ in range(5)
+        for marker in ("macro", "delegated_scale", "first_observer", "second_observer")
+    ]
+
+    image_t0 = np.asarray(state["source.t0"])
+    magnifications = np.asarray(state["source.macro_magnification"])
+    unlensed = np.stack([times - t0 + np.array([1.0, 10.0]) for t0 in image_t0])
+    expected = (
+        magnifications[:, None] * scale_values[:, None] * unlensed
+        + first_offsets[:, None]
+        + second_offsets[:, None]
+    )
+    np.testing.assert_array_equal(result, expected)
+
+
+def test_scale_flux_effect_coexists_with_macro_magnification():
+    """Keep public source scaling distinct from private macro scaling."""
+    source = _PhaseSEDModel(
+        ra=GivenValueList([20.0, 30.0], stateful=False),
+        dec=GivenValueList([10.0, -5.0], stateful=False),
+        redshift=0.0,
+        t0=GivenValueList([100.0, 200.0], stateful=False),
+        node_label="source",
+    )
+    source.add_effect(ScaleFluxEffect(flux_scale=2.0))
+    _, model = _make_resolved_lens(source=source)
+
+    assert "flux_scale" in source.setters
+    assert "macro_magnification" in source.setters
+    state = model.sample_parameters(num_samples=2)
+    times = np.array([205.0, 206.0])
+    wavelengths = np.array([4_000.0, 5_000.0])
+    result = model.evaluate_sed(times, wavelengths, state)
+
+    image_t0 = np.asarray(state["source.t0"])
+    magnifications = np.asarray(state["source.macro_magnification"])
+    unlensed = np.stack([(times - t0)[:, None] + wavelengths[None, :] / 1_000.0 for t0 in image_t0])
+    expected = 2.0 * magnifications[:, None, None] * unlensed
+    np.testing.assert_array_equal(result, expected)
+
+
+def test_resolved_lens_public_sed_rejects_bandflux_child():
+    """Raise the documented public error for bandflux-only SED evaluation."""
+    source = _PhaseBandfluxModel(
+        ra=20.0,
+        dec=10.0,
+        redshift=0.0,
+        t0=100.0,
+        node_label="source",
+    )
+    _, model = _make_resolved_lens(source=source)
+    state = model.sample_parameters(num_samples=2)
+
+    with pytest.raises(
+        TypeError,
+        match="ResolvedStrongLensModel contains a BandfluxModel, which does not support SED evaluation",
+    ):
+        model.evaluate_sed([105.0], [4_000.0], state)
+
+
+def test_resolved_lens_public_bandflux_propagates_missing_effect_method():
+    """Propagate a wrapper effect's unsupported bandflux operation."""
+    source = _PhaseBandfluxModel(
+        ra=20.0,
+        dec=10.0,
+        redshift=0.0,
+        t0=100.0,
+        node_label="source",
+    )
+    _, model = _make_resolved_lens(source=source)
+    model.add_effect(_SEDOnlyEffect())
+    state = model.sample_parameters(num_samples=2)
+
+    with pytest.raises(NotImplementedError):
+        model.evaluate_bandfluxes(
+            None,
+            np.array([105.0]),
+            np.array(["g"]),
+            state,
+        )
+
+
+def test_resolved_lens_public_wavelength_bounds_forward_state():
+    """Return child wavelength bounds with the exact expanded state."""
+    source = _BoundedPhaseSEDModel(
+        ra=GivenValueList([20.0, 30.0], stateful=False),
+        dec=GivenValueList([10.0, -5.0], stateful=False),
+        redshift=0.0,
+        t0=GivenValueList([100.0, 200.0], stateful=False),
+        node_label="source",
+    )
+    _, model = _make_resolved_lens(source=source)
+    state = model.sample_parameters(num_samples=2)
+
+    assert model.minwave(state) == 900.0
+    assert model.maxwave(state) == 2_100.0
+    assert source.minwave_state is state
+    assert source.maxwave_state is state
+
+
+def test_resolved_lens_public_sed_shapes_follow_state_rows():
+    """Return ordinary or row-stacked SED shapes from public evaluation."""
+    _, model = _make_resolved_lens()
+    state = model.sample_parameters(num_samples=2)
+    one_image_state = next(iter(state))
+    times = np.array([205.0, 206.0])
+    wavelengths = np.array([4_000.0, 5_000.0])
+
+    assert model.evaluate_sed(times, wavelengths, one_image_state).shape == (2, 2)
+    assert model.evaluate_sed(times, wavelengths, state).shape == (5, 2, 2)
+
+
+def test_resolved_lens_public_bandflux_shapes_follow_state_rows():
+    """Return ordinary or row-stacked bandflux shapes from public evaluation."""
+    source = _PhaseBandfluxModel(
+        ra=GivenValueList([20.0, 30.0], stateful=False),
+        dec=GivenValueList([10.0, -5.0], stateful=False),
+        redshift=0.0,
+        t0=GivenValueList([100.0, 200.0], stateful=False),
+        node_label="source",
+    )
+    _, model = _make_resolved_lens(source=source)
+    state = model.sample_parameters(num_samples=2)
+    one_image_state = next(iter(state))
+    times = np.array([205.0, 206.0])
+    filters = np.array(["g", "r"])
+
+    assert model.evaluate_bandfluxes(None, times, filters, one_image_state).shape == (2,)
+    assert model.evaluate_bandfluxes(None, times, filters, state).shape == (5, 2)
 
 
 def test_resolved_lens_broadcasts_constant_arrays_and_uses_full_width():
