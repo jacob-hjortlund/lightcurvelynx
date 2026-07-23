@@ -371,11 +371,18 @@ def _make_source_for_strict_rejection(
     return source
 
 
-def _capture_resolved_construction_error(source, *, node_label=None):
+def _capture_resolved_construction_error(
+    source,
+    *,
+    node_label=None,
+    **constructor_overrides,
+):
+    constructor_kwargs = _resolved_constructor_kwargs()
+    constructor_kwargs.update(constructor_overrides)
     try:
         ResolvedStrongLensModel(
             source,
-            **_resolved_constructor_kwargs(),
+            **constructor_kwargs,
             node_label=node_label,
         )
     except Exception as exc:
@@ -1501,6 +1508,68 @@ def test_resolved_lens_rejects_dotted_registered_parameter_without_source_mutati
     error = _capture_resolved_construction_error(source)
 
     _assert_strict_source_snapshot(source, before)
+    assert type(error) is ValueError
+    assert "registered parameter name" in str(error)
+    assert "GraphState separator" in str(error)
+
+
+@pytest.mark.parametrize(
+    ("input_name", "input_values"),
+    [
+        ("source_x", [0.0]),
+        ("source_y", [0.0]),
+        ("image_x", [[0.0, 1.0]]),
+        ("image_y", [[0.0, 1.0]]),
+        ("macro_magnifications", [[1.0, 2.0]]),
+        ("time_delays", [[0.0, 1.0]]),
+        ("num_images", [2]),
+    ],
+)
+def test_resolved_lens_rejects_dotted_input_dependency_without_mutation(
+    input_name,
+    input_values,
+):
+    """Preflight every lens-data input graph before consuming the source."""
+    source = _make_source_for_strict_rejection()
+    external = GivenValueList(
+        input_values,
+        stateful=False,
+        node_label=f"bad.{input_name}",
+    )
+    source_before = _strict_source_snapshot(source)
+    external_before = _strict_source_snapshot(external)
+
+    error = _capture_resolved_construction_error(
+        source,
+        **{input_name: external},
+    )
+
+    _assert_strict_source_snapshot(external, external_before)
+    _assert_strict_source_snapshot(source, source_before)
+    assert type(error) is ValueError
+    assert "node_label" in str(error)
+    assert "GraphState separator" in str(error)
+
+
+def test_resolved_lens_rejects_dotted_parameter_reached_through_input_without_mutation():
+    """Preflight registered names throughout a supplied input graph."""
+    source = _make_source_for_strict_rejection()
+    external = GivenValueList(
+        [0.0],
+        stateful=False,
+        node_label="valid_input",
+    )
+    external.add_parameter("bad.parameter", 1.0)
+    source_before = _strict_source_snapshot(source)
+    external_before = _strict_source_snapshot(external)
+
+    error = _capture_resolved_construction_error(
+        source,
+        source_x=external,
+    )
+
+    _assert_strict_source_snapshot(external, external_before)
+    _assert_strict_source_snapshot(source, source_before)
     assert type(error) is ValueError
     assert "registered parameter name" in str(error)
     assert "GraphState separator" in str(error)

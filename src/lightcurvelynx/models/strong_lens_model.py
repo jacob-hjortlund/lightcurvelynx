@@ -41,6 +41,7 @@ import numpy as np
 
 from lightcurvelynx.math_nodes.state_expansion_node import StateExpansionNode
 from lightcurvelynx.models._resolved_strong_lens import (
+    _build_dependency_graph_without_mutation,
     _MacroMagnificationEffect,
     _ResolvedCoordinatesNode,
     _ResolvedImageDataNode,
@@ -842,6 +843,8 @@ class ResolvedStrongLensModel(MultiObjectModel):
             image_y=expansion.image_y,
             node_label=None if node_label is None else f"{node_label}_coordinates",
         )
+
+        _build_dependency_graph_without_mutation(coordinates)
 
         source_model.add_parameter_offset("ra", coordinates.ra_offset)
         source_model.add_parameter_offset("dec", coordinates.dec_offset)

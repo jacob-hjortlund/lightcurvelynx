@@ -60,10 +60,10 @@ def _validate_reachable_node_names(node):
         )
 
 
-def _build_dependency_graph_without_mutation(source_model):
+def _build_dependency_graph_without_mutation(root_node):
     """Inspect dependencies while preserving every reachable node identity."""
     reachable_nodes = []
-    pending_nodes = [source_model]
+    pending_nodes = [root_node]
     seen_nodes = set()
     while pending_nodes:
         node = pending_nodes.pop()
@@ -87,15 +87,15 @@ def _build_dependency_graph_without_mutation(source_model):
         for node in reachable_nodes
     ]
     try:
-        dependency_graph = source_model.build_dependency_graph()
-        source_node_string = str(source_model)
+        dependency_graph = root_node.build_dependency_graph()
+        root_node_string = str(root_node)
     finally:
         for node, node_pos, node_string, setter_snapshots in snapshots:
             node.node_pos = node_pos
             node.node_string = node_string
             for setter, node_name in setter_snapshots:
                 setter.node_name = node_name
-    return dependency_graph, source_node_string
+    return dependency_graph, root_node_string
 
 
 def _validate_source_for_resolved_lensing(source_model):
