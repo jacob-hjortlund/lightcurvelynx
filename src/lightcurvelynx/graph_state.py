@@ -31,6 +31,21 @@ from astropy.io import ascii
 from astropy.table import Table
 
 
+def _copy_single_sample_value(value):
+    """Copy supported mutable storage while retaining opaque scalar values."""
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if type(value) is list:
+        return [_copy_single_sample_value(item) for item in value]
+    if type(value) is dict:
+        return {key: _copy_single_sample_value(item) for key, item in value.items()}
+    if type(value) is set:
+        return value.copy()
+    if type(value) is bytearray:
+        return value.copy()
+    return value
+
+
 class GraphState:
     """A class to hold the state(s) of the each variable for one or more samples of the random
     variables in the graph. Each entry is indexed by a combination of node's (unique) name and
@@ -396,8 +411,10 @@ class GraphState:
 
             if total_samples == 1:
                 # Preserve the single sample exactly so a scalar remains
-                # distinguishable from a genuine one-component vector.
-                values = copy.deepcopy(graph_states[0][full_name])
+                # distinguishable from a genuine one-component vector. Copy
+                # supported mutable storage without copying opaque scalar
+                # objects or invoking their deepcopy hooks.
+                values = _copy_single_sample_value(graph_states[0][full_name])
             else:
                 # Create a numpy array that is the concatenation of all the values
                 # from each of the GraphStates.

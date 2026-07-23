@@ -555,6 +555,53 @@ def test_graph_state_from_list_preserves_single_row_parameter_shapes(input_kind)
         np.testing.assert_array_equal(input_row["node.matrix"], matrix_before)
 
 
+def test_graph_state_from_list_preserves_opaque_singleton_identity():
+    """Retain an opaque scalar by reference without invoking deepcopy hooks."""
+
+    class _OpaqueScalar:
+        def __deepcopy__(self, memo):
+            del memo
+            raise RuntimeError("opaque scalar must not be deep-copied")
+
+    opaque = _OpaqueScalar()
+    input_state = GraphState()
+    input_state.set("node", "value", opaque)
+
+    singleton = GraphState.from_list([input_state])
+
+    assert singleton["node.value"] is opaque
+
+
+def test_graph_state_from_list_isolates_supported_singleton_containers():
+    """Copy supported mutable storage while retaining opaque leaf identities."""
+
+    class _OpaqueScalar:
+        def __deepcopy__(self, memo):
+            del memo
+            raise RuntimeError("opaque scalar must not be deep-copied")
+
+    opaque = _OpaqueScalar()
+    input_list = [np.array([1.0, 2.0]), opaque]
+    input_mapping = {"array": np.array([3.0, 4.0]), "opaque": opaque}
+    input_state = GraphState()
+    input_state.set("node", "items", input_list)
+    input_state.set("node", "mapping", input_mapping)
+
+    singleton = GraphState.from_list([input_state])
+
+    assert singleton["node.items"] is not input_list
+    assert singleton["node.mapping"] is not input_mapping
+    assert singleton["node.items"][0] is not input_list[0]
+    assert singleton["node.mapping"]["array"] is not input_mapping["array"]
+    assert singleton["node.items"][1] is opaque
+    assert singleton["node.mapping"]["opaque"] is opaque
+
+    singleton["node.items"][0][0] = -1.0
+    singleton["node.mapping"]["array"][0] = -1.0
+    np.testing.assert_array_equal(input_list[0], [1.0, 2.0])
+    np.testing.assert_array_equal(input_mapping["array"], [3.0, 4.0])
+
+
 def test_graph_state_from_list_chains_scalar_singleton_with_scalar_samples():
     """Keep a chained singleton scalar on the scalar sample axis."""
     first = GraphState()
@@ -597,6 +644,9 @@ def test_graph_state_from_list_preserves_quantity_concatenation():
     assert singleton["node.distance"].unit == u.m
     assert singleton["node.distance"].shape == ()
     assert singleton["node.distance"].value == 1.0
+
+    singleton["node.distance"][...] = 2.0 * u.m
+    assert meter_state["node.distance"] == 1.0 * u.m
 
 
 def test_create_multi_sample_graph_state_reference():

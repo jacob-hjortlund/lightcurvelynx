@@ -1251,6 +1251,22 @@ def test_resolved_lens_rejects_non_physical_source_without_mutation():
     assert _source_configuration(source) == before
 
 
+def test_resolved_lens_rejects_base_physical_model_without_mutation():
+    """Reject the inherited unsupported effect operation before decoration."""
+    source = BasePhysicalModel(
+        ra=20.0,
+        dec=10.0,
+        redshift=0.0,
+        t0=100.0,
+    )
+    before = _strict_source_snapshot(source)
+
+    with pytest.raises(ValueError, match="add_effect"):
+        ResolvedStrongLensModel(source, **_resolved_constructor_kwargs())
+
+    _assert_strict_source_snapshot(source, before)
+
+
 @pytest.mark.parametrize(
     "reserved_name",
     ["base_ra", "base_dec", "base_t0", "macro_magnification"],
@@ -1297,6 +1313,29 @@ def test_resolved_lens_rejects_reserved_source_class_attributes_without_mutation
     assert reserved_name in str(exc_info.value)
 
 
+def test_resolved_lens_rejects_state_dependent_source_descriptor_without_mutation():
+    """Detect a reserved source descriptor without invoking its getter."""
+
+    class _SourceWithStateDependentBaseDec(_PhaseSEDModel):
+        @property
+        def base_dec(self):
+            if "base_ra" not in self.setters:
+                raise AttributeError("base_dec is dormant before RA decoration")
+            return object()
+
+    source = _make_source_for_strict_rejection(_SourceWithStateDependentBaseDec)
+    before = _strict_source_snapshot(source)
+
+    with pytest.raises(Exception) as exc_info:
+        ResolvedStrongLensModel(source, **_resolved_constructor_kwargs())
+
+    _assert_strict_source_snapshot(source, before)
+    assert type(exc_info.value) is ValueError
+    assert "source_model" in str(exc_info.value)
+    assert "class attribute" in str(exc_info.value)
+    assert "base_dec" in str(exc_info.value)
+
+
 @pytest.mark.parametrize("parameter_name", _RESOLVED_OUTER_PARAMETER_NAMES)
 def test_resolved_lens_rejects_outer_class_attributes_without_source_mutation(parameter_name):
     """Preflight every outer parameter class attribute before source decoration."""
@@ -1314,6 +1353,28 @@ def test_resolved_lens_rejects_outer_class_attributes_without_source_mutation(pa
     _assert_strict_source_snapshot(source, before)
     assert type(exc_info.value) is ValueError
     assert f"outer parameter '{parameter_name}'" in str(exc_info.value)
+    assert "class attribute" in str(exc_info.value)
+
+
+def test_resolved_lens_rejects_state_dependent_wrapper_descriptor_without_source_mutation():
+    """Detect a reserved wrapper descriptor without invoking its getter."""
+
+    class _ResolvedWithStateDependentSystemId(ResolvedStrongLensModel):
+        @property
+        def system_id(self):
+            if "setters" not in self.__dict__:
+                raise AttributeError("system_id is dormant before wrapper initialization")
+            return object()
+
+    source = _make_source_for_strict_rejection()
+    before = _strict_source_snapshot(source)
+
+    with pytest.raises(Exception) as exc_info:
+        _ResolvedWithStateDependentSystemId(source, **_resolved_constructor_kwargs())
+
+    _assert_strict_source_snapshot(source, before)
+    assert type(exc_info.value) is ValueError
+    assert "outer parameter 'system_id'" in str(exc_info.value)
     assert "class attribute" in str(exc_info.value)
 
 

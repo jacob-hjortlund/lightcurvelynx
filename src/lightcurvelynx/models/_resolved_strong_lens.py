@@ -1,3 +1,5 @@
+import inspect
+
 import numpy as np
 from astropy import units as u
 from astropy.coordinates import SkyCoord, SkyOffsetFrame
@@ -25,6 +27,7 @@ _RESOLVED_OUTER_PARAMETER_NAMES = (
     "macro_magnification",
     "time_delay",
 )
+_MISSING_STATIC_ATTRIBUTE = object()
 
 
 def _build_dependency_graph_without_mutation(source_model):
@@ -68,6 +71,13 @@ def _validate_source_for_resolved_lensing(source_model):
     if not isinstance(source_model, BasePhysicalModel):
         raise TypeError("source_model must be a BasePhysicalModel.")
 
+    effect_operation = inspect.getattr_static(source_model, "add_effect")
+    if effect_operation is BasePhysicalModel.add_effect:
+        raise ValueError(
+            "source_model must implement add_effect instead of inheriting the "
+            "unsupported BasePhysicalModel operation."
+        )
+
     reserved_setters = [
         name
         for name in ("base_ra", "base_dec", "base_t0", "macro_magnification")
@@ -76,7 +86,9 @@ def _validate_source_for_resolved_lensing(source_model):
     reserved_attributes = [
         name
         for name in ("base_ra", "base_dec", "base_t0", "macro_magnification")
-        if name not in source_model.setters and hasattr(source_model, name)
+        if name not in source_model.setters
+        and inspect.getattr_static(source_model, name, _MISSING_STATIC_ATTRIBUTE)
+        is not _MISSING_STATIC_ATTRIBUTE
     ]
     if reserved_setters or reserved_attributes:
         collision_details = []
@@ -105,7 +117,12 @@ def _validate_source_for_resolved_lensing(source_model):
 
 
 def _validate_resolved_wrapper_parameter_names(wrapper_model):
-    collisions = [name for name in _RESOLVED_OUTER_PARAMETER_NAMES if hasattr(wrapper_model, name)]
+    collisions = [
+        name
+        for name in _RESOLVED_OUTER_PARAMETER_NAMES
+        if inspect.getattr_static(wrapper_model, name, _MISSING_STATIC_ATTRIBUTE)
+        is not _MISSING_STATIC_ATTRIBUTE
+    ]
     if collisions:
         details = ", ".join(f"outer parameter '{name}'" for name in collisions)
         raise ValueError(
