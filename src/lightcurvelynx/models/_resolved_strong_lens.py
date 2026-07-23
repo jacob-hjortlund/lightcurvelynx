@@ -5,6 +5,38 @@ from scipy.optimize import least_squares
 
 from lightcurvelynx.base_models import FunctionNode
 from lightcurvelynx.effects.effect_model import EffectModel
+from lightcurvelynx.graph_state import GraphState
+from lightcurvelynx.models.physical_model import BasePhysicalModel
+
+
+def _validate_source_for_resolved_lensing(source_model):
+    if not isinstance(source_model, BasePhysicalModel):
+        raise TypeError("source_model must be a BasePhysicalModel.")
+
+    reserved = [
+        name
+        for name in ("base_ra", "base_dec", "base_t0", "macro_magnification")
+        if name in source_model.setters
+    ]
+    if reserved:
+        raise ValueError(
+            "source_model is already decorated or uses reserved resolved-lens "
+            f"parameters: {', '.join(reserved)}."
+        )
+
+    dependency_graph = source_model.build_dependency_graph()
+    for parameter_name in ("ra", "dec", "t0"):
+        full_name = GraphState.extended_param_name(
+            str(source_model),
+            parameter_name,
+        )
+        dependents = dependency_graph.outgoing[full_name]
+        if dependents:
+            raise ValueError(
+                "Cannot decorate source_model because parameter "
+                f"{parameter_name} has dependent parameters: "
+                f"{', '.join(sorted(dependents))}."
+            )
 
 
 def _coerce_scalar_samples(value, num_samples, name):

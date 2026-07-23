@@ -1,4 +1,4 @@
-"""Unresolved strong-lens models for a single physical source.
+"""Strong-lens models for a single physical source.
 
 An unresolved system combines all static macro-images into one measured flux.
 For absolute dimensionless magnifications ``mu_i`` and observer-frame arrival
@@ -9,6 +9,11 @@ delays in days, this module uses the convention
     F(t, wavelength) = sum_i mu_i * F_source(
         t - (delay_i - min(delay)), wavelength
     )
+
+A resolved system instead expands each sampled lens system into one row per
+active macro-image. Image metadata remains on the outer wrapper, while the
+exact source instance is decorated with image-dependent position, phase, and
+magnification transformations before ordinary one-image evaluation.
 
 Thus the earliest active image has zero relative delay, and later images are
 evaluated at earlier source times. An SED child owns its configured framework
@@ -33,6 +38,13 @@ does not contribute to the unresolved flux.
 
 import numpy as np
 
+from lightcurvelynx.math_nodes.state_expansion_node import StateExpansionNode
+from lightcurvelynx.models._resolved_strong_lens import (
+    _MacroMagnificationEffect,
+    _ResolvedCoordinatesNode,
+    _ResolvedImageDataNode,
+    _validate_source_for_resolved_lensing,
+)
 from lightcurvelynx.models.multi_object_model import MultiObjectModel
 from lightcurvelynx.models.physical_model import BandfluxModel, BasePhysicalModel
 
@@ -589,3 +601,167 @@ class UnresolvedStrongLensModel(MultiObjectModel):
             filters=filters,
             state=state,
         )
+
+
+class ResolvedStrongLensModel(MultiObjectModel):
+    """Wrap one physical source as separately sampled static macro-images.
+
+    Sampling expands each input lens system into one output row per active
+    image. The source instance is retained as the only child and decorated
+    with image-dependent sky-coordinate, phase, and macro-magnification
+    transformations.
+
+    Parameters
+    ----------
+    source_model : BasePhysicalModel
+        Physical source to decorate and evaluate once per resolved image.
+    source_x, source_y : parameter
+        Source-plane offsets from the lens origin in arcseconds.
+    image_x, image_y : parameter
+        Fixed-width image-plane offsets from the lens origin in arcseconds.
+    macro_magnifications : parameter
+        Fixed-width absolute, dimensionless macro-image magnifications.
+    time_delays : parameter
+        Fixed-width image arrival delays in observer-frame days.
+    num_images : parameter or None, optional
+        Number of active leading entries. ``None`` uses the full array width.
+    node_label : str or None, optional
+        Human-readable label for the outer model node.
+    """
+
+    simulation_metadata_params = ("system_id", "image_id")
+
+    def __init__(
+        self,
+        source_model,
+        *,
+        source_x,
+        source_y,
+        image_x,
+        image_y,
+        macro_magnifications,
+        time_delays,
+        num_images=None,
+        node_label=None,
+    ):
+        _validate_source_for_resolved_lensing(source_model)
+
+        image_data = _ResolvedImageDataNode(
+            source_t0=None,
+            source_x=source_x,
+            source_y=source_y,
+            image_x=image_x,
+            image_y=image_y,
+            macro_magnifications=macro_magnifications,
+            time_delays=time_delays,
+            num_images=num_images,
+            node_label=None if node_label is None else f"{node_label}_image_data",
+        )
+        expansion = StateExpansionNode(
+            param_names=[
+                "image_x",
+                "image_y",
+                "macro_magnification",
+                "time_delay",
+            ],
+            param_values=image_data.image_data,
+            node_label=None if node_label is None else f"{node_label}_expansion",
+        )
+        coordinates = _ResolvedCoordinatesNode(
+            source_ra=None,
+            source_dec=None,
+            source_x=image_data.source_x,
+            source_y=image_data.source_y,
+            image_x=expansion.image_x,
+            image_y=expansion.image_y,
+            node_label=None if node_label is None else f"{node_label}_coordinates",
+        )
+
+        source_model.add_parameter_offset("ra", coordinates.ra_offset)
+        source_model.add_parameter_offset("dec", coordinates.dec_offset)
+        coordinates.set_parameter("source_ra", source_model.base_ra)
+        coordinates.set_parameter("source_dec", source_model.base_dec)
+        source_model.add_parameter_offset("t0", expansion.time_delay)
+        image_data.set_parameter("source_t0", source_model.base_t0)
+        macro_effect = _MacroMagnificationEffect(expansion.macro_magnification)
+        source_model.add_effect(macro_effect)
+
+        super().__init__(
+            [source_model],
+            ra=source_model.ra,
+            dec=source_model.dec,
+            redshift=source_model.redshift,
+            t0=source_model.t0,
+            distance=source_model.distance,
+            node_label=node_label,
+        )
+
+        resolved_parameters = {
+            "system_id": expansion.org_inds,
+            "image_id": expansion.sub_inds,
+            "source_x": image_data.source_x,
+            "source_y": image_data.source_y,
+            "lens_ra": coordinates.lens_ra,
+            "lens_dec": coordinates.lens_dec,
+            "image_x": expansion.image_x,
+            "image_y": expansion.image_y,
+            "macro_magnification": expansion.macro_magnification,
+            "time_delay": expansion.time_delay,
+        }
+        for name, setter in resolved_parameters.items():
+            self.add_parameter(name, setter, allow_gradient=False)
+
+        self.source_model = source_model
+        self._image_data_node = image_data
+        self._image_expansion_node = expansion
+        self._coordinates_node = coordinates
+        self._macro_magnification_effect = macro_effect
+        self.apply_redshift = False
+
+    def minwave(self, graph_state=None):
+        """Return the child model's minimum wavelength bound."""
+        return self.source_model.minwave(graph_state=graph_state)
+
+    def maxwave(self, graph_state=None):
+        """Return the child model's maximum wavelength bound."""
+        return self.source_model.maxwave(graph_state=graph_state)
+
+    def _evaluate_single(self, times, wavelengths, state, **kwargs):
+        """Evaluate one resolved image's SED and wrapper effects."""
+        if isinstance(self.source_model, BandfluxModel):
+            raise TypeError(
+                "ResolvedStrongLensModel contains a BandfluxModel, which does not support SED evaluation."
+            )
+        flux_density = self.source_model._evaluate_single(
+            times,
+            wavelengths,
+            state,
+            **kwargs,
+        )
+        params = self.get_local_params(state)
+        for effect in self.obs_frame_effects:
+            flux_density = effect.apply(
+                flux_density,
+                times=times,
+                wavelengths=wavelengths,
+                **params,
+            )
+        return flux_density
+
+    def _evaluate_bandfluxes_single(self, passband_group, times, filters, state):
+        """Evaluate one resolved image's bandfluxes and wrapper effects."""
+        bandfluxes = self.source_model._evaluate_bandfluxes_single(
+            passband_group,
+            times,
+            filters,
+            state,
+        )
+        params = self.get_local_params(state)
+        for effect in self.obs_frame_effects:
+            bandfluxes = effect.apply_bandflux(
+                bandfluxes,
+                times=times,
+                filters=filters,
+                **params,
+            )
+        return bandfluxes
