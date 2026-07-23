@@ -44,6 +44,7 @@ from lightcurvelynx.models._resolved_strong_lens import (
     _MacroMagnificationEffect,
     _ResolvedCoordinatesNode,
     _ResolvedImageDataNode,
+    _validate_resolved_wrapper_node_label,
     _validate_resolved_wrapper_parameter_names,
     _validate_source_for_resolved_lensing,
 )
@@ -695,13 +696,15 @@ class ResolvedStrongLensModel(MultiObjectModel):
     Raises
     ------
     TypeError
-        If ``source_model`` is not a ``BasePhysicalModel``.
+        If ``source_model`` is not a ``BasePhysicalModel`` or ``node_label``
+        is neither a string nor ``None``.
     ValueError
         At construction, if the source is already decorated, uses a reserved
-        resolved-lens parameter, or has a required source parameter that
-        cannot be moved safely. During sampling, if the realized source epoch,
-        coordinates, image counts, fixed-width arrays, magnifications, or
-        delays violate their contracts.
+        resolved-lens parameter, has a required source parameter that cannot
+        be moved safely, or any reachable graph name contains the GraphState
+        separator. During sampling, if the realized source epoch, coordinates,
+        image counts, fixed-width arrays, magnifications, or delays violate
+        their contracts.
 
     Notes
     -----
@@ -789,10 +792,12 @@ class ResolvedStrongLensModel(MultiObjectModel):
         Raises
         ------
         TypeError
-            If ``source_model`` is not a ``BasePhysicalModel``.
+            If ``source_model`` is not a ``BasePhysicalModel`` or
+            ``node_label`` is neither a string nor ``None``.
         ValueError
             If source graph decoration is unsafe or conflicts with reserved
-            resolved-lens parameters.
+            resolved-lens parameters, or any reachable graph name contains
+            the GraphState separator.
 
         Notes
         -----
@@ -803,6 +808,7 @@ class ResolvedStrongLensModel(MultiObjectModel):
         instance as its sole child. Realization-dependent input validation
         occurs during sampling before state expansion.
         """
+        _validate_resolved_wrapper_node_label(node_label)
         _validate_resolved_wrapper_parameter_names(self)
         _validate_source_for_resolved_lensing(source_model)
 

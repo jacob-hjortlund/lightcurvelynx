@@ -30,6 +30,36 @@ _RESOLVED_OUTER_PARAMETER_NAMES = (
 _MISSING_STATIC_ATTRIBUTE = object()
 
 
+def _validate_graph_state_name(name, description):
+    """Validate one node or parameter name before GraphState construction."""
+    if not isinstance(name, str):
+        raise TypeError(f"{description} must be a string.")
+    if "." in name:
+        raise ValueError(f"{description} cannot contain the GraphState separator '.'.")
+
+
+def _validate_resolved_wrapper_node_label(node_label):
+    """Validate the prospective outer node label before source decoration."""
+    if node_label is not None:
+        _validate_graph_state_name(
+            node_label,
+            "ResolvedStrongLensModel node_label",
+        )
+
+
+def _validate_reachable_node_names(node):
+    """Validate one reachable node's GraphState-facing names."""
+    node_type = type(node).__name__
+    if node.node_label is not None:
+        _validate_graph_state_name(node.node_label, f"{node_type} node_label")
+    _validate_graph_state_name(node.node_string, f"{node_type} node string")
+    for parameter_name in node.setters:
+        _validate_graph_state_name(
+            parameter_name,
+            f"{node_type} registered parameter name",
+        )
+
+
 def _build_dependency_graph_without_mutation(source_model):
     """Inspect dependencies while preserving every reachable node identity."""
     reachable_nodes = []
@@ -41,6 +71,7 @@ def _build_dependency_graph_without_mutation(source_model):
             continue
         seen_nodes.add(node)
         reachable_nodes.append(node)
+        _validate_reachable_node_names(node)
         pending_nodes.extend(getattr(node, "objects", ()))
         pending_nodes.extend(
             setter.dependency for setter in node.setters.values() if setter.dependency is not None

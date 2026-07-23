@@ -274,6 +274,20 @@ def _strict_source_snapshot(source):
         "obs_frame_effects",
         "band_pass_effects",
     )
+    reachable_nodes = []
+    pending_nodes = [source]
+    seen_nodes = set()
+    while pending_nodes:
+        node = pending_nodes.pop()
+        if node in seen_nodes:
+            continue
+        seen_nodes.add(node)
+        reachable_nodes.append(node)
+        pending_nodes.extend(getattr(node, "objects", ()))
+        pending_nodes.extend(
+            setter.dependency for setter in node.setters.values() if setter.dependency is not None
+        )
+
     return {
         "setter_keys": tuple(source.setters),
         "setters": tuple(
@@ -294,8 +308,25 @@ def _strict_source_snapshot(source):
             for attribute in effect_attributes
             if hasattr(source, attribute)
         ),
-        "node_pos": source.node_pos,
-        "node_string": source.node_string,
+        "reachable_nodes": tuple(
+            (
+                node,
+                node.node_label,
+                node.node_pos,
+                node.node_string,
+                tuple(node.setters),
+                tuple(
+                    (
+                        name,
+                        setter,
+                        setter.dependency,
+                        setter.node_name,
+                    )
+                    for name, setter in node.setters.items()
+                ),
+            )
+            for node in reachable_nodes
+        ),
     }
 
 
@@ -309,20 +340,47 @@ def _assert_strict_source_snapshot(source, snapshot):
         assert getattr(source, attribute) is effect_list
         assert len(effect_list) == len(effects)
         assert all(current is expected for current, expected in zip(effect_list, effects, strict=True))
-    assert source.node_pos == snapshot["node_pos"]
-    assert source.node_string == snapshot["node_string"]
+    for node, node_label, node_pos, node_string, setter_keys, setters in snapshot["reachable_nodes"]:
+        assert node.node_label == node_label
+        assert node.node_pos == node_pos
+        assert node.node_string == node_string
+        assert tuple(node.setters) == setter_keys
+        for name, setter, dependency, setter_node_name in setters:
+            assert node.setters[name] is setter
+            assert node.setters[name].dependency is dependency
+            assert node.setters[name].node_name == setter_node_name
 
 
-def _make_source_for_strict_rejection(source_class=_PhaseSEDModel):
+def _make_source_for_strict_rejection(
+    source_class=_PhaseSEDModel,
+    *,
+    node_label=None,
+    redshift=None,
+):
+    if redshift is None:
+        redshift = GivenValueList([0.0], stateful=False)
     source = source_class(
         ra=20.0,
         dec=10.0,
-        redshift=GivenValueList([0.0], stateful=False),
+        redshift=redshift,
         t0=100.0,
+        node_label=node_label,
     )
     source.add_effect(ScaleFluxEffect(flux_scale=2.0))
     source.add_effect(_SEDOnlyEffect())
     return source
+
+
+def _capture_resolved_construction_error(source, *, node_label=None):
+    try:
+        ResolvedStrongLensModel(
+            source,
+            **_resolved_constructor_kwargs(),
+            node_label=node_label,
+        )
+    except Exception as exc:
+        return exc
+    return None
 
 
 def _record_effect_application(monkeypatch, effect, method_name, call_order, marker):
@@ -1376,6 +1434,76 @@ def test_resolved_lens_rejects_state_dependent_wrapper_descriptor_without_source
     assert type(exc_info.value) is ValueError
     assert "outer parameter 'system_id'" in str(exc_info.value)
     assert "class attribute" in str(exc_info.value)
+
+
+def test_resolved_lens_rejects_non_string_wrapper_label_without_source_mutation():
+    """Preflight a non-string prospective wrapper label atomically."""
+    source = _make_source_for_strict_rejection()
+    before = _strict_source_snapshot(source)
+
+    error = _capture_resolved_construction_error(source, node_label=object())
+
+    _assert_strict_source_snapshot(source, before)
+    assert type(error) is TypeError
+    assert "node_label must be a string" in str(error)
+
+
+def test_resolved_lens_rejects_dotted_wrapper_label_without_source_mutation():
+    """Preflight a wrapper label containing the GraphState separator."""
+    source = _make_source_for_strict_rejection()
+    before = _strict_source_snapshot(source)
+
+    error = _capture_resolved_construction_error(source, node_label="bad.label")
+
+    _assert_strict_source_snapshot(source, before)
+    assert type(error) is ValueError
+    assert "node_label" in str(error)
+    assert "GraphState separator" in str(error)
+
+
+def test_resolved_lens_rejects_dotted_source_label_without_source_mutation():
+    """Preflight the owned source label and node string atomically."""
+    source = _make_source_for_strict_rejection(node_label="bad.source")
+    before = _strict_source_snapshot(source)
+
+    error = _capture_resolved_construction_error(source)
+
+    _assert_strict_source_snapshot(source, before)
+    assert type(error) is ValueError
+    assert "node_label" in str(error)
+    assert "GraphState separator" in str(error)
+
+
+def test_resolved_lens_rejects_dotted_dependency_label_without_source_mutation():
+    """Preflight every reachable dependency label and node string atomically."""
+    dependency = GivenValueList(
+        [0.0],
+        stateful=False,
+        node_label="bad.dependency",
+    )
+    source = _make_source_for_strict_rejection(redshift=dependency)
+    before = _strict_source_snapshot(source)
+
+    error = _capture_resolved_construction_error(source)
+
+    _assert_strict_source_snapshot(source, before)
+    assert type(error) is ValueError
+    assert "node_label" in str(error)
+    assert "GraphState separator" in str(error)
+
+
+def test_resolved_lens_rejects_dotted_registered_parameter_without_source_mutation():
+    """Preflight every reachable registered parameter name atomically."""
+    source = _make_source_for_strict_rejection()
+    source.add_parameter("bad.parameter", 1.0)
+    before = _strict_source_snapshot(source)
+
+    error = _capture_resolved_construction_error(source)
+
+    _assert_strict_source_snapshot(source, before)
+    assert type(error) is ValueError
+    assert "registered parameter name" in str(error)
+    assert "GraphState separator" in str(error)
 
 
 @pytest.mark.parametrize("parameter_name", ["ra", "dec", "t0"])
