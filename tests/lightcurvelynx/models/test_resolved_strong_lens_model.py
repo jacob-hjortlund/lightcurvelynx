@@ -1,10 +1,14 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 from astropy import units as u
 from astropy.coordinates import SkyCoord, SkyOffsetFrame
 
+from lightcurvelynx.astro_utils.passbands import Passband, PassbandGroup
 from lightcurvelynx.effects.basic_effects import ScaleFluxEffect
 from lightcurvelynx.effects.effect_model import EffectModel
+from lightcurvelynx.graph_state import GraphState
 from lightcurvelynx.math_nodes.basic_math_node import BasicMathNode
 from lightcurvelynx.math_nodes.given_sampler import GivenValueList
 from lightcurvelynx.models._resolved_strong_lens import (
@@ -14,6 +18,13 @@ from lightcurvelynx.models._resolved_strong_lens import (
 )
 from lightcurvelynx.models.physical_model import BandfluxModel, BasePhysicalModel, SEDModel
 from lightcurvelynx.models.strong_lens_model import ResolvedStrongLensModel
+from lightcurvelynx.noise_models.base_noise_models import (
+    FluxNoiseModel,
+    GivenNoiseModel,
+)
+from lightcurvelynx.obstable.fake_obs_table import FakeObsTable
+from lightcurvelynx.simulate import simulate_lightcurves
+from lightcurvelynx.survey_info import SurveyInfo
 
 
 class _PhaseSEDModel(SEDModel):
@@ -33,6 +44,18 @@ class _PhaseBandfluxModel(BandfluxModel):
         """Return phase plus a fixed filter-dependent offset."""
         t0 = self.get_param(state, "t0")
         return times - t0 + {"g": 1.0, "r": 10.0}[filter]
+
+
+class _DeterministicNoise(FluxNoiseModel):
+    def apply_noise(self, bandflux, **kwargs):
+        del kwargs
+        bandflux = np.asarray(bandflux, dtype=float)
+        return bandflux + 0.5, np.full_like(bandflux, 0.25)
+
+
+class _SynchronousExecutor:
+    def map(self, function, iterable):
+        return [function(item) for item in iterable]
 
 
 class _RecordingSEDModel(SEDModel):
@@ -235,6 +258,307 @@ def _record_effect_application(monkeypatch, effect, method_name, call_order, mar
         return original_method(*args, **kwargs)
 
     monkeypatch.setattr(effect, method_name, recording_method)
+
+
+def _make_test_passbands():
+    return PassbandGroup(
+        [
+            Passband(
+                np.array(
+                    [
+                        [4_000.0, 0.5],
+                        [5_000.0, 1.0],
+                        [6_000.0, 0.5],
+                    ]
+                ),
+                "test",
+                "g",
+            )
+        ]
+    )
+
+
+def _make_three_image_resolved_simulation():
+    source = _PhaseBandfluxModel(
+        ra=20.0,
+        dec=10.0,
+        redshift=0.0,
+        t0=100.0,
+        node_label="source",
+    )
+    resolved = ResolvedStrongLensModel(
+        source,
+        source_x=0.0,
+        source_y=0.0,
+        image_x=[-2.0, 0.0, 2.0],
+        image_y=[0.0, 0.0, 0.0],
+        macro_magnifications=[1.0, 2.0, 3.0],
+        time_delays=[4.0, 0.0, 2.0],
+        node_label="resolved",
+    )
+    state = resolved.sample_parameters()
+    lens = SkyCoord(
+        ra=state["resolved.lens_ra"][0] * u.deg,
+        dec=state["resolved.lens_dec"][0] * u.deg,
+    )
+    image_positions = [lens.spherical_offsets_by(x * u.arcsec, 0.0 * u.arcsec) for x in [0.0, 2.0, -2.0]]
+    return resolved, image_positions, _make_test_passbands()
+
+
+def _make_uneven_resolved_simulation():
+    source = _PhaseBandfluxModel(
+        ra=GivenValueList([20.0, 30.0], stateful=False),
+        dec=GivenValueList([10.0, -5.0], stateful=False),
+        redshift=0.0,
+        t0=GivenValueList([100.0, 200.0], stateful=False),
+        node_label="source",
+    )
+    _, resolved = _make_resolved_lens(source=source)
+    observations = FakeObsTable(
+        {
+            "time": [210.0, 210.0],
+            "ra": [20.0, 30.0],
+            "dec": [10.0, -5.0],
+            "filter": ["g", "g"],
+        },
+        radius=5.0 / 3600.0,
+        bandflux_error=0.0,
+    )
+    survey = SurveyInfo(
+        obstable=observations,
+        passbands=_make_test_passbands(),
+        noise_model=_DeterministicNoise(),
+    )
+    return resolved, survey
+
+
+def test_resolved_lens_simulation_matches_each_image_footprint():
+    """Match survey observations against each resolved image coordinate."""
+    resolved, image_positions, passbands = _make_three_image_resolved_simulation()
+    observations = FakeObsTable(
+        {
+            "time": [110.0, 110.0, 110.0],
+            "ra": [position.ra.deg for position in image_positions],
+            "dec": [position.dec.deg for position in image_positions],
+            "filter": ["g", "g", "g"],
+        },
+        radius=0.5 / 3600.0,
+        bandflux_error=0.0,
+    )
+    survey = SurveyInfo(
+        obstable=observations,
+        passbands=passbands,
+        noise_model=GivenNoiseModel(),
+    )
+
+    results = simulate_lightcurves(
+        resolved,
+        1,
+        survey,
+        progress_bar=False,
+    )
+
+    assert len(results) == 3
+    np.testing.assert_array_equal(results["system_id"], [0, 0, 0])
+    np.testing.assert_array_equal(results["image_id"], [0, 1, 2])
+    np.testing.assert_array_equal(results["t0"], [100.0, 102.0, 104.0])
+    np.testing.assert_array_equal(results["nobs"], [1, 1, 1])
+    np.testing.assert_allclose(
+        results["ra"],
+        [position.ra.deg for position in image_positions],
+        rtol=0.0,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        results["dec"],
+        [position.dec.deg for position in image_positions],
+        rtol=0.0,
+        atol=1e-12,
+    )
+    for image_id in range(3):
+        lightcurve = results["lightcurve"].iloc[image_id]
+        assert lightcurve["obs_idx"].tolist() == [image_id]
+    np.testing.assert_array_equal(
+        results["lightcurve.flux_perfect"],
+        [22.0, 27.0, 7.0],
+    )
+
+
+def test_resolved_lens_simulation_applies_noise_and_retains_unmatched_image():
+    """Apply noise per image and keep provenance when one image is unseen."""
+    resolved, image_positions, passbands = _make_three_image_resolved_simulation()
+
+    def make_survey(pointings):
+        observations = FakeObsTable(
+            {
+                "time": [110.0, 110.0, 110.0],
+                "ra": [position.ra.deg for position in pointings],
+                "dec": [position.dec.deg for position in pointings],
+                "filter": ["g", "g", "g"],
+            },
+            radius=0.5 / 3600.0,
+            bandflux_error=0.0,
+        )
+        return SurveyInfo(
+            obstable=observations,
+            passbands=passbands,
+            noise_model=_DeterministicNoise(),
+        )
+
+    results = simulate_lightcurves(
+        resolved,
+        1,
+        make_survey(image_positions),
+        progress_bar=False,
+    )
+
+    np.testing.assert_array_equal(results["nobs"], [1, 1, 1])
+    np.testing.assert_array_equal(
+        results["lightcurve.flux"],
+        [22.5, 27.5, 7.5],
+    )
+    np.testing.assert_array_equal(
+        results["lightcurve.fluxerr"],
+        [0.25, 0.25, 0.25],
+    )
+
+    displaced_pointings = list(image_positions)
+    displaced_pointings[1] = image_positions[1].spherical_offsets_by(
+        0.0 * u.arcsec,
+        20.0 * u.arcsec,
+    )
+    unmatched = simulate_lightcurves(
+        resolved,
+        1,
+        make_survey(displaced_pointings),
+        progress_bar=False,
+    )
+
+    assert len(unmatched) == 3
+    np.testing.assert_array_equal(unmatched["system_id"], [0, 0, 0])
+    np.testing.assert_array_equal(unmatched["image_id"], [0, 1, 2])
+    np.testing.assert_array_equal(unmatched["nobs"], [1, 0, 1])
+    assert unmatched["lightcurve"].iloc[1] is None
+    for image_id, expected_flux in ((0, 22.5), (2, 7.5)):
+        lightcurve = unmatched["lightcurve"].iloc[image_id]
+        assert lightcurve["obs_idx"].tolist() == [image_id]
+        np.testing.assert_array_equal(lightcurve["flux"], [expected_flux])
+        np.testing.assert_array_equal(lightcurve["fluxerr"], [0.25])
+
+
+def test_resolved_lens_simulation_batching_matches_serial_and_threaded():
+    """Preserve global image rows across uneven synchronous/threaded batches."""
+    resolved, survey = _make_uneven_resolved_simulation()
+    simulation_kwargs = {
+        "param_cols": ["resolved.macro_magnification"],
+        "progress_bar": False,
+    }
+    serial = simulate_lightcurves(
+        resolved,
+        2,
+        survey,
+        **simulation_kwargs,
+    )
+    batched = simulate_lightcurves(
+        resolved,
+        2,
+        survey,
+        executor=_SynchronousExecutor(),
+        batch_size=1,
+        **simulation_kwargs,
+    )
+
+    threaded_resolved, threaded_survey = _make_uneven_resolved_simulation()
+    threaded_resolved.set_graph_positions()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        threaded = simulate_lightcurves(
+            threaded_resolved,
+            2,
+            threaded_survey,
+            executor=executor,
+            batch_size=1,
+            **simulation_kwargs,
+        )
+
+    for results in (serial, batched, threaded):
+        assert len(results) == 5
+        np.testing.assert_array_equal(results["system_id"], [0, 0, 1, 1, 1])
+        np.testing.assert_array_equal(results["image_id"], [0, 1, 0, 1, 2])
+        np.testing.assert_array_equal(results["t0"], [100.0, 102.0, 200.0, 201.0, 202.0])
+        np.testing.assert_array_equal(
+            results["resolved_macro_magnification"],
+            [2.0, 3.0, 4.0, 6.0, 5.0],
+        )
+        np.testing.assert_array_equal(results["nobs"], [1, 1, 1, 1, 1])
+
+    for actual in (batched, threaded):
+        for column in ("system_id", "image_id", "nobs"):
+            np.testing.assert_array_equal(actual[column], serial[column])
+        for column in ("ra", "dec", "t0", "resolved_macro_magnification"):
+            np.testing.assert_allclose(actual[column], serial[column], rtol=0.0, atol=1e-12)
+        for row_index in range(5):
+            actual_lightcurve = actual["lightcurve"].iloc[row_index]
+            serial_lightcurve = serial["lightcurve"].iloc[row_index]
+            for column in ("flux_perfect", "flux"):
+                np.testing.assert_array_equal(
+                    actual_lightcurve[column],
+                    serial_lightcurve[column],
+                )
+
+
+def test_resolved_lens_simulation_replay_uses_expanded_state(monkeypatch):
+    """Replay realized image rows without resampling requested lens systems."""
+    resolved, survey = _make_uneven_resolved_simulation()
+    simulation_kwargs = {
+        "param_cols": ["resolved.macro_magnification"],
+        "progress_bar": False,
+    }
+    results = simulate_lightcurves(
+        resolved,
+        2,
+        survey,
+        **simulation_kwargs,
+    )
+    params_rows = results["params"].tolist()
+    state = GraphState.from_dict(
+        {name: [params[name] for params in params_rows] for name in params_rows[0]},
+        num_samples=len(params_rows),
+    )
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("model resampled during replay")
+
+    monkeypatch.setattr(resolved, "sample_parameters", fail_if_called)
+    replay = simulate_lightcurves(
+        resolved,
+        state.num_samples,
+        survey,
+        graph_state=state,
+        **simulation_kwargs,
+    )
+
+    for column in ("id", "system_id", "image_id", "nobs"):
+        np.testing.assert_array_equal(replay[column], results[column])
+    for column in ("ra", "dec", "t0", "z", "resolved_macro_magnification"):
+        np.testing.assert_allclose(replay[column], results[column], rtol=0.0, atol=1e-12)
+    for row_index in range(state.num_samples):
+        np.testing.assert_array_equal(
+            replay["lightcurve"].iloc[row_index]["flux_perfect"],
+            results["lightcurve"].iloc[row_index]["flux_perfect"],
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="Graph state has 5 samples, but simulation is set to 2 samples",
+    ):
+        simulate_lightcurves(
+            resolved,
+            2,
+            survey,
+            graph_state=state,
+            **simulation_kwargs,
+        )
 
 
 def test_resolved_lens_owns_and_decorates_source():
