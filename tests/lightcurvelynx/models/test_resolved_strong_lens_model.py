@@ -258,6 +258,32 @@ def test_resolved_lens_rejects_dependent_source_parameters_without_mutation(para
     assert _source_configuration(source) == before
 
 
+def test_resolved_lens_rejection_preserves_unlabeled_reachable_graph_identity():
+    """Reject without assigning graph identities to any reachable node."""
+    source = _PhaseSEDModel(
+        ra=20.0,
+        dec=10.0,
+        redshift=0.0,
+        t0=100.0,
+    )
+    dependent = BasicMathNode("value + 1.0", value=source.ra)
+    source.set_parameter("distance", dependent)
+
+    def graph_identity(node):
+        return (
+            node.node_pos,
+            node.node_string,
+            tuple(setter.node_name for setter in node.setters.values()),
+        )
+
+    before = tuple(graph_identity(node) for node in (source, dependent))
+
+    with pytest.raises(ValueError, match="parameter ra has dependent parameters"):
+        ResolvedStrongLensModel(source, **_resolved_constructor_kwargs())
+
+    assert tuple(graph_identity(node) for node in (source, dependent)) == before
+
+
 def test_image_data_node_normalizes_sorts_and_ignores_padding():
     """Active images are normalized and stably ordered ahead of padding."""
     node = _ResolvedImageDataNode(

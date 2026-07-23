@@ -9,6 +9,43 @@ from lightcurvelynx.graph_state import GraphState
 from lightcurvelynx.models.physical_model import BasePhysicalModel
 
 
+def _build_dependency_graph_without_mutation(source_model):
+    """Inspect dependencies while preserving every reachable node identity."""
+    reachable_nodes = []
+    pending_nodes = [source_model]
+    seen_nodes = set()
+    while pending_nodes:
+        node = pending_nodes.pop()
+        if node in seen_nodes:
+            continue
+        seen_nodes.add(node)
+        reachable_nodes.append(node)
+        pending_nodes.extend(getattr(node, "objects", ()))
+        pending_nodes.extend(
+            setter.dependency for setter in node.setters.values() if setter.dependency is not None
+        )
+
+    snapshots = [
+        (
+            node,
+            node.node_pos,
+            node.node_string,
+            tuple((setter, setter.node_name) for setter in node.setters.values()),
+        )
+        for node in reachable_nodes
+    ]
+    try:
+        dependency_graph = source_model.build_dependency_graph()
+        source_node_string = str(source_model)
+    finally:
+        for node, node_pos, node_string, setter_snapshots in snapshots:
+            node.node_pos = node_pos
+            node.node_string = node_string
+            for setter, node_name in setter_snapshots:
+                setter.node_name = node_name
+    return dependency_graph, source_node_string
+
+
 def _validate_source_for_resolved_lensing(source_model):
     if not isinstance(source_model, BasePhysicalModel):
         raise TypeError("source_model must be a BasePhysicalModel.")
@@ -24,10 +61,10 @@ def _validate_source_for_resolved_lensing(source_model):
             f"parameters: {', '.join(reserved)}."
         )
 
-    dependency_graph = source_model.build_dependency_graph()
+    dependency_graph, source_node_string = _build_dependency_graph_without_mutation(source_model)
     for parameter_name in ("ra", "dec", "t0"):
         full_name = GraphState.extended_param_name(
-            str(source_model),
+            source_node_string,
             parameter_name,
         )
         dependents = dependency_graph.outgoing[full_name]
