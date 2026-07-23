@@ -22,8 +22,9 @@ instead produces observer-frame bandfluxes, with no framework redshift
 conversion by either child or wrapper. Effects marked as rest-frame and added
 through the wrapper are delegated to the child: an SED child applies them in
 its rest-frame pipeline, whereas a ``BandfluxModel`` applies them through its
-observer-frame band-pass API. Observer-frame effects added to the wrapper are
-applied once after the image sum.
+observer-frame band-pass API. Observer-frame effects added to an unresolved
+wrapper are applied once after image summation. Effects added through a
+resolved wrapper after construction instead run per realized image.
 
 The fixed-width ``macro_magnifications`` and ``time_delays`` arrays and the
 ``num_images`` count from
@@ -604,29 +605,143 @@ class UnresolvedStrongLensModel(MultiObjectModel):
 
 
 class ResolvedStrongLensModel(MultiObjectModel):
-    """Wrap one physical source as separately sampled static macro-images.
+    """Wrap one physical source as unconditionally resolved macro-images.
 
-    Sampling expands each input lens system into one output row per active
-    image. The source instance is retained as the only child and decorated
-    with image-dependent sky-coordinate, phase, and macro-magnification
-    transformations.
+    During fresh sampling, ``num_samples`` counts lens systems. Each system is
+    expanded into one realized row per active image, so evaluation and
+    simulation results contain image rows rather than system rows. Active
+    images are normalized to their earliest arrival delay and stably ordered
+    by that delay. ``system_id`` identifies the input system and ``image_id``
+    identifies its image in this normalized order.
 
     Parameters
     ----------
     source_model : BasePhysicalModel
-        Physical source to decorate and evaluate once per resolved image.
+        Exact physical source instance to decorate, own, and evaluate once per
+        resolved image. Its realized ``ra`` and ``dec`` are the unlensed source
+        coordinate used with ``source_x`` and ``source_y`` to infer the lens
+        origin. Its realized ``t0`` must be finite. Successful construction
+        mutates the instance's parameter graph and effect pipeline; it must not
+        subsequently be reused as an independent source or in another
+        composite model.
     source_x, source_y : parameter
-        Source-plane offsets from the lens origin in arcseconds.
+        Setters for scalar source-plane tangent offsets from the lens origin.
+        ``source_x`` is east and ``source_y`` is north, both in arcseconds.
+        Realized values are scalar for one system and have shape ``(S,)`` for
+        ``S`` systems.
     image_x, image_y : parameter
-        Fixed-width image-plane offsets from the lens origin in arcseconds.
+        Setters for fixed-width image-plane tangent offsets about the same lens
+        origin. ``image_x`` is east and ``image_y`` is north, both in
+        arcseconds. Realized values have shape ``(I,)`` for one system and
+        ``(S, I)`` for ``S`` systems.
     macro_magnifications : parameter
-        Fixed-width absolute, dimensionless macro-image magnifications.
+        Setter for fixed-width absolute, dimensionless macro-image
+        magnifications, with the same realized shape as ``image_x``.
     time_delays : parameter
-        Fixed-width image arrival delays in observer-frame days.
+        Setter for fixed-width image arrival delays in observer-frame days,
+        with the same realized shape as ``image_x``. A common delay offset is
+        removed before expansion.
     num_images : parameter or None, optional
-        Number of active leading entries. ``None`` uses the full array width.
+        Setter for the number of active leading entries in each fixed-width
+        image array. Realized counts must satisfy ``2 <= num_images <= I``.
+        ``None`` activates all ``I`` entries.
     node_label : str or None, optional
         Human-readable label for the outer model node.
+
+    Attributes
+    ----------
+    source_model : BasePhysicalModel
+        The exact owned and decorated source passed to the constructor.
+    objects : list of BasePhysicalModel
+        The one-element child-model list used by ``MultiObjectModel``.
+    num_objects : int
+        Number of child models, always one.
+    simulation_metadata_params : tuple of str
+        ``("system_id", "image_id")``, promoting resolved-image provenance to
+        top-level simulation results.
+    apply_redshift : bool
+        ``False`` so the wrapper never performs an additional redshift
+        conversion. An SED child owns its conversion; a ``BandfluxModel``
+        remains in the observer frame.
+    system_id, image_id : parameter
+        Scalar outer provenance parameters for the input system and the image
+        within its delay-normalized order.
+    source_x, source_y : parameter
+        Scalar outer parameters retaining the realized source-plane east and
+        north offsets in arcseconds.
+    lens_ra, lens_dec : parameter
+        Scalar outer parameters for the inferred lens-origin right ascension
+        and declination in degrees.
+    image_x, image_y : parameter
+        Scalar outer parameters for the current image's east and north tangent
+        offsets in arcseconds.
+    macro_magnification : parameter
+        Scalar outer parameter for the current image's absolute,
+        dimensionless magnification.
+    time_delay : parameter
+        Scalar outer parameter for the current image's normalized
+        observer-frame arrival delay in days.
+    ra, dec : parameter
+        Final per-image right ascension and declination in degrees.
+    t0 : parameter
+        Final per-image epoch in days, equal to the realized source epoch plus
+        ``time_delay``.
+    redshift : parameter
+        Dimensionless child redshift linked onto the outer wrapper.
+    distance : parameter
+        Child luminosity distance in parsecs linked onto the outer wrapper.
+
+    Raises
+    ------
+    TypeError
+        If ``source_model`` is not a ``BasePhysicalModel``.
+    ValueError
+        At construction, if the source is already decorated, uses a reserved
+        resolved-lens parameter, or has a required source parameter that
+        cannot be moved safely. During sampling, if the realized source epoch,
+        coordinates, image counts, fixed-width arrays, magnifications, or
+        delays violate their contracts.
+
+    Notes
+    -----
+    Construction preflights every known rejection before graph decoration.
+    Rejected construction therefore leaves the source's graph node identities,
+    setters, dependencies, and effect lists unchanged.
+
+    The full image arrays must be float-coercible, one-dimensional per system,
+    and equal in fixed width. Validation then uses only the active leading
+    prefix: positions and delays must be finite, magnifications must be finite
+    and non-negative, and at least one active magnification must be positive.
+    Float-coercible inactive padding is ignored. Active delays have their
+    minimum subtracted and are sorted stably with all paired image fields, so
+    the earliest image retains the source ``t0`` and equal-delay images retain
+    backend order.
+
+    Spherical coordinate transformations recover the lens origin from the
+    unlensed source coordinate and source-plane offset, then place every image
+    from its image-plane offset. Right ascension wrapping, declination
+    dependence, and near-pole coordinates such as 89.9 degrees are supported;
+    the singular exact declination endpoints at plus or minus 90 degrees are
+    excluded.
+
+    Effects present on ``source_model`` before wrapping have latent values
+    sampled once per system and shared by all of its image rows, while their
+    evaluation receives each image's final ``ra``, ``dec``, and ``t0``.
+    Parameters first introduced through effects added after wrapping are
+    sampled after expansion, making stochastic draws image-specific; the
+    effects are evaluated per realized image. Constants and explicit links
+    retain normal graph-sharing semantics. The child's macro-magnification is
+    applied once before outer observer-frame effects.
+
+    Every active image is treated as resolved, without a seeing, PSF, blend,
+    or resolution model. Survey footprint matching uses each final per-image
+    ``ra`` and ``dec`` independently.
+
+    Caustics is optional and is not imported or type-checked here. The public
+    parameter indicators of ``CausticsSourcePositionNode`` and
+    ``CausticsLensImageNode`` can be connected directly to the corresponding
+    constructor arguments; any other backend may supply the same generic
+    parameter contracts.
     """
 
     simulation_metadata_params = ("system_id", "image_id")
@@ -644,6 +759,49 @@ class ResolvedStrongLensModel(MultiObjectModel):
         num_images=None,
         node_label=None,
     ):
+        """Configure a resolved strong-lens wrapper.
+
+        Parameters
+        ----------
+        source_model : BasePhysicalModel
+            Exact source instance to own and decorate. Its ``ra`` and ``dec``
+            setters describe the unlensed source coordinate, and its realized
+            ``t0`` must be finite.
+        source_x, source_y : parameter
+            Scalar per-system east and north tangent-plane offsets,
+            respectively, in arcseconds about the lens origin.
+        image_x, image_y : parameter
+            Fixed-width per-system east and north tangent-plane image offsets,
+            respectively, in arcseconds about the same lens origin.
+        macro_magnifications : parameter
+            Fixed-width absolute, dimensionless image magnifications.
+        time_delays : parameter
+            Fixed-width observer-frame image arrival delays in days.
+        num_images : parameter or None, optional
+            Active leading-image count for each system. ``None`` activates the
+            complete common width; otherwise each count must be an exact
+            integer from two through that width.
+        node_label : str or None, optional
+            Human-readable label for the outer model node and its private
+            graph collaborators.
+
+        Raises
+        ------
+        TypeError
+            If ``source_model`` is not a ``BasePhysicalModel``.
+        ValueError
+            If source graph decoration is unsafe or conflicts with reserved
+            resolved-lens parameters.
+
+        Notes
+        -----
+        The constructor validates decoratability before mutating the source.
+        On success, it moves the source's original ``ra``, ``dec``, and ``t0``
+        recipes to preserved base parameters, installs per-image coordinate
+        and delay offsets plus macro-magnification, and retains that exact
+        instance as its sole child. Realization-dependent input validation
+        occurs during sampling before state expansion.
+        """
         _validate_source_for_resolved_lensing(source_model)
 
         image_data = _ResolvedImageDataNode(

@@ -332,6 +332,98 @@ def _make_uneven_resolved_simulation():
     return resolved, survey
 
 
+def test_resolved_lens_accepts_direct_caustics_node_outputs():
+    """Wire the real optional Caustics node outputs directly into the model."""
+    caustics = pytest.importorskip("caustics")
+    pytest.importorskip("torch")
+    pytest.importorskip("contourpy")
+    pytest.importorskip("shapely")
+
+    from astropy.cosmology import FlatLambdaCDM as AstropyFlatLambdaCDM
+
+    from lightcurvelynx.models.caustics_models import (
+        CausticsLensImageNode,
+        CausticsLensSpec,
+        CausticsSourcePositionNode,
+    )
+
+    astropy_cosmology = AstropyFlatLambdaCDM(H0=70.0, Om0=0.3)
+    cosmology = caustics.FlatLambdaCDM(
+        h0=astropy_cosmology.h,
+        critical_density_0=astropy_cosmology.critical_density0.to_value(u.Msun / u.Mpc**3),
+        Om0=astropy_cosmology.Om0,
+    )
+    lens = CausticsLensSpec(
+        "SIS",
+        {"z_l": 0.5, "x0": 0.0, "y0": 0.0, "Rein": 1.0},
+    )
+    source_position = CausticsSourcePositionNode(
+        lens,
+        cosmology=cosmology,
+        source_redshift=1.5,
+        fov=4.0,
+        pixelscale=0.1,
+        max_fov_expansions=2,
+        fov_expansion_factor=2.0,
+        pseudo_caustic_points=32,
+        pseudo_caustic_epsilon=0.05,
+        geometry_tolerance=0.01,
+        boundary_tolerance=0.05,
+        max_boundary_refinements=4,
+        max_attempts=50,
+        seed=17,
+        node_label="caustics_source",
+    )
+    images = CausticsLensImageNode(
+        lens,
+        cosmology=cosmology,
+        source_redshift=1.5,
+        source_x=source_position.source_x,
+        source_y=source_position.source_y,
+        expected_num_images=source_position.expected_num_images,
+        max_images=4,
+        min_images=2,
+        fov=4.0,
+        fov_multiplier=1.0,
+        pixelscale=0.05,
+        epsilon=0.01,
+        max_depth=8,
+        max_fov_expansions=1,
+        fov_expansion_factor=2.0,
+        max_pixelscale_refinements=1,
+        pixelscale_refinement_factor=0.5,
+        node_label="caustics_images",
+    )
+    source = _PhaseSEDModel(
+        ra=20.0,
+        dec=10.0,
+        redshift=0.0,
+        t0=100.0,
+        node_label="source",
+    )
+    resolved = ResolvedStrongLensModel(
+        source,
+        source_x=source_position.source_x,
+        source_y=source_position.source_y,
+        image_x=images.image_x,
+        image_y=images.image_y,
+        macro_magnifications=images.macro_magnifications,
+        time_delays=images.time_delays,
+        num_images=images.num_images,
+        node_label="resolved",
+    )
+
+    state = resolved.sample_parameters(
+        num_samples=1,
+        rng_info=np.random.default_rng(19),
+    )
+
+    assert state.num_samples >= 2
+    assert np.all(np.isfinite(np.atleast_1d(state["resolved.ra"])))
+    assert np.all(np.isfinite(np.atleast_1d(state["resolved.dec"])))
+    assert np.all(np.atleast_1d(state["resolved.macro_magnification"]) >= 0.0)
+
+
 def test_resolved_lens_simulation_matches_each_image_footprint():
     """Match survey observations against each resolved image coordinate."""
     resolved, image_positions, passbands = _make_three_image_resolved_simulation()
