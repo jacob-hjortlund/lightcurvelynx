@@ -554,10 +554,8 @@ def _simulate_lightcurves_batch(simulation_info):
                 object_nested_dict["obs_idx"].append(obs_index)
                 for col in obstable_save_cols:
                     if len(obs_index) > 0:
-                        col_data = (
-                            obstable[survey_idx][col].values[obs_index]
-                            if col in obstable[survey_idx]
-                            else np.full(nobs, None)
+                        col_data = obstable[survey_idx].get_value_per_row(
+                            col, indices=obs_index, default=None
                         )
                         object_nested_dict[col].append(col_data)
 
