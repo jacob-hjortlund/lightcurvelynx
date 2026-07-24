@@ -488,7 +488,7 @@ def test_simulate_lightcurves(test_data_dir):
         source,
         5,
         survey_info,
-        obstable_save_cols=["observationId", "zp_nJy"],
+        obstable_save_cols=["observationId", "zp_nJy", "read_noise"],
         param_cols=["source.brightness"],
         progress_bar=False,  # Disable progress bar for testing
     )
@@ -511,6 +511,7 @@ def test_simulate_lightcurves(test_data_dir):
         assert len(np.unique(results.loc[idx]["lightcurve"]["observationId"])) == num_obs
         assert np.all(results.loc[idx]["lightcurve"]["observationId"] >= 0)
         assert len(results.loc[idx]["lightcurve"]["zp_nJy"]) == num_obs
+        assert np.allclose(results.loc[idx]["lightcurve"]["read_noise"], 8.8)
 
         # Check that we have the survey and obs indices. All observations come from the first
         # survey, and the obs indices are unique.
