@@ -1431,6 +1431,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         "image_y",
         "macro_magnifications",
         "time_delays",
+        "macro_convergences",
+        "macro_shear",
         "image_count_deficit",
         "solver_fov",
         "solver_pixelscale",
@@ -1771,6 +1773,10 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             Active image-plane y positions in arcseconds.
         macro_magnifications : numpy.ndarray, shape (I,)
             Absolute dimensionless macro-magnifications.
+        macro_convergences: numpy.ndarray, shape (I,)
+            Macro convergence at each image position
+        macro_shears: numpy.ndarray, shape (I,)
+            Macro shear at each image position
         time_delays : numpy.ndarray, shape (I,)
             Observer-frame relative delays in days, normalized to start at zero.
         diagnostics : dict
@@ -2234,11 +2240,17 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         image_y_tensor = torch.as_tensor(coordinates[:, 1], dtype=torch.float64)
         magnifications = torch.abs(lens.magnification(image_x_tensor, image_y_tensor))
         time_delays = lens.time_delay(image_x_tensor, image_y_tensor)
-
+        convergences = lens.convergence(image_x_tensor, image_y_tensor)
+        shear1, shear2 = lens.shear(image_x_tensor, image_y_tensor)
+        
         image_x = coordinates[:, 0]
         image_y = coordinates[:, 1]
         magnifications = _runtime._to_numpy(magnifications)
         time_delays = _runtime._to_numpy(time_delays)
+        convergences = _runtime._to_numpy(convergences)
+        shear1 = _runtime._to_numpy(shear1)
+        shear2 = _runtime._to_numpy(shear2)
+        shears = np.sqrt(shear1**2 + shear2**2)
 
         time_delays = time_delays - np.min(time_delays)
         # np.lexsort uses the final key as the primary key: delay, then x, then y.
@@ -2248,6 +2260,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
             image_y[order],
             magnifications[order],
             time_delays[order],
+            convergences[order],
+            shears[order],
             {
                 "image_count_deficit": (
                     -1 if expected_num_images is None else expected_num_images - num_images
@@ -2288,16 +2302,18 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                zero-padded;
             5. ``time_delays``, observer-frame days relative to zero,
                NaN-padded;
-            6. ``image_count_deficit``, expected minus recovered count or
+            6. ``convergences``, NaN-padded;
+            7. ``shears``, NaN-padded;
+            8. ``image_count_deficit``, expected minus recovered count or
                ``-1`` without an expectation;
-            7. ``solver_fov``, final accepted or bounded-deficit FOV in
+            9. ``solver_fov``, final accepted or bounded-deficit FOV in
                arcseconds;
-            8. ``solver_pixelscale``, final successful global variant's actual
+            10. ``solver_pixelscale``, final successful global variant's actual
                grid spacing in arcseconds;
-            9. ``solver_attempts``, global calls plus executed recovery-seed
+            11. ``solver_attempts``, global calls plus executed recovery-seed
                batches;
-            10. ``solver_fov_expansions``, outer FOV steps only;
-            11. ``solver_pixelscale_refinements``, outer requested-scale
+            12. ``solver_fov_expansions``, outer FOV steps only;
+            13. ``solver_pixelscale_refinements``, outer requested-scale
                 steps only.
 
             For one sample, count and diagnostic outputs are NumPy scalars and
@@ -2360,6 +2376,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         image_y = np.full((num_samples, self.max_images), np.nan)
         magnifications = np.zeros((num_samples, self.max_images), dtype=float)
         time_delays = np.full((num_samples, self.max_images), np.nan)
+        convergences = np.full((num_samples, self.max_images), np.nan)
+        shears = np.full((num_samples, self.max_images), np.nan)
         image_count_deficit = np.empty(num_samples, dtype=int)
         solver_fov = np.empty(num_samples, dtype=float)
         solver_pixelscale = np.empty(num_samples, dtype=float)
@@ -2372,13 +2390,15 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 name: _runtime._sample_value(value, sample_index, num_samples)
                 for name, value in input_values.items()
             }
-            current_x, current_y, current_mu, current_delay, diagnostics = self._solve_one(current_values)
+            current_x, current_y, current_mu, current_delay, current_convergence, current_shear, diagnostics = self._solve_one(current_values)
             count = len(current_x)
             counts[sample_index] = count
             image_x[sample_index, :count] = current_x
             image_y[sample_index, :count] = current_y
             magnifications[sample_index, :count] = current_mu
             time_delays[sample_index, :count] = current_delay
+            convergences[sample_index, :count] = current_convergence
+            shears[sample_index, :count] = current_shear
             image_count_deficit[sample_index] = diagnostics["image_count_deficit"]
             solver_fov[sample_index] = diagnostics["solver_fov"]
             solver_pixelscale[sample_index] = diagnostics["solver_pixelscale"]
@@ -2393,6 +2413,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 image_y[0],
                 magnifications[0],
                 time_delays[0],
+                convergences[0],
+                shears[0],
                 image_count_deficit[0],
                 solver_fov[0],
                 solver_pixelscale[0],
@@ -2407,6 +2429,8 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
                 image_y,
                 magnifications,
                 time_delays,
+                convergences,
+                shears,
                 image_count_deficit,
                 solver_fov,
                 solver_pixelscale,
