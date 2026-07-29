@@ -153,3 +153,9 @@ _html/
 src/lightcurvelynx/astro_utils/passbands/*
 data/*
 docs/notebooks/scratch
+
+
+# Local stuff
+caustics.ipynb
+example.py
+docs/superpowers/
