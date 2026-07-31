@@ -1016,6 +1016,149 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             realized_pixelscale,
         )
 
+    def _sample_certified_position_for_one_lens(
+        self,
+        region,
+        rng,
+        geometry_adapter,
+        adapter_values,
+        previous_geometry,
+        geometry,
+        uncertainty,
+        refinements,
+        *,
+        sample_index,
+        geometry_settings,
+    ):
+        """Sample one source position within a bounded certification budget.
+
+        Parameters
+        ----------
+        region : shapely.Polygon or shapely.MultiPolygon
+            Complete repaired strong-lensing source region with coordinates in
+            arcseconds.
+        rng : numpy.random.Generator
+            Sample-local random generator used for every proposal attempt.
+        geometry_adapter : _GeometryAdapter
+            Realized aggregate geometry adapter used for signed image counts.
+        adapter_values : Mapping
+            Recursive realized values consumed by ``geometry_adapter``.
+        previous_geometry : _BoundaryGeometry
+            Penultimate certified boundary snapshot.
+        geometry : _BoundaryGeometry
+            Final certified boundary snapshot, including point-caustic
+            exclusions.
+        uncertainty : float
+            Maximum matched-boundary displacement in arcseconds.
+        refinements : int
+            Number of completed factor-of-two boundary-refinement steps.
+        sample_index : int
+            Zero-based graph sample index included in diagnostics.
+        geometry_settings : Mapping
+            Realized and configured source-geometry settings included in
+            proposal-exhaustion diagnostics.
+
+        Returns
+        -------
+        source_x : float
+            Accepted source-plane x coordinate in arcseconds.
+        source_y : float
+            Accepted source-plane y coordinate in arcseconds.
+        strong_lensing_area : float
+            Area of the complete repaired region in square arcseconds.
+        sampling_attempts : int
+            Cumulative coordinate-pair draws across proposal and narrow-band
+            rejections.
+        expected_num_images : int
+            Final certified regular-image count.
+        source_boundary_clearance : float
+            Accepted source's nearest regular-boundary distance in arcseconds.
+
+        Raises
+        ------
+        RuntimeError
+            If proposal sampling exhausts, penultimate and final image counts
+            disagree, or narrow-boundary rejections consume ``max_attempts``.
+
+        Notes
+        -----
+        A count disagreement is immediately fatal. Only candidates whose
+        clearance is no greater than ``uncertainty`` are redrawn, and every
+        coordinate pair consumes the one cumulative ``max_attempts`` budget.
+        """
+        remaining_attempts = self.max_attempts
+        total_attempts = 0
+        narrow_boundary_rejections = 0
+        last_clearance = None
+
+        def exhaustion_message():
+            return (
+                "Unable to sample a certified source position for "
+                f"{self._lens_identifier(sample_index)} after {self.max_attempts} attempts; "
+                f"narrow_boundary_rejections={narrow_boundary_rejections}, "
+                f"last_source_boundary_clearance={last_clearance} arcsec, "
+                f"boundary_uncertainty={uncertainty} arcsec, "
+                f"penultimate pixelscale={previous_geometry.pixelscale} arcsec, "
+                "penultimate pseudo_caustic_points="
+                f"{previous_geometry.pseudo_caustic_points}, "
+                f"final pixelscale={geometry.pixelscale} arcsec, "
+                f"final pseudo_caustic_points={geometry.pseudo_caustic_points}, "
+                f"boundary_refinements={refinements}."
+            )
+
+        while remaining_attempts > 0:
+            source_x, source_y, area, candidate_attempts = _source_geometry._sample_position(
+                region,
+                rng,
+                max_attempts=remaining_attempts,
+                lens_identifier=self._lens_identifier(sample_index),
+                geometry_settings=geometry_settings,
+                excluded_points=geometry.point_caustics,
+            )
+            total_attempts += candidate_attempts
+            remaining_attempts -= candidate_attempts
+            previous_count = geometry_adapter.expected_num_images(
+                source_x,
+                source_y,
+                values=adapter_values,
+                caustic_curves=previous_geometry.caustic_curves,
+                pseudo_caustic_curves=previous_geometry.pseudo_caustic_curves,
+            )
+            final_count = geometry_adapter.expected_num_images(
+                source_x,
+                source_y,
+                values=adapter_values,
+                caustic_curves=geometry.caustic_curves,
+                pseudo_caustic_curves=geometry.pseudo_caustic_curves,
+            )
+            clearance = _source_geometry._source_boundary_clearance(
+                source_x,
+                source_y,
+                geometry,
+                self.geometry_tolerance,
+            )
+            if previous_count != final_count:
+                raise RuntimeError(
+                    "Sampled source-position certification failed for "
+                    f"{self._lens_identifier(sample_index)}; "
+                    f"penultimate expected_num_images={previous_count}, "
+                    f"final expected_num_images={final_count}, "
+                    f"source_boundary_clearance={clearance} arcsec, "
+                    f"boundary_uncertainty={uncertainty} arcsec, "
+                    f"penultimate pixelscale={previous_geometry.pixelscale} arcsec, "
+                    "penultimate pseudo_caustic_points="
+                    f"{previous_geometry.pseudo_caustic_points}, "
+                    f"final pixelscale={geometry.pixelscale} arcsec, "
+                    f"final pseudo_caustic_points={geometry.pseudo_caustic_points}, "
+                    f"boundary_refinements={refinements}."
+                )
+            if clearance > uncertainty:
+                return source_x, source_y, area, total_attempts, final_count, clearance
+            narrow_boundary_rejections += 1
+            last_clearance = clearance
+
+        raise RuntimeError(exhaustion_message())
+
     def compute(self, graph_state, rng_info=None, **kwargs):
         """Sample one uniform strong-lensing source position per graph sample.
 
@@ -1165,55 +1308,23 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 source_y[sample_index],
                 areas[sample_index],
                 attempts[sample_index],
-            ) = _source_geometry._sample_position(
+                expected_num_images[sample_index],
+                source_boundary_clearance[sample_index],
+            ) = self._sample_certified_position_for_one_lens(
                 region,
                 sample_rng,
-                max_attempts=self.max_attempts,
-                lens_identifier=self._lens_identifier(sample_index),
-                geometry_settings=geometry_settings,
-                excluded_points=geometry.point_caustics,
-            )
-
-            previous_count = geometry_adapter.expected_num_images(
-                source_x[sample_index],
-                source_y[sample_index],
-                values=adapter_values,
-                caustic_curves=previous_geometry.caustic_curves,
-                pseudo_caustic_curves=previous_geometry.pseudo_caustic_curves,
-            )
-            final_count = geometry_adapter.expected_num_images(
-                source_x[sample_index],
-                source_y[sample_index],
-                values=adapter_values,
-                caustic_curves=geometry.caustic_curves,
-                pseudo_caustic_curves=geometry.pseudo_caustic_curves,
-            )
-            clearance = _source_geometry._source_boundary_clearance(
-                source_x[sample_index],
-                source_y[sample_index],
+                geometry_adapter,
+                adapter_values,
+                previous_geometry,
                 geometry,
-                self.geometry_tolerance,
+                uncertainty,
+                refinements,
+                sample_index=sample_index,
+                geometry_settings=geometry_settings,
             )
-            if previous_count != final_count or clearance <= uncertainty:
-                raise RuntimeError(
-                    "Sampled source-position certification failed for "
-                    f"{self._lens_identifier(sample_index)}; "
-                    f"penultimate expected_num_images={previous_count}, "
-                    f"final expected_num_images={final_count}, "
-                    f"source_boundary_clearance={clearance} arcsec, "
-                    f"boundary_uncertainty={uncertainty} arcsec, "
-                    f"penultimate pixelscale={previous_geometry.pixelscale} arcsec, "
-                    "penultimate pseudo_caustic_points="
-                    f"{previous_geometry.pseudo_caustic_points}, "
-                    f"final pixelscale={geometry.pixelscale} arcsec, "
-                    f"final pseudo_caustic_points={geometry.pseudo_caustic_points}, "
-                    f"boundary_refinements={refinements}."
-                )
 
-            expected_num_images[sample_index] = final_count
             critical_curve_fov[sample_index] = geometry.critical_curve_fov
             boundary_uncertainty[sample_index] = uncertainty
-            source_boundary_clearance[sample_index] = clearance
             boundary_refinements[sample_index] = refinements
 
         if num_samples == 1:

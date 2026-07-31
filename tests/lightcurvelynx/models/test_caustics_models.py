@@ -1543,22 +1543,51 @@ def test_source_compute_shapes_output_order_persistence_and_fixed_semantics(
         assert all(result.shape == (2,) for result in results)
 
 
-@pytest.mark.parametrize(
-    ("counts", "clearance", "message"),
-    [
-        ((3, 4), 0.5, "penultimate expected_num_images=3, final expected_num_images=4"),
-        ((4, 4), 0.1, "source_boundary_clearance=0.1 arcsec, boundary_uncertainty=0.1 arcsec"),
-    ],
-)
-def test_source_compute_rejects_uncertified_sample_before_persistence(
+def test_source_compute_redraws_narrow_boundary_candidate_with_remaining_budget(
     monkeypatch,
     valid_sis_spec,
     fixed_cosmology,
-    counts,
-    clearance,
-    message,
 ):
-    """Require stable counts and clearance strictly above boundary uncertainty."""
+    """Retry equality-clearance candidates within one cumulative draw budget."""
+    node = _source_node(valid_sis_spec, fixed_cosmology)
+    _patch_source_compute_runtime(monkeypatch, node)
+    candidates = iter(
+        [
+            (0.0, 0.0, 10.0, 2),
+            (1.25, -0.75, 10.0, 3),
+        ]
+    )
+    budgets = []
+
+    def sample_position(*args, max_attempts, **kwargs):
+        del args, kwargs
+        budgets.append(max_attempts)
+        return next(candidates)
+
+    clearances = iter([0.1, 0.5])
+    monkeypatch.setattr(caustics_source_geometry, "_sample_position", sample_position)
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: next(clearances),
+    )
+
+    results = node.compute(
+        _graph_state_for(node, 1),
+        rng_info=np.random.default_rng(5),
+    )
+
+    assert results[0:5] == [1.25, -0.75, 10.0, 5, 4]
+    assert results[7] == 0.5
+    assert budgets == [10, 8]
+
+
+def test_source_compute_count_mismatch_remains_nonretryable(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Raise immediately when penultimate and final image counts disagree."""
     node = _source_node(valid_sis_spec, fixed_cosmology)
     previous = _boundary_snapshot(
         center_x=0.0,
@@ -1575,7 +1604,7 @@ def test_source_compute_rejects_uncertified_sample_before_persistence(
 
     class CountAdapter(_FakeGeometryAdapter):
         def __init__(self):
-            self.counts = iter(counts)
+            self.counts = iter((3, 4))
 
         def expected_num_images(self, source_x, source_y, **kwargs):
             del source_x, source_y, kwargs
@@ -1595,21 +1624,34 @@ def test_source_compute_rejects_uncertified_sample_before_persistence(
             0.5,
         ),
     )
+
+    sampler_calls = 0
+
+    def sample_position(*args, **kwargs):
+        nonlocal sampler_calls
+        del args, kwargs
+        sampler_calls += 1
+        return (0.0, 0.0, 1.0, 1)
+
     monkeypatch.setattr(
         caustics_source_geometry,
         "_sample_position",
-        lambda *args, **kwargs: (0.0, 0.0, 1.0, 1),
+        sample_position,
     )
     monkeypatch.setattr(
         caustics_source_geometry,
         "_source_boundary_clearance",
-        lambda *args, **kwargs: clearance,
+        lambda *args, **kwargs: 0.5,
     )
     graph_state = _graph_state_for(node, 1)
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(
+        RuntimeError,
+        match="penultimate expected_num_images=3, final expected_num_images=4",
+    ):
         node.compute(graph_state, rng_info=np.random.default_rng(5))
 
+    assert sampler_calls == 1
     assert not set(_SOURCE_OUTPUTS).intersection(graph_state[node.node_string])
 
 
