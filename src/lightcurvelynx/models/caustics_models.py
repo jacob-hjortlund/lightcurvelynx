@@ -599,8 +599,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         """
         return f"{self._lens_description()} sample {sample_index} at node '{self.node_string}'"
 
-    def _realized_pixelscale_for_one_lens(self, geometry_adapter, values):
-        """Realize the initial requested grid-spacing upper bound.
+    def _realized_angular_settings(self, geometry_adapter, values, *, sample_index):
+        """Realize all source-geometry angular settings for one lens.
 
         Parameters
         ----------
@@ -608,26 +608,117 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             Realized total-lens adapter for this lens system.
         values : Mapping[str, object]
             Realized inputs for one lens system.
+        sample_index : int
+            Zero-based graph sample index used in contextual exceptions.
 
         Returns
         -------
-        float
-            Initial requested Jacobian-grid spacing upper bound in arcseconds.
+        characteristic_scale : float or None
+            Adapter-provided characteristic angular scale in arcseconds when
+            any fraction is enabled, otherwise ``None``.
+        realized_pixelscale : float
+            Sample-local Jacobian-grid spacing upper bound in arcseconds.
+        realized_pseudo_caustic_epsilon : float
+            Sample-local initial pseudo-caustic loop radius in arcseconds.
+        realized_geometry_tolerance : float
+            Sample-local curve and topology tolerance in arcseconds.
+        realized_boundary_tolerance : float
+            Sample-local matched-boundary tolerance in arcseconds.
+
+        Raises
+        ------
+        TypeError
+            If a required characteristic scale is not a scalar value
+            convertible to ``float``.
+        ValueError
+            If a required characteristic scale is not finite and positive, or
+            the realized geometry/pixel or boundary/geometry relations fail.
 
         Notes
         -----
-        Without a fraction this is the configured absolute scale. Otherwise it
-        is the smaller of that value and
-        ``pixelscale_fraction * resolution_scale(values)``; the
-        adapter's positive finite scale postcondition is trusted.
+        When at least one fraction is enabled, this method calls
+        ``resolution_scale(values)`` exactly once and reuses that scale for all
+        four policies. Each enabled fraction produces the smaller of its
+        configured absolute cap and the fraction times the characteristic
+        scale. A ``None`` fraction uses only the corresponding absolute value.
+        When every fraction is ``None``, no scale lookup occurs and the first
+        return value is ``None``. Scale and dynamic-relation failures include
+        the lens/sample identifier and configured, fractional, and realized
+        context where applicable.
         """
-        if self.pixelscale_fraction is None:
-            return self.pixelscale
-        characteristic_scale = geometry_adapter.resolution_scale(values)
-        return min(
+        configured = (
             self.pixelscale,
-            self.pixelscale_fraction * characteristic_scale,
+            self.pseudo_caustic_epsilon,
+            self.geometry_tolerance,
+            self.boundary_tolerance,
         )
+        fractions = (
+            self.pixelscale_fraction,
+            self.pseudo_caustic_epsilon_fraction,
+            self.geometry_tolerance_fraction,
+            self.boundary_tolerance_fraction,
+        )
+        if all(fraction is None for fraction in fractions):
+            return (None, *configured)
+
+        raw_scale = geometry_adapter.resolution_scale(values)
+        if isinstance(raw_scale, np.ndarray) and raw_scale.ndim != 0:
+            raise TypeError(
+                "Characteristic angular scale must be a scalar value convertible "
+                f"to float for {self._lens_identifier(sample_index)}."
+            )
+        try:
+            characteristic_scale = float(raw_scale)
+        except (TypeError, ValueError, OverflowError) as err:
+            raise TypeError(
+                "Characteristic angular scale must be a scalar value convertible "
+                f"to float for {self._lens_identifier(sample_index)}."
+            ) from err
+        if not np.isfinite(characteristic_scale) or characteristic_scale <= 0.0:
+            raise ValueError(
+                "Characteristic angular scale must be finite and positive for "
+                f"{self._lens_identifier(sample_index)}; "
+                f"characteristic_scale={characteristic_scale}."
+            )
+
+        realized = tuple(
+            absolute if fraction is None else min(absolute, fraction * characteristic_scale)
+            for absolute, fraction in zip(configured, fractions, strict=True)
+        )
+        (
+            realized_pixelscale,
+            realized_pseudo_caustic_epsilon,
+            realized_geometry_tolerance,
+            realized_boundary_tolerance,
+        ) = realized
+        context = (
+            f"characteristic_scale={characteristic_scale}, "
+            f"configured_pixelscale={self.pixelscale}, "
+            f"pixelscale_fraction={self.pixelscale_fraction}, "
+            f"realized_pixelscale={realized_pixelscale}, "
+            f"configured_pseudo_caustic_epsilon={self.pseudo_caustic_epsilon}, "
+            "pseudo_caustic_epsilon_fraction="
+            f"{self.pseudo_caustic_epsilon_fraction}, "
+            f"realized_pseudo_caustic_epsilon={realized_pseudo_caustic_epsilon}, "
+            f"configured_geometry_tolerance={self.geometry_tolerance}, "
+            f"geometry_tolerance_fraction={self.geometry_tolerance_fraction}, "
+            f"realized_geometry_tolerance={realized_geometry_tolerance}, "
+            f"configured_boundary_tolerance={self.boundary_tolerance}, "
+            f"boundary_tolerance_fraction={self.boundary_tolerance_fraction}, "
+            f"realized_boundary_tolerance={realized_boundary_tolerance}"
+        )
+        if realized_geometry_tolerance >= realized_pixelscale:
+            raise ValueError(
+                "realized_geometry_tolerance must be smaller than "
+                f"realized_pixelscale for {self._lens_identifier(sample_index)}; {context}."
+            )
+        if realized_boundary_tolerance < realized_geometry_tolerance:
+            raise ValueError(
+                "realized_boundary_tolerance must be at least "
+                f"realized_geometry_tolerance for {self._lens_identifier(sample_index)}; "
+                f"{context}."
+            )
+        return (characteristic_scale, *realized)
 
     def _initial_fov_for_one_lens(self, geometry_adapter, values, *, pixelscale):
         """Realize the starting critical-curve search FOV.
@@ -672,6 +763,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         *,
         sample_index,
         pixelscale,
+        geometry_tolerance,
         initial_fov=None,
     ):
         """Extract complete caustics with bounded sample-local FOV recovery.
@@ -687,8 +779,11 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         sample_index : int
             Zero-based graph sample index used in diagnostics.
         pixelscale : float
-            Requested maximum Jacobian-grid spacing in arcseconds, held fixed
-            throughout FOV recovery.
+            Already-realized sample-local maximum Jacobian-grid spacing in
+            arcseconds, held fixed throughout FOV recovery.
+        geometry_tolerance : float
+            Already-realized sample-local curve and topology tolerance in
+            arcseconds.
         initial_fov : float or None, optional
             Initial image-plane FOV in arcseconds, or ``None`` to realize it
             from configured/adapter policy.
@@ -738,7 +833,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                     center=search_center,
                     fov=current_fov,
                     pixelscale=pixelscale,
-                    geometry_tolerance=self.geometry_tolerance,
+                    geometry_tolerance=geometry_tolerance,
                     jacobian_mask_points=jacobian_mask_points,
                 )
                 return tuple(caustic_curves), current_fov
@@ -765,6 +860,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         sample_index,
         pixelscale,
         pseudo_caustic_points,
+        pseudo_caustic_epsilon,
+        geometry_tolerance,
         initial_fov=None,
     ):
         """Extract one typed-boundary snapshot for a realized lens.
@@ -780,9 +877,16 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         sample_index : int
             Zero-based graph sample index used in diagnostics.
         pixelscale : float
-            Requested critical-curve grid-spacing upper bound in arcseconds.
+            Already-realized sample-local critical-curve grid-spacing upper
+            bound in arcseconds.
         pseudo_caustic_points : int
             Number of unique image-plane loop vertices per pseudo-caustic.
+        pseudo_caustic_epsilon : float
+            Already-realized sample-local initial pseudo-caustic loop radius in
+            arcseconds.
+        geometry_tolerance : float
+            Already-realized sample-local curve and topology tolerance in
+            arcseconds.
         initial_fov : float or None, optional
             Initial image-plane search FOV in arcseconds, or ``None`` for
             configured/adapter policy.
@@ -819,6 +923,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             values,
             sample_index=sample_index,
             pixelscale=pixelscale,
+            geometry_tolerance=geometry_tolerance,
             initial_fov=initial_fov,
         )
         pseudo_caustic_curves = _source_geometry._trace_pseudo_caustics(
@@ -826,8 +931,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             geometry_adapter,
             values,
             num_points=pseudo_caustic_points,
-            epsilon=self.pseudo_caustic_epsilon,
-            geometry_tolerance=self.geometry_tolerance,
+            epsilon=pseudo_caustic_epsilon,
+            geometry_tolerance=geometry_tolerance,
         )
         return _source_geometry._BoundaryGeometry(
             caustic_curves=tuple(caustic_curves),
@@ -845,6 +950,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         *,
         sample_index,
         pixelscale,
+        pseudo_caustic_epsilon,
+        geometry_tolerance,
+        boundary_tolerance,
     ):
         """Refine typed boundaries until displacement and topology converge.
 
@@ -860,6 +968,15 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             Zero-based graph sample index used in diagnostics.
         pixelscale : float
             Realized initial requested grid-spacing upper bound in arcseconds.
+        pseudo_caustic_epsilon : float
+            Already-realized sample-local initial pseudo-caustic loop radius in
+            arcseconds.
+        geometry_tolerance : float
+            Already-realized sample-local curve and topology tolerance in
+            arcseconds.
+        boundary_tolerance : float
+            Already-realized sample-local matched-boundary tolerance in
+            arcseconds.
 
         Returns
         -------
@@ -897,7 +1014,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         point caustics across three raw snapshots, then apply the unchanged
         regular-boundary topology and displacement policy. Certified point
         centers must also retain their count and move no farther than
-        ``boundary_tolerance``, but they do not enter boundary uncertainty.
+        the already-realized ``boundary_tolerance``, but they do not enter
+        boundary uncertainty.
         ``axisymmetry_center(values)`` is used only as a ``None``/non-``None``
         capability gate; its coordinate is not used by the contraction test.
         Axisymmetric certification requires three snapshots and therefore at
@@ -920,6 +1038,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 sample_index=sample_index,
                 pixelscale=pixelscale / (2**refinement),
                 pseudo_caustic_points=self.pseudo_caustic_points * (2**refinement),
+                pseudo_caustic_epsilon=pseudo_caustic_epsilon,
+                geometry_tolerance=geometry_tolerance,
                 initial_fov=None if previous is None else previous.critical_curve_fov,
             )
             if previous is not None:
@@ -931,9 +1051,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                         last_uncertainty,
                         last_topology_stable,
                     ) = _source_geometry._compare_boundary_geometry(
-                        previous, current, geometry_tolerance=self.geometry_tolerance
+                        previous, current, geometry_tolerance=geometry_tolerance
                     )
-                    if last_topology_stable and last_uncertainty <= self.boundary_tolerance:
+                    if last_topology_stable and last_uncertainty <= boundary_tolerance:
                         return previous, current, last_uncertainty, refinement
                 previous = current
                 continue
@@ -943,7 +1063,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                     older.caustic_curves,
                     previous.caustic_curves,
                     current.caustic_curves,
-                    boundary_tolerance=self.boundary_tolerance,
+                    boundary_tolerance=boundary_tolerance,
                 )
                 if partition is None:
                     last_uncertainty = np.inf
@@ -972,12 +1092,12 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                     ) = _source_geometry._compare_boundary_geometry(
                         comparison_previous,
                         comparison_current,
-                        geometry_tolerance=self.geometry_tolerance,
+                        geometry_tolerance=geometry_tolerance,
                     )
                     point_centers_stable = len(comparison_previous.point_caustics) == len(
                         comparison_current.point_caustics
                     ) and all(
-                        np.linalg.norm(previous_point - current_point) <= self.boundary_tolerance
+                        np.linalg.norm(previous_point - current_point) <= boundary_tolerance
                         for previous_point, current_point in zip(
                             comparison_previous.point_caustics,
                             comparison_current.point_caustics,
@@ -985,7 +1105,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                         )
                     )
                     last_topology_stable = last_topology_stable and point_centers_stable
-                    if last_topology_stable and last_uncertainty <= self.boundary_tolerance:
+                    if last_topology_stable and last_uncertainty <= boundary_tolerance:
                         return (
                             comparison_previous,
                             comparison_current,
@@ -999,7 +1119,16 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             f"{self._lens_identifier(sample_index)}; "
             f"last displacement={last_uncertainty} arcsec, "
             f"topology_stable={last_topology_stable}, "
-            f"boundary_tolerance={self.boundary_tolerance} arcsec, "
+            f"configured_pseudo_caustic_epsilon={self.pseudo_caustic_epsilon} arcsec, "
+            "pseudo_caustic_epsilon_fraction="
+            f"{self.pseudo_caustic_epsilon_fraction}, "
+            f"realized_pseudo_caustic_epsilon={pseudo_caustic_epsilon} arcsec, "
+            f"configured_geometry_tolerance={self.geometry_tolerance} arcsec, "
+            f"geometry_tolerance_fraction={self.geometry_tolerance_fraction}, "
+            f"realized_geometry_tolerance={geometry_tolerance} arcsec, "
+            f"configured_boundary_tolerance={self.boundary_tolerance} arcsec, "
+            f"boundary_tolerance_fraction={self.boundary_tolerance_fraction}, "
+            f"realized_boundary_tolerance={boundary_tolerance} arcsec, "
             f"max_boundary_refinements={self.max_boundary_refinements}, "
             f"previous_pixelscale={last_previous.pixelscale} arcsec, "
             f"previous_pseudo_caustic_points={last_previous.pseudo_caustic_points}, "
@@ -1038,8 +1167,12 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         region : shapely.Polygon or shapely.MultiPolygon
             Complete supported strong-lensing source region with coordinates
             in arcseconds and area in square arcseconds.
-        realized_pixelscale : float
-            Realized initial requested grid-spacing upper bound in arcseconds.
+        angular_settings : tuple
+            Five values in this exact order: characteristic angular scale or
+            ``None`` when no fractions are enabled, realized initial pixel
+            scale, realized pseudo-caustic epsilon, realized geometry
+            tolerance, and realized boundary tolerance. Every numerical value
+            is in arcseconds.
 
         Raises
         ------
@@ -1073,10 +1206,18 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             values=values,
         )
         _source_geometry._validate_source_geometry_support(self.lens, lens)
-        realized_pixelscale = self._realized_pixelscale_for_one_lens(
+        angular_settings = self._realized_angular_settings(
             geometry_adapter,
             adapter_values,
+            sample_index=sample_index,
         )
+        (
+            characteristic_scale,
+            realized_pixelscale,
+            realized_pseudo_caustic_epsilon,
+            realized_geometry_tolerance,
+            realized_boundary_tolerance,
+        ) = angular_settings
         previous_geometry, geometry, uncertainty, refinements = (
             self._certified_boundary_geometry_for_one_lens(
                 lens,
@@ -1084,12 +1225,15 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 adapter_values,
                 sample_index=sample_index,
                 pixelscale=realized_pixelscale,
+                pseudo_caustic_epsilon=realized_pseudo_caustic_epsilon,
+                geometry_tolerance=realized_geometry_tolerance,
+                boundary_tolerance=realized_boundary_tolerance,
             )
         )
         region = _source_geometry._build_strong_lensing_region(
             geometry.caustic_curves,
             geometry.pseudo_caustic_curves,
-            geometry_tolerance=self.geometry_tolerance,
+            geometry_tolerance=realized_geometry_tolerance,
         )
         return (
             geometry_adapter,
@@ -1099,7 +1243,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             uncertainty,
             refinements,
             region,
-            realized_pixelscale,
+            angular_settings,
         )
 
     def _sample_certified_position_for_one_lens(
@@ -1114,6 +1258,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         refinements,
         *,
         sample_index,
+        geometry_tolerance,
         geometry_settings,
     ):
         """Sample one source position within a bounded certification budget.
@@ -1140,6 +1285,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             Number of completed factor-of-two boundary-refinement steps.
         sample_index : int
             Zero-based graph sample index included in diagnostics.
+        geometry_tolerance : float
+            Already-realized sample-local curve and topology tolerance in
+            arcseconds, used for boundary-clearance normalization.
         geometry_settings : Mapping
             Realized and configured source-geometry settings included in
             proposal-exhaustion diagnostics.
@@ -1181,6 +1329,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         last_clearance = None
 
         def exhaustion_message():
+            settings = ", ".join(f"{name}={value}" for name, value in geometry_settings.items())
             return (
                 "Unable to sample a certified source position for "
                 f"{self._lens_identifier(sample_index)} after {self.max_attempts} attempts; "
@@ -1192,7 +1341,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 f"{previous_geometry.pseudo_caustic_points}, "
                 f"final pixelscale={geometry.pixelscale} arcsec, "
                 f"final pseudo_caustic_points={geometry.pseudo_caustic_points}, "
-                f"boundary_refinements={refinements}."
+                f"boundary_refinements={refinements}, {settings}."
             )
 
         while remaining_attempts > 0:
@@ -1231,7 +1380,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 source_x,
                 source_y,
                 geometry,
-                self.geometry_tolerance,
+                geometry_tolerance,
             )
             if previous_count != final_count:
                 raise RuntimeError(
@@ -1351,10 +1500,11 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         region area. Exhaustion and count mismatch both occur before any of
         this call's results are passed to ``_save_results``.
         Sampling-exhaustion context includes
-        ``fov``, configured/fractional/realized pixel-scale settings,
-        ``max_fov_expansions``, pseudo-caustic settings, both tolerances, and
-        ``max_boundary_refinements``. The sampler reports ``max_attempts``
-        separately; the context mapping does not include
+        ``fov``, configured/fractional/realized settings for pixel scale,
+        pseudo-caustic epsilon, geometry tolerance, and boundary tolerance,
+        ``max_fov_expansions``, pseudo-caustic resolution, final boundary
+        settings, and ``max_boundary_refinements``. The sampler reports
+        ``max_attempts`` separately; the context mapping does not include
         ``fov_expansion_factor``.
         """
         input_values = self._build_inputs(graph_state, **kwargs)
@@ -1389,23 +1539,42 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 uncertainty,
                 refinements,
                 region,
-                realized_pixelscale,
+                angular_settings,
             ) = self._region_for_one_lens(
                 values,
                 sample_index=sample_index,
             )
+            (
+                characteristic_scale,
+                realized_pixelscale,
+                realized_pseudo_caustic_epsilon,
+                realized_geometry_tolerance,
+                realized_boundary_tolerance,
+            ) = angular_settings
             sample_rng = np.random.default_rng(sample_seed)
             geometry_settings = {
                 "fov": self.fov,
+                "characteristic_scale": characteristic_scale,
                 "configured_pixelscale": self.pixelscale,
                 "pixelscale_fraction": self.pixelscale_fraction,
                 "realized_pixelscale": realized_pixelscale,
                 "max_fov_expansions": self.max_fov_expansions,
                 "pseudo_caustic_points": self.pseudo_caustic_points,
-                "pseudo_caustic_epsilon": self.pseudo_caustic_epsilon,
-                "geometry_tolerance": self.geometry_tolerance,
-                "boundary_tolerance": self.boundary_tolerance,
+                "configured_pseudo_caustic_epsilon": self.pseudo_caustic_epsilon,
+                "pseudo_caustic_epsilon_fraction": self.pseudo_caustic_epsilon_fraction,
+                "realized_pseudo_caustic_epsilon": realized_pseudo_caustic_epsilon,
+                "configured_geometry_tolerance": self.geometry_tolerance,
+                "geometry_tolerance_fraction": self.geometry_tolerance_fraction,
+                "realized_geometry_tolerance": realized_geometry_tolerance,
+                "configured_boundary_tolerance": self.boundary_tolerance,
+                "boundary_tolerance_fraction": self.boundary_tolerance_fraction,
+                "realized_boundary_tolerance": realized_boundary_tolerance,
                 "max_boundary_refinements": self.max_boundary_refinements,
+                "final_pixelscale": geometry.pixelscale,
+                "final_pseudo_caustic_points": geometry.pseudo_caustic_points,
+                "final_critical_curve_fov": geometry.critical_curve_fov,
+                "boundary_uncertainty": uncertainty,
+                "boundary_refinements": refinements,
             }
             (
                 source_x[sample_index],
@@ -1424,6 +1593,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
                 uncertainty,
                 refinements,
                 sample_index=sample_index,
+                geometry_tolerance=realized_geometry_tolerance,
                 geometry_settings=geometry_settings,
             )
 

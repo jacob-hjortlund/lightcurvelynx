@@ -468,7 +468,7 @@ def _patch_source_compute_runtime(monkeypatch, node, *, extra_draws=(), events=N
             0.1,
             2,
             region,
-            0.5,
+            (None, 0.5, 0.1, 0.01, 0.1),
         )
 
     def sample_position(
@@ -1175,31 +1175,182 @@ def test_public_nodes_keep_cosmology_fixed_and_register_exact_output_order(
     assert tuple(node.list_params()[-len(outputs) :]) == outputs
 
 
-def test_source_node_resolves_absolute_and_relative_pixelscales(valid_sis_spec, fixed_cosmology):
-    """Use the configured scale directly or the smaller relative lens scale."""
-    adapter = _FakeGeometryAdapter()
+def test_source_node_realizes_all_angular_settings_from_one_scale_lookup(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Use one characteristic-scale call for every enabled fraction."""
+
+    class RecordingAdapter(_FakeGeometryAdapter):
+        """Record one configurable characteristic-scale lookup."""
+
+        def __init__(self, scale):
+            self.scale = scale
+            self.calls = 0
+
+        def resolution_scale(self, values):
+            assert values == {"lens": "values"}
+            self.calls += 1
+            return self.scale
+
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale=0.75,
+        pixelscale_fraction=0.25,
+        pseudo_caustic_epsilon=0.3,
+        pseudo_caustic_epsilon_fraction=0.1,
+        geometry_tolerance=0.05,
+        geometry_tolerance_fraction=0.01,
+        boundary_tolerance=0.4,
+        boundary_tolerance_fraction=0.1,
+    )
+    adapter = RecordingAdapter(2.0)
+
+    settings = node._realized_angular_settings(
+        adapter,
+        {"lens": "values"},
+        sample_index=3,
+    )
+
+    assert settings == (2.0, 0.5, 0.2, 0.02, 0.2)
+    assert adapter.calls == 1
+
+
+def test_source_node_caps_relative_settings_and_skips_scale_for_absolute_only(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Keep absolute caps and preserve the no-lookup compatibility path."""
+    capped = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale=0.75,
+        pixelscale_fraction=2.0,
+        pseudo_caustic_epsilon=0.3,
+        pseudo_caustic_epsilon_fraction=1.0,
+        geometry_tolerance=0.05,
+        geometry_tolerance_fraction=1.0,
+        boundary_tolerance=0.4,
+        boundary_tolerance_fraction=1.0,
+    )
+    assert capped._realized_angular_settings(
+        _FakeGeometryAdapter(),
+        {},
+        sample_index=0,
+    ) == (2.0, 0.75, 0.3, 0.05, 0.4)
+
+    class UnexpectedScaleAdapter(_FakeGeometryAdapter):
+        """Fail if the absolute-only path requests a scale."""
+
+        def resolution_scale(self, values):
+            raise AssertionError("absolute-only realization requested a scale")
+
     absolute = _source_node(
         valid_sis_spec,
         fixed_cosmology,
         pixelscale=0.75,
         pixelscale_fraction=None,
+        pseudo_caustic_epsilon=0.3,
+        pseudo_caustic_epsilon_fraction=None,
+        geometry_tolerance=0.05,
+        geometry_tolerance_fraction=None,
+        boundary_tolerance=0.4,
+        boundary_tolerance_fraction=None,
     )
-    relative = _source_node(
+    assert absolute._realized_angular_settings(
+        UnexpectedScaleAdapter(),
+        {},
+        sample_index=0,
+    ) == (None, 0.75, 0.3, 0.05, 0.4)
+
+
+@pytest.mark.parametrize(
+    ("scale", "error_type", "message"),
+    [
+        (None, TypeError, "must be a scalar value convertible to float"),
+        (np.array([1.0]), TypeError, "must be a scalar value convertible to float"),
+        (0.0, ValueError, "must be finite and positive"),
+        (-1.0, ValueError, "must be finite and positive"),
+        (np.inf, ValueError, "must be finite and positive"),
+        (np.nan, ValueError, "must be finite and positive"),
+    ],
+)
+def test_source_node_validates_required_characteristic_scale(
+    valid_sis_spec,
+    fixed_cosmology,
+    scale,
+    error_type,
+    message,
+):
+    """Validate the adapter value once before fractional arithmetic."""
+
+    class ScaleAdapter(_FakeGeometryAdapter):
+        """Expose the parametrized invalid scale value."""
+
+        def resolution_scale(self, values):
+            """Return the parametrized invalid adapter value."""
+            del values
+            return scale
+
+    adapter = ScaleAdapter()
+    node = _source_node(
         valid_sis_spec,
         fixed_cosmology,
-        pixelscale=0.75,
-        pixelscale_fraction=0.25,
-    )
-    capped = _source_node(
-        valid_sis_spec,
-        fixed_cosmology,
-        pixelscale=0.75,
-        pixelscale_fraction=1.0,
+        geometry_tolerance_fraction=0.01,
     )
 
-    assert absolute._realized_pixelscale_for_one_lens(adapter, {}) == 0.75
-    assert relative._realized_pixelscale_for_one_lens(adapter, {}) == 0.5
-    assert capped._realized_pixelscale_for_one_lens(adapter, {}) == 0.75
+    with pytest.raises(error_type, match=message) as error:
+        node._realized_angular_settings(adapter, {}, sample_index=7)
+
+    assert "lens model 'SIS' sample 7 at node 'source_node'" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {
+                "pixelscale": 0.75,
+                "pixelscale_fraction": 0.1,
+                "geometry_tolerance": 0.3,
+                "geometry_tolerance_fraction": None,
+                "boundary_tolerance": 0.4,
+            },
+            "realized_geometry_tolerance must be smaller than realized_pixelscale",
+        ),
+        (
+            {
+                "pixelscale": 0.75,
+                "geometry_tolerance": 0.2,
+                "geometry_tolerance_fraction": None,
+                "boundary_tolerance": 0.4,
+                "boundary_tolerance_fraction": 0.05,
+            },
+            "realized_boundary_tolerance must be at least realized_geometry_tolerance",
+        ),
+    ],
+)
+def test_source_node_rejects_inconsistent_realized_angular_settings(
+    valid_sis_spec,
+    fixed_cosmology,
+    overrides,
+    message,
+):
+    """Catch invalid mixed absolute/relative policies for the current lens."""
+    node = _source_node(valid_sis_spec, fixed_cosmology, **overrides)
+
+    with pytest.raises(ValueError, match=message) as error:
+        node._realized_angular_settings(_FakeGeometryAdapter(), {}, sample_index=5)
+
+    text = str(error.value)
+    assert "characteristic_scale=2.0" in text
+    assert "configured_geometry_tolerance=" in text
+    assert "geometry_tolerance_fraction=" in text
+    assert "realized_geometry_tolerance=" in text
+    assert "configured_boundary_tolerance=" in text
+    assert "boundary_tolerance_fraction=" in text
+    assert "realized_boundary_tolerance=" in text
 
 
 def test_source_node_uses_configured_or_adapter_derived_fov(valid_sis_spec, fixed_cosmology):
@@ -1269,12 +1420,14 @@ def test_source_caustic_search_expands_fov_with_fixed_pixelscale(
         {},
         sample_index=3,
         pixelscale=0.25,
+        geometry_tolerance=0.003,
     )
 
     assert curves == (curve,)
     assert successful_fov == 8.0
     assert [call[1]["fov"] for call in calls] == [2.0, 4.0, 8.0]
     assert [call[1]["pixelscale"] for call in calls] == [0.25, 0.25, 0.25]
+    assert [call[1]["geometry_tolerance"] for call in calls] == [0.003] * 3
     assert [call[1]["center"] for call in calls] == [(0.0, 0.0)] * 3
     assert [call[1]["jacobian_mask_points"] for call in calls] == [()] * 3
 
@@ -1298,7 +1451,7 @@ def test_source_caustic_search_reports_bounded_fov_exhaustion(
 
     def always_incomplete(lens, **kwargs):
         del lens
-        calls.append(kwargs["fov"])
+        calls.append(kwargs)
         raise last_error
 
     monkeypatch.setattr(caustics_source_geometry, "_find_all_caustics", always_incomplete)
@@ -1310,14 +1463,59 @@ def test_source_caustic_search_reports_bounded_fov_exhaustion(
             {},
             sample_index=7,
             pixelscale=0.25,
+            geometry_tolerance=0.003,
         )
 
-    assert calls == [2.0, 6.0]
+    assert [call["fov"] for call in calls] == [2.0, 6.0]
+    assert [call["geometry_tolerance"] for call in calls] == [0.003, 0.003]
     assert error.value.__cause__ is last_error
     message = str(error.value)
     assert "lens model 'SIS' sample 7 at node 'source_node'" in message
     assert "initial fov=2.0 arcsec, final fov=6.0 arcsec" in message
     assert "pixelscale=0.25 arcsec, max_fov_expansions=1" in message
+
+
+def test_source_boundary_snapshot_uses_realized_epsilon_and_geometry_tolerance(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Pass effective settings to mapped and pseudo-caustic extraction."""
+    node = _source_node(valid_sis_spec, fixed_cosmology)
+    calls = {}
+
+    def find_all(lens, adapter, values, **kwargs):
+        calls["find"] = (lens, adapter, values, kwargs)
+        return (_closed_square(),), 4.0
+
+    def trace(lens, adapter, values, **kwargs):
+        calls["trace"] = (lens, adapter, values, kwargs)
+        return ()
+
+    monkeypatch.setattr(node, "_find_all_caustics_for_one_lens", find_all)
+    monkeypatch.setattr(caustics_source_geometry, "_trace_pseudo_caustics", trace)
+    lens = object()
+    adapter = _FakeGeometryAdapter()
+    values = {"lens": "values"}
+
+    geometry = node._boundary_geometry_for_one_lens(
+        lens,
+        adapter,
+        values,
+        sample_index=2,
+        pixelscale=0.5,
+        pseudo_caustic_points=16,
+        pseudo_caustic_epsilon=0.02,
+        geometry_tolerance=0.003,
+    )
+
+    assert calls["find"][3]["geometry_tolerance"] == 0.003
+    assert calls["trace"][3] == {
+        "num_points": 16,
+        "epsilon": 0.02,
+        "geometry_tolerance": 0.003,
+    }
+    assert geometry.pixelscale == 0.5
 
 
 def test_source_boundary_certification_refines_until_displacement_converges(
@@ -1331,7 +1529,7 @@ def test_source_boundary_certification_refines_until_displacement_converges(
         valid_sis_spec,
         fixed_cosmology,
         pixelscale=1.0,
-        boundary_tolerance=0.2,
+        boundary_tolerance=0.9,
         max_boundary_refinements=3,
     )
     snapshots = [
@@ -1347,6 +1545,14 @@ def test_source_boundary_certification_refines_until_displacement_converges(
         return snapshots[len(calls) - 1]
 
     monkeypatch.setattr(node, "_boundary_geometry_for_one_lens", boundary_snapshot)
+    original_compare = caustics_source_geometry._compare_boundary_geometry
+    comparison_tolerances = []
+
+    def compare(previous, current, geometry_tolerance):
+        comparison_tolerances.append(geometry_tolerance)
+        return original_compare(previous, current, geometry_tolerance)
+
+    monkeypatch.setattr(caustics_source_geometry, "_compare_boundary_geometry", compare)
 
     previous, current, uncertainty, refinements = node._certified_boundary_geometry_for_one_lens(
         object(),
@@ -1354,11 +1560,17 @@ def test_source_boundary_certification_refines_until_displacement_converges(
         {},
         sample_index=0,
         pixelscale=1.0,
+        pseudo_caustic_epsilon=0.02,
+        geometry_tolerance=0.003,
+        boundary_tolerance=0.2,
     )
 
     assert [call["pixelscale"] for call in calls] == [1.0, 0.5, 0.25]
     assert [call["pseudo_caustic_points"] for call in calls] == [8, 16, 32]
     assert [call["initial_fov"] for call in calls] == [None, 4.0, 6.0]
+    assert [call["pseudo_caustic_epsilon"] for call in calls] == [0.02] * 3
+    assert [call["geometry_tolerance"] for call in calls] == [0.003] * 3
+    assert comparison_tolerances == [0.003, 0.003]
     assert previous.critical_curve_fov == 6.0
     assert current.critical_curve_fov == 8.0
     assert uncertainty == pytest.approx(0.1)
@@ -1400,9 +1612,14 @@ def test_source_boundary_certification_reports_nonconverging_snapshots(
             {},
             sample_index=4,
             pixelscale=1.0,
+            pseudo_caustic_epsilon=0.02,
+            geometry_tolerance=0.003,
+            boundary_tolerance=0.1,
         )
 
     assert len(calls) == 3
+    assert [call["pseudo_caustic_epsilon"] for call in calls] == [0.02] * 3
+    assert [call["geometry_tolerance"] for call in calls] == [0.003] * 3
     message = str(error.value)
     assert "lens model 'SIS' sample 4 at node 'source_node'" in message
     assert "last displacement=1.0 arcsec, topology_stable=True" in message
@@ -1411,6 +1628,15 @@ def test_source_boundary_certification_reports_nonconverging_snapshots(
     assert "current_pixelscale=0.25 arcsec" in message
     assert "previous_critical_curve_fov=5.0 arcsec" in message
     assert "current_critical_curve_fov=6.0 arcsec" in message
+    assert "configured_pseudo_caustic_epsilon=0.1 arcsec" in message
+    assert "pseudo_caustic_epsilon_fraction=None" in message
+    assert "realized_pseudo_caustic_epsilon=0.02 arcsec" in message
+    assert "configured_geometry_tolerance=0.01 arcsec" in message
+    assert "geometry_tolerance_fraction=None" in message
+    assert "realized_geometry_tolerance=0.003 arcsec" in message
+    assert "configured_boundary_tolerance=0.1 arcsec" in message
+    assert "boundary_tolerance_fraction=None" in message
+    assert "realized_boundary_tolerance=0.1 arcsec" in message
 
 
 def test_axisymmetric_boundary_certification_partitions_stable_point_and_converges(
@@ -1466,6 +1692,26 @@ def test_axisymmetric_boundary_certification_partitions_stable_point_and_converg
         return snapshots[len(calls) - 1]
 
     monkeypatch.setattr(node, "_boundary_geometry_for_one_lens", boundary_snapshot)
+    original_partition = caustics_source_geometry._partition_axisymmetric_point_caustics
+    partition_tolerances = []
+
+    def partition(*curves, boundary_tolerance):
+        partition_tolerances.append(boundary_tolerance)
+        return original_partition(*curves, boundary_tolerance=boundary_tolerance)
+
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_partition_axisymmetric_point_caustics",
+        partition,
+    )
+    original_compare = caustics_source_geometry._compare_boundary_geometry
+    comparison_tolerances = []
+
+    def compare(previous, current, geometry_tolerance):
+        comparison_tolerances.append(geometry_tolerance)
+        return original_compare(previous, current, geometry_tolerance)
+
+    monkeypatch.setattr(caustics_source_geometry, "_compare_boundary_geometry", compare)
 
     previous, current, uncertainty, refinements = node._certified_boundary_geometry_for_one_lens(
         lens,
@@ -1473,11 +1719,18 @@ def test_axisymmetric_boundary_certification_partitions_stable_point_and_converg
         adapter_values,
         sample_index=2,
         pixelscale=1.0,
+        pseudo_caustic_epsilon=0.02,
+        geometry_tolerance=0.003,
+        boundary_tolerance=0.1,
     )
 
     assert [call["pixelscale"] for call in calls] == [1.0, 0.5, 0.25]
     assert [call["pseudo_caustic_points"] for call in calls] == [8, 16, 32]
     assert [call["initial_fov"] for call in calls] == [None, 4.0, 5.0]
+    assert [call["pseudo_caustic_epsilon"] for call in calls] == [0.02] * 3
+    assert [call["geometry_tolerance"] for call in calls] == [0.003] * 3
+    assert partition_tolerances == [0.1]
+    assert comparison_tolerances == [0.003]
     assert previous.caustic_curves == (regular_curves[1],)
     assert current.caustic_curves == (regular_curves[2],)
     np.testing.assert_allclose(previous.point_caustics, [[0.04, 0.0]])
@@ -1537,14 +1790,288 @@ def test_axisymmetric_boundary_certification_exhausts_on_partition_count_change(
             {},
             sample_index=6,
             pixelscale=1.0,
+            pseudo_caustic_epsilon=0.02,
+            geometry_tolerance=0.003,
+            boundary_tolerance=0.1,
         )
 
     assert len(calls) == 3
+    assert [call["pseudo_caustic_epsilon"] for call in calls] == [0.02] * 3
+    assert [call["geometry_tolerance"] for call in calls] == [0.003] * 3
     message = str(error.value)
     assert "lens model 'SIS' sample 6 at node 'source_node'" in message
     assert "last displacement=inf arcsec, topology_stable=False" in message
     assert "previous_pixelscale=0.5 arcsec" in message
     assert "current_pixelscale=0.25 arcsec" in message
+
+
+def test_axisymmetric_certification_uses_realized_boundary_tolerance_for_point_centers(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Reject point-center motion above the effective per-lens threshold."""
+    pytest.importorskip("shapely")
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        boundary_tolerance=0.9,
+        max_boundary_refinements=2,
+    )
+
+    class AxisymmetricAdapter(_FakeGeometryAdapter):
+        """Enable the axisymmetric certification branch."""
+
+        def axisymmetry_center(self, values):
+            del values
+            return (0.0, 0.0)
+
+    snapshots = [
+        _boundary_snapshot(
+            center_x=0.0,
+            fov=4.0 + index,
+            pixelscale=1.0 / 2**index,
+            pseudo_caustic_points=8 * 2**index,
+        )
+        for index in range(3)
+    ]
+    calls = []
+
+    def boundary_snapshot(*args, **kwargs):
+        del args
+        calls.append(kwargs)
+        return snapshots[len(calls) - 1]
+
+    partition_tolerances = []
+
+    def partition(older, previous, current, *, boundary_tolerance):
+        del older, previous, current
+        partition_tolerances.append(boundary_tolerance)
+        square = _closed_square()
+        return caustics_source_geometry._PointCausticPartition(
+            previous_curves=(square,),
+            current_curves=(square.copy(),),
+            previous_points=(np.array([0.0, 0.0]),),
+            current_points=(np.array([0.2, 0.0]),),
+        )
+
+    monkeypatch.setattr(node, "_boundary_geometry_for_one_lens", boundary_snapshot)
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_partition_axisymmetric_point_caustics",
+        partition,
+    )
+
+    with pytest.raises(RuntimeError, match="topology_stable=False"):
+        node._certified_boundary_geometry_for_one_lens(
+            object(),
+            AxisymmetricAdapter(),
+            {},
+            sample_index=8,
+            pixelscale=1.0,
+            pseudo_caustic_epsilon=0.02,
+            geometry_tolerance=0.003,
+            boundary_tolerance=0.1,
+        )
+
+    assert partition_tolerances == [0.1]
+
+
+def test_source_region_realizes_once_and_threads_all_angular_settings(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Use one settings realization throughout boundary and region policy."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale=0.75,
+        pixelscale_fraction=0.25,
+        pseudo_caustic_epsilon=0.3,
+        pseudo_caustic_epsilon_fraction=0.1,
+        geometry_tolerance=0.05,
+        geometry_tolerance_fraction=0.01,
+        boundary_tolerance=0.4,
+        boundary_tolerance_fraction=0.1,
+    )
+    lens = object()
+    adapter = _FakeGeometryAdapter()
+    adapter_values = {"lens": "values"}
+    previous = _boundary_snapshot(
+        center_x=0.0,
+        fov=4.0,
+        pixelscale=0.5,
+        pseudo_caustic_points=16,
+    )
+    geometry = _boundary_snapshot(
+        center_x=0.01,
+        fov=4.0,
+        pixelscale=0.25,
+        pseudo_caustic_points=32,
+    )
+    region = object()
+    calls = {}
+
+    monkeypatch.setattr(
+        caustics_lens_system,
+        "_build_lens_system",
+        lambda *args, **kwargs: (lens, adapter, adapter_values),
+    )
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_validate_source_geometry_support",
+        lambda *args, **kwargs: None,
+    )
+
+    def certify(passed_lens, passed_adapter, passed_values, **kwargs):
+        assert passed_lens is lens
+        assert passed_adapter is adapter
+        assert passed_values is adapter_values
+        calls["certify"] = kwargs
+        return previous, geometry, 0.01, 1
+
+    def build(caustic_curves, pseudo_caustic_curves, *, geometry_tolerance):
+        assert caustic_curves is geometry.caustic_curves
+        assert pseudo_caustic_curves is geometry.pseudo_caustic_curves
+        calls["region_tolerance"] = geometry_tolerance
+        return region
+
+    monkeypatch.setattr(node, "_certified_boundary_geometry_for_one_lens", certify)
+    monkeypatch.setattr(caustics_source_geometry, "_build_strong_lensing_region", build)
+
+    result = node._region_for_one_lens({"source_redshift": 1.5}, sample_index=4)
+
+    assert calls["certify"] == {
+        "sample_index": 4,
+        "pixelscale": 0.5,
+        "pseudo_caustic_epsilon": 0.2,
+        "geometry_tolerance": 0.02,
+        "boundary_tolerance": 0.2,
+    }
+    assert calls["region_tolerance"] == 0.02
+    assert result[0] is adapter
+    assert result[1] is adapter_values
+    assert result[2] is previous
+    assert result[3] is geometry
+    assert result[4:6] == (0.01, 1)
+    assert result[6] is region
+    assert result[7] == (2.0, 0.5, 0.2, 0.02, 0.2)
+
+
+def test_source_compute_uses_realized_clearance_tolerance_and_settings_context(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Use and report effective values without mutating configured caps."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale_fraction=0.25,
+        pseudo_caustic_epsilon_fraction=0.01,
+        geometry_tolerance_fraction=0.0015,
+        boundary_tolerance_fraction=0.02,
+    )
+    adapter = _FakeGeometryAdapter()
+    previous = _boundary_snapshot(
+        center_x=0.0,
+        fov=4.0,
+        pixelscale=0.5,
+        pseudo_caustic_points=16,
+    )
+    geometry = _boundary_snapshot(
+        center_x=0.05,
+        fov=5.0,
+        pixelscale=0.25,
+        pseudo_caustic_points=32,
+    )
+    region = object()
+    captured = {}
+
+    monkeypatch.setattr(
+        node,
+        "_region_for_one_lens",
+        lambda values, sample_index: (
+            adapter,
+            {},
+            previous,
+            geometry,
+            0.01,
+            2,
+            region,
+            (2.0, 0.5, 0.02, 0.003, 0.04),
+        ),
+    )
+
+    def sample_position(
+        passed_region,
+        rng,
+        *,
+        max_attempts,
+        lens_identifier,
+        geometry_settings,
+        excluded_points,
+    ):
+        del rng, max_attempts, lens_identifier, excluded_points
+        assert passed_region is region
+        captured["geometry_settings"] = geometry_settings
+        return 0.0, 0.0, 1.0, 1
+
+    def clearance(source_x, source_y, passed_geometry, geometry_tolerance):
+        del source_x, source_y
+        assert passed_geometry is geometry
+        captured["clearance_tolerance"] = geometry_tolerance
+        return 0.5
+
+    monkeypatch.setattr(caustics_source_geometry, "_sample_position", sample_position)
+    monkeypatch.setattr(caustics_source_geometry, "_source_boundary_clearance", clearance)
+
+    node.compute(_graph_state_for(node, 1), rng_info=np.random.default_rng(5))
+
+    assert captured["clearance_tolerance"] == 0.003
+    settings = captured["geometry_settings"]
+    assert {
+        "characteristic_scale": settings["characteristic_scale"],
+        "configured_pixelscale": settings["configured_pixelscale"],
+        "pixelscale_fraction": settings["pixelscale_fraction"],
+        "realized_pixelscale": settings["realized_pixelscale"],
+        "configured_pseudo_caustic_epsilon": settings["configured_pseudo_caustic_epsilon"],
+        "pseudo_caustic_epsilon_fraction": settings["pseudo_caustic_epsilon_fraction"],
+        "realized_pseudo_caustic_epsilon": settings["realized_pseudo_caustic_epsilon"],
+        "configured_geometry_tolerance": settings["configured_geometry_tolerance"],
+        "geometry_tolerance_fraction": settings["geometry_tolerance_fraction"],
+        "realized_geometry_tolerance": settings["realized_geometry_tolerance"],
+        "configured_boundary_tolerance": settings["configured_boundary_tolerance"],
+        "boundary_tolerance_fraction": settings["boundary_tolerance_fraction"],
+        "realized_boundary_tolerance": settings["realized_boundary_tolerance"],
+    } == {
+        "characteristic_scale": 2.0,
+        "configured_pixelscale": node.pixelscale,
+        "pixelscale_fraction": node.pixelscale_fraction,
+        "realized_pixelscale": 0.5,
+        "configured_pseudo_caustic_epsilon": node.pseudo_caustic_epsilon,
+        "pseudo_caustic_epsilon_fraction": node.pseudo_caustic_epsilon_fraction,
+        "realized_pseudo_caustic_epsilon": 0.02,
+        "configured_geometry_tolerance": node.geometry_tolerance,
+        "geometry_tolerance_fraction": node.geometry_tolerance_fraction,
+        "realized_geometry_tolerance": 0.003,
+        "configured_boundary_tolerance": node.boundary_tolerance,
+        "boundary_tolerance_fraction": node.boundary_tolerance_fraction,
+        "realized_boundary_tolerance": 0.04,
+    }
+    assert settings["fov"] == node.fov
+    assert settings["max_fov_expansions"] == node.max_fov_expansions
+    assert settings["pseudo_caustic_points"] == node.pseudo_caustic_points
+    assert settings["max_boundary_refinements"] == node.max_boundary_refinements
+    assert settings["final_pixelscale"] == geometry.pixelscale
+    assert settings["final_pseudo_caustic_points"] == geometry.pseudo_caustic_points
+    assert settings["final_critical_curve_fov"] == geometry.critical_curve_fov
+    assert settings["boundary_uncertainty"] == 0.01
+    assert settings["boundary_refinements"] == 2
+    assert node.pseudo_caustic_epsilon == 0.1
+    assert node.geometry_tolerance == 0.01
+    assert node.boundary_tolerance == 0.1
 
 
 def test_source_compute_draws_all_subseeds_before_sample_work(
@@ -1804,11 +2331,37 @@ def test_source_compute_exhausts_narrow_boundary_retry_budget(
     with pytest.raises(RuntimeError) as error:
         node.compute(graph_state, rng_info=np.random.default_rng(5))
 
+    message = str(error.value)
     assert budgets == [3, 2, 1]
-    assert "after 3 attempts" in str(error.value)
-    assert "narrow_boundary_rejections=3" in str(error.value)
-    assert "last_source_boundary_clearance=0.1 arcsec" in str(error.value)
-    assert "boundary_uncertainty=0.1 arcsec" in str(error.value)
+    assert "after 3 attempts" in message
+    assert "narrow_boundary_rejections=3" in message
+    assert "last_source_boundary_clearance=0.1 arcsec" in message
+    assert "boundary_uncertainty=0.1 arcsec" in message
+    for setting in (
+        "fov=4.0",
+        "characteristic_scale=None",
+        "configured_pixelscale=1.0",
+        "pixelscale_fraction=None",
+        "realized_pixelscale=0.5",
+        "max_fov_expansions=2",
+        "pseudo_caustic_points=8",
+        "configured_pseudo_caustic_epsilon=0.1",
+        "pseudo_caustic_epsilon_fraction=None",
+        "realized_pseudo_caustic_epsilon=0.1",
+        "configured_geometry_tolerance=0.01",
+        "geometry_tolerance_fraction=None",
+        "realized_geometry_tolerance=0.01",
+        "configured_boundary_tolerance=0.1",
+        "boundary_tolerance_fraction=None",
+        "realized_boundary_tolerance=0.1",
+        "max_boundary_refinements=3",
+        "final_pixelscale=0.25",
+        "final_pseudo_caustic_points=32",
+        "final_critical_curve_fov=5.0",
+        "boundary_uncertainty=0.1",
+        "boundary_refinements=2",
+    ):
+        assert setting in message
     assert not set(_SOURCE_OUTPUTS).intersection(graph_state[node.node_string])
 
 
@@ -1845,6 +2398,7 @@ def test_source_compute_wraps_sampling_exhaustion_after_narrow_boundary_rejectio
     assert "narrow_boundary_rejections=1" in str(error.value)
     assert "last_source_boundary_clearance=0.1 arcsec" in str(error.value)
     assert "boundary_uncertainty=0.1 arcsec" in str(error.value)
+    assert "realized_geometry_tolerance=0.01" in str(error.value)
     assert error.value.__cause__ is inner_error
 
 
@@ -1887,7 +2441,7 @@ def test_source_compute_count_mismatch_remains_nonretryable(
             0.1,
             2,
             object(),
-            0.5,
+            (None, 0.5, 0.1, 0.01, 0.1),
         ),
     )
 
