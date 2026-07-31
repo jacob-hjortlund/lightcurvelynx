@@ -67,10 +67,10 @@ def _trace_pseudo_caustics(
 
     for generator in geometry_adapter.pseudo_caustic_generators(values):
         center = np.asarray(generator.center, dtype=float)
-        if generator.max_initial_radius is None:
-            radius = epsilon
-        else:
-            radius = min(epsilon, generator.max_initial_radius)
+        initial_radius = epsilon
+        if generator.max_initial_radius is not None:
+            initial_radius = min(initial_radius, generator.max_initial_radius)
+        radius = initial_radius
         previous_curve = _runtime._raytrace_curve(lens, center + radius * directions)
         last_change = np.inf
 
@@ -85,6 +85,8 @@ def _trace_pseudo_caustics(
         else:
             raise RuntimeError(
                 "Pseudo-caustic extraction did not converge after 32 refinements; "
+                f"initial_radius={initial_radius} arcsec, epsilon={epsilon} arcsec, "
+                f"geometry_tolerance={geometry_tolerance} arcsec, "
                 f"final boundary change was {last_change} arcsec."
             )
 
