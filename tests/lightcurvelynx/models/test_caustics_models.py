@@ -29,6 +29,8 @@ _IMAGE_OUTPUTS = (
     "image_y",
     "macro_magnifications",
     "time_delays",
+    "macro_convergences",
+    "macro_shear",
     "image_count_deficit",
     "solver_fov",
     "solver_pixelscale",
@@ -216,7 +218,7 @@ class _RecoveryGeometryAdapter(_FakeGeometryAdapter):
 
 
 class _FakeLens:
-    """Return deterministic magnifications and arrival times."""
+    """Return deterministic image observables."""
 
     def magnification(self, image_x, image_y):
         """Return signed values so the node must take absolute magnitudes."""
@@ -228,15 +230,38 @@ class _FakeLens:
         del image_x, image_y
         return _FakeTensor([12.0, 10.0])
 
+    def convergence(self, image_x, image_y):
+        """Return deterministic macro convergences."""
+        del image_x, image_y
+        return _FakeTensor([0.25, 0.5])
+
+    def shear(self, image_x, image_y):
+        """Return deterministic Cartesian macro-shear components."""
+        del image_x, image_y
+        return (_FakeTensor([3.0, 5.0]), _FakeTensor([4.0, 12.0]))
+
 
 class _ArrayLens:
     """Return configurable observables while recording their evaluation count."""
 
-    def __init__(self, magnifications, delays):
+    def __init__(self, magnifications, delays, convergences=None, shear1=None, shear2=None):
         self.magnifications = np.asarray(magnifications, dtype=float)
         self.delays = np.asarray(delays, dtype=float)
+        self.convergences = (
+            np.zeros_like(self.magnifications)
+            if convergences is None
+            else np.asarray(convergences, dtype=float)
+        )
+        self.shear1 = (
+            np.zeros_like(self.magnifications) if shear1 is None else np.asarray(shear1, dtype=float)
+        )
+        self.shear2 = (
+            np.zeros_like(self.magnifications) if shear2 is None else np.asarray(shear2, dtype=float)
+        )
         self.magnification_calls = 0
         self.delay_calls = 0
+        self.convergence_calls = 0
+        self.shear_calls = 0
 
     def magnification(self, image_x, image_y):
         """Return configured signed magnifications."""
@@ -249,6 +274,18 @@ class _ArrayLens:
         del image_x, image_y
         self.delay_calls += 1
         return _FakeTensor(self.delays)
+
+    def convergence(self, image_x, image_y):
+        """Return configured macro convergences."""
+        del image_x, image_y
+        self.convergence_calls += 1
+        return _FakeTensor(self.convergences)
+
+    def shear(self, image_x, image_y):
+        """Return configured Cartesian macro-shear components."""
+        del image_x, image_y
+        self.shear_calls += 1
+        return (_FakeTensor(self.shear1), _FakeTensor(self.shear2))
 
 
 def _closed_square(center=(0.0, 0.0), half_width=1.0):
@@ -1925,7 +1962,7 @@ def test_image_solve_derives_none_fov_or_converts_explicit_fov(
     assert adapter.initial_fov_calls == ([adapter_values] if uses_adapter else [])
     assert len(forward_calls) == 1
     assert forward_calls[0]["current_fov"] == expected_initial_fov
-    assert result[4]["solver_fov"] == expected_initial_fov
+    assert result[6]["solver_fov"] == expected_initial_fov
 
 
 @pytest.mark.parametrize(
@@ -1998,7 +2035,13 @@ def test_image_one_attempt_uses_actual_spacing_and_sorts_all_observables(
         epsilon=0.3,
         epsilon_fraction=0.1,
     )
-    lens = _ArrayLens([-2.0, 3.0, -4.0, 5.0], [10.0, 10.0, 10.0, 11.0])
+    lens = _ArrayLens(
+        [-2.0, 3.0, -4.0, 5.0],
+        [10.0, 10.0, 10.0, 11.0],
+        convergences=[0.1, 0.2, 0.3, 0.4],
+        shear1=[3.0, 5.0, 8.0, 7.0],
+        shear2=[4.0, 12.0, 15.0, 24.0],
+    )
     _patch_image_runtime(monkeypatch, lens, _FakeGeometryAdapter())
     calls = []
     coordinates = np.array(
@@ -2017,9 +2060,15 @@ def test_image_one_attempt_uses_actual_spacing_and_sorts_all_observables(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    image_x, image_y, magnifications, delays, diagnostics = node._solve_one(
-        _image_values(fov=5.0, expected_num_images=4)
-    )
+    (
+        image_x,
+        image_y,
+        magnifications,
+        delays,
+        convergences,
+        shears,
+        diagnostics,
+    ) = node._solve_one(_image_values(fov=5.0, expected_num_images=4))
 
     assert len(calls) == 1
     assert calls[0] == {
@@ -2033,6 +2082,8 @@ def test_image_one_attempt_uses_actual_spacing_and_sorts_all_observables(
     np.testing.assert_array_equal(image_y, [2.0, 3.0, 2.0, 9.0])
     np.testing.assert_array_equal(magnifications, [4.0, 3.0, 2.0, 5.0])
     np.testing.assert_array_equal(delays, [0.0, 0.0, 0.0, 1.0])
+    np.testing.assert_array_equal(convergences, [0.3, 0.2, 0.1, 0.4])
+    np.testing.assert_array_equal(shears, [17.0, 13.0, 5.0, 25.0])
     assert diagnostics == {
         "image_count_deficit": 0,
         "solver_fov": 10.0,
@@ -2043,6 +2094,8 @@ def test_image_one_attempt_uses_actual_spacing_and_sorts_all_observables(
     }
     assert lens.magnification_calls == 1
     assert lens.delay_calls == 1
+    assert lens.convergence_calls == 1
+    assert lens.shear_calls == 1
 
 
 def test_image_singular_base_uses_divisions_plus_one_variant(
@@ -2069,7 +2122,7 @@ def test_image_singular_base_uses_divisions_plus_one_variant(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    _, _, _, _, diagnostics = node._solve_one(_image_values())
+    _, _, _, _, _, _, diagnostics = node._solve_one(_image_values())
 
     assert [(call["center_x"], call["center_y"], call["divisions"]) for call in calls] == [
         (0.0, 0.0, 3),
@@ -2106,7 +2159,7 @@ def test_image_three_singular_variants_then_expand_fov(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    _, _, _, _, diagnostics = node._solve_one(_image_values())
+    _, _, _, _, _, _, diagnostics = node._solve_one(_image_values())
 
     assert [call["current_fov"] for call in calls] == [4.0, 4.0, 4.0, 8.0]
     assert [(call["center_x"], call["center_y"], call["divisions"]) for call in calls] == [
@@ -2145,7 +2198,7 @@ def test_image_empty_candidate_error_moves_directly_to_outer_schedule(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    _, _, _, _, diagnostics = node._solve_one(_image_values())
+    _, _, _, _, _, _, diagnostics = node._solve_one(_image_values())
 
     assert [(call["current_fov"], call["divisions"]) for call in calls] == [
         (4.0, 4),
@@ -2208,7 +2261,7 @@ def test_image_outer_schedule_finishes_fov_before_pixelscale_refinement(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    _, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
+    _, _, _, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
 
     assert [call["current_fov"] for call in calls] == [4.0, 8.0, 16.0, 16.0, 16.0]
     assert [call["divisions"] for call in calls] == [3, 6, 11, 22, 43]
@@ -2314,7 +2367,7 @@ def test_image_targeted_recovery_adds_one_batch_and_keeps_duplicates(
     monkeypatch.setattr(caustics_image_recovery, "_recovery_image_seeds", recovery_seeds)
     monkeypatch.setattr(caustics_image_recovery, "_refine_image_seeds", refine_seeds)
 
-    image_x, image_y, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
+    image_x, image_y, _, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
 
     assert len(seed_calls) == 1
     assert seed_calls[0][0] is lens
@@ -2379,7 +2432,7 @@ def test_image_targeted_recovery_policy_gates(
     else:
         result = node._solve_one(_image_values(expected_num_images=expected_num_images))
         assert len(result[0]) == count
-        assert result[4]["solver_attempts"] == 1
+        assert result[6]["solver_attempts"] == 1
 
 
 def test_image_retryable_targeted_failure_retains_deficient_global_result(
@@ -2416,7 +2469,7 @@ def test_image_retryable_targeted_failure_retains_deficient_global_result(
         lambda *args, **kwargs: (_ for _ in ()).throw(IndexError("index 0 is out of bounds for dimension 0")),
     )
 
-    image_x, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
+    image_x, _, _, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
 
     np.testing.assert_array_equal(image_x, [4.0, 0.0])
     assert diagnostics["image_count_deficit"] == 1
@@ -2554,7 +2607,7 @@ def test_image_bounded_deficit_requires_at_least_min_images(
     else:
         result = node._solve_one(_image_values(expected_num_images=3))
         assert len(result[0]) == 2
-        assert result[4]["image_count_deficit"] == deficit
+        assert result[6]["image_count_deficit"] == deficit
 
 
 def test_image_no_expectation_completes_at_minimum_with_deficit_sentinel(
@@ -2582,7 +2635,7 @@ def test_image_no_expectation_completes_at_minimum_with_deficit_sentinel(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    image_x, image_y, magnifications, delays, diagnostics = node._solve_one(
+    image_x, image_y, magnifications, delays, convergences, shears, diagnostics = node._solve_one(
         _image_values(expected_num_images=None)
     )
 
@@ -2593,6 +2646,8 @@ def test_image_no_expectation_completes_at_minimum_with_deficit_sentinel(
     np.testing.assert_array_equal(image_y, [0.0, 0.0])
     np.testing.assert_array_equal(magnifications, [3.0, 2.0])
     np.testing.assert_array_equal(delays, [0.0, 3.0])
+    np.testing.assert_array_equal(convergences, [0.0, 0.0])
+    np.testing.assert_array_equal(shears, [0.0, 0.0])
     assert diagnostics == {
         "image_count_deficit": -1,
         "solver_fov": 4.0,
@@ -2622,6 +2677,8 @@ def test_image_compute_single_sample_packs_padding_and_preserves_fixed_output(
         np.array([-2.0, -1.0]),
         np.array([5.0, 6.0]),
         np.array([0.0, 3.0]),
+        np.array([0.2, 0.4]),
+        np.array([0.5, 0.7]),
         {
             "image_count_deficit": -1,
             "solver_fov": 8.0,
@@ -2647,24 +2704,28 @@ def test_image_compute_single_sample_packs_padding_and_preserves_fixed_output(
     assert tuple(name for name in saved if name in _IMAGE_OUTPUTS) == _IMAGE_OUTPUTS
     assert "cosmology" not in saved
     assert np.isscalar(results[0])
-    assert all(np.isscalar(result) for result in results[5:])
-    assert all(result.shape == (4,) for result in results[1:5])
+    assert all(np.isscalar(result) for result in results[7:])
+    assert all(result.shape == (4,) for result in results[1:7])
     assert results[0] == 2
     np.testing.assert_array_equal(results[1], [2.0, 1.0, np.nan, np.nan])
     np.testing.assert_array_equal(results[2], [-2.0, -1.0, np.nan, np.nan])
     np.testing.assert_array_equal(results[3], [5.0, 6.0, 0.0, 0.0])
     np.testing.assert_array_equal(results[4], [0.0, 3.0, np.nan, np.nan])
-    assert results[5] == -1
-    assert results[6] == 8.0
-    assert results[7] == 0.25
-    assert results[8] == 3
-    assert results[9] == 1
-    assert results[10] == 0
+    np.testing.assert_array_equal(results[5], [0.2, 0.4, np.nan, np.nan])
+    np.testing.assert_array_equal(results[6], [0.5, 0.7, np.nan, np.nan])
+    assert results[7] == -1
+    assert results[8] == 8.0
+    assert results[9] == 0.25
+    assert results[10] == 3
+    assert results[11] == 1
+    assert results[12] == 0
     assert saved["num_images"] == 99
     np.testing.assert_array_equal(saved["image_x"], [2.0, 1.0, np.nan, np.nan])
     np.testing.assert_array_equal(saved["image_y"], [-2.0, -1.0, np.nan, np.nan])
     np.testing.assert_array_equal(saved["macro_magnifications"], [5.0, 6.0, 0.0, 0.0])
     np.testing.assert_array_equal(saved["time_delays"], [0.0, 3.0, np.nan, np.nan])
+    np.testing.assert_array_equal(saved["macro_convergences"], [0.2, 0.4, np.nan, np.nan])
+    np.testing.assert_array_equal(saved["macro_shear"], [0.5, 0.7, np.nan, np.nan])
     assert saved["image_count_deficit"] == -1
     assert saved["solver_fov"] == 8.0
     assert saved["solver_pixelscale"] == 0.25
@@ -2696,6 +2757,8 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
                 np.array([-2.0, -1.0]),
                 np.array([5.0, 6.0]),
                 np.array([0.0, 3.0]),
+                np.array([0.2, 0.4]),
+                np.array([0.5, 0.7]),
                 {
                     "image_count_deficit": -1,
                     "solver_fov": 8.0,
@@ -2710,6 +2773,8 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
                 np.array([-7.0]),
                 np.array([9.0]),
                 np.array([0.0]),
+                np.array([0.9]),
+                np.array([1.1]),
                 {
                     "image_count_deficit": -1,
                     "solver_fov": 16.0,
@@ -2739,8 +2804,8 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
 
     np.testing.assert_array_equal(seen_source_x, [0.1, 0.2])
     assert tuple(name for name in saved if name in _IMAGE_OUTPUTS) == _IMAGE_OUTPUTS
-    assert all(result.shape == (2,) for result in (results[0], *results[5:]))
-    assert all(result.shape == (2, 4) for result in results[1:5])
+    assert all(result.shape == (2,) for result in (results[0], *results[7:]))
+    assert all(result.shape == (2, 4) for result in results[1:7])
     np.testing.assert_array_equal(results[0], [2, 1])
     np.testing.assert_array_equal(
         results[1],
@@ -2755,12 +2820,20 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
         results[4],
         [[0.0, 3.0, np.nan, np.nan], [0.0, np.nan, np.nan, np.nan]],
     )
-    np.testing.assert_array_equal(results[5], [-1, -1])
-    np.testing.assert_array_equal(results[6], [8.0, 16.0])
-    np.testing.assert_array_equal(results[7], [0.25, 0.125])
-    np.testing.assert_array_equal(results[8], [3, 5])
-    np.testing.assert_array_equal(results[9], [1, 2])
-    np.testing.assert_array_equal(results[10], [0, 1])
+    np.testing.assert_array_equal(
+        results[5],
+        [[0.2, 0.4, np.nan, np.nan], [0.9, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(
+        results[6],
+        [[0.5, 0.7, np.nan, np.nan], [1.1, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(results[7], [-1, -1])
+    np.testing.assert_array_equal(results[8], [8.0, 16.0])
+    np.testing.assert_array_equal(results[9], [0.25, 0.125])
+    np.testing.assert_array_equal(results[10], [3, 5])
+    np.testing.assert_array_equal(results[11], [1, 2])
+    np.testing.assert_array_equal(results[12], [0, 1])
     np.testing.assert_array_equal(saved["num_images"], [2, 1])
     np.testing.assert_array_equal(
         saved["image_x"],
@@ -2777,6 +2850,14 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
     np.testing.assert_array_equal(
         saved["time_delays"],
         [[0.0, 3.0, np.nan, np.nan], [0.0, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(
+        saved["macro_convergences"],
+        [[0.2, 0.4, np.nan, np.nan], [0.9, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(
+        saved["macro_shear"],
+        [[0.5, 0.7, np.nan, np.nan], [1.1, np.nan, np.nan, np.nan]],
     )
     np.testing.assert_array_equal(saved["image_count_deficit"], [-1, -1])
     np.testing.assert_array_equal(saved["solver_fov"], [8.0, 16.0])
