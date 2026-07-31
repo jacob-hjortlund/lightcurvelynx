@@ -348,8 +348,11 @@ def _source_node(lens, cosmology, **overrides):
         "fov_expansion_factor": 2.0,
         "pseudo_caustic_points": 8,
         "pseudo_caustic_epsilon": 0.1,
+        "pseudo_caustic_epsilon_fraction": None,
         "geometry_tolerance": 0.01,
+        "geometry_tolerance_fraction": None,
         "boundary_tolerance": 0.1,
+        "boundary_tolerance_fraction": None,
         "max_boundary_refinements": 3,
         "max_attempts": 10,
         "seed": 17,
@@ -760,6 +763,125 @@ def test_source_node_rejects_non_spec_lens(fixed_cosmology):
     """Reject invalid public lens objects before registering graph inputs."""
     with pytest.raises(TypeError, match="lens must be a CausticsLensSpec"):
         _source_node(object(), fixed_cosmology)
+
+
+def test_source_node_defaults_to_scale_aware_geometry_settings(valid_sis_spec, fixed_cosmology):
+    """Enable all three new characteristic-scale fractions by default."""
+    node = caustics_models.CausticsSourcePositionNode(
+        valid_sis_spec,
+        cosmology=fixed_cosmology,
+        source_redshift=1.5,
+    )
+
+    assert node.pseudo_caustic_epsilon_fraction == 1.0e-5
+    assert node.geometry_tolerance_fraction == 1.0e-6
+    assert node.boundary_tolerance_fraction == 1.0e-4
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "pseudo_caustic_epsilon_fraction",
+        "geometry_tolerance_fraction",
+        "boundary_tolerance_fraction",
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "error_type", "message"),
+    [
+        (np.array([0.1]), TypeError, "must be None or a scalar value convertible to float"),
+        (object(), TypeError, "must be None or a scalar value convertible to float"),
+        (0.0, ValueError, "must be finite and positive"),
+        (-0.1, ValueError, "must be finite and positive"),
+        (np.inf, ValueError, "must be finite and positive"),
+        (np.nan, ValueError, "must be finite and positive"),
+    ],
+)
+def test_source_node_validates_optional_tolerance_fractions(
+    valid_sis_spec,
+    fixed_cosmology,
+    name,
+    value,
+    error_type,
+    message,
+):
+    """Give all source tolerance fractions the shared scalar contract."""
+    with pytest.raises(error_type, match=rf"{name} {message}"):
+        _source_node(valid_sis_spec, fixed_cosmology, **{name: value})
+
+
+def test_source_node_normalizes_scalar_tolerance_fractions_and_accepts_none(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Normalize zero-dimensional arrays and preserve independent opt-outs."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pseudo_caustic_epsilon_fraction=np.array(0.2),
+        geometry_tolerance_fraction=np.array(0.03),
+        boundary_tolerance_fraction=None,
+        pixelscale_fraction=0.2,
+    )
+
+    assert node.pseudo_caustic_epsilon_fraction == 0.2
+    assert node.geometry_tolerance_fraction == 0.03
+    assert node.boundary_tolerance_fraction is None
+
+
+def test_source_node_does_not_order_pseudo_epsilon_and_geometry_fractions(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Leave image-loop radius versus source-change policy lens-dependent."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pseudo_caustic_epsilon_fraction=1.0e-8,
+        geometry_tolerance_fraction=1.0e-6,
+    )
+
+    assert node.pseudo_caustic_epsilon_fraction < node.geometry_tolerance_fraction
+
+
+def test_source_node_accepts_equal_boundary_and_geometry_fractions(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Accept the inclusive relative certification threshold boundary."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale_fraction=0.1,
+        geometry_tolerance_fraction=0.01,
+        boundary_tolerance_fraction=0.01,
+    )
+
+    assert node.boundary_tolerance_fraction == node.geometry_tolerance_fraction
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"pixelscale_fraction": 0.01, "geometry_tolerance_fraction": 0.01},
+            "geometry_tolerance_fraction must be smaller than pixelscale_fraction",
+        ),
+        (
+            {"geometry_tolerance_fraction": 0.02, "boundary_tolerance_fraction": 0.01},
+            "boundary_tolerance_fraction must be at least geometry_tolerance_fraction",
+        ),
+    ],
+)
+def test_source_node_rejects_inconsistent_fractional_relations(
+    valid_sis_spec,
+    fixed_cosmology,
+    overrides,
+    message,
+):
+    """Reject scale-dependent relations that are invalid for every lens."""
+    with pytest.raises(ValueError, match=message):
+        _source_node(valid_sis_spec, fixed_cosmology, **overrides)
 
 
 @pytest.mark.parametrize(
