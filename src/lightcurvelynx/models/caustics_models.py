@@ -142,16 +142,18 @@ class CausticsLensSpec:
 
 
 class CausticsSourcePositionNode(FunctionNode, CiteClass):
-    """Uniformly sample the complete geometric strong-lensing source region.
+    """Sample the complete geometric strong-lensing source region.
 
     For each realized atomic or single-plane lens configuration, this node
     maps total-lens critical curves into true caustics and maps component-owned
     pseudo-caustics through the total lens. It structurally repairs the regular
-    source-plane interiors, samples one position uniformly from their union,
-    and certifies the regular-image count with signed boundary winding. The
-    realized point, geometric cross-section, rejection-attempt count, image
-    count, and boundary diagnostics form nine newly computed results. After
-    every sample succeeds, they are passed to ``_save_results``; its
+    source-plane interiors, draws uniform candidate positions from their union,
+    and certifies the regular-image count with signed boundary winding.
+    Candidates with insufficient boundary clearance are retried within one
+    total draw budget, while an image-count mismatch is immediately fatal. The
+    accepted point, complete geometric cross-section, cumulative draw count,
+    image count, and boundary diagnostics form nine newly computed results.
+    After every sample succeeds, they are passed to ``_save_results``; its
     ``GraphState.set`` calls update eligible nonfixed output entries and
     preserve any pre-fixed output entries. ``compute`` nevertheless returns
     the newly computed value for every output.
@@ -196,7 +198,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         Maximum number of factor-of-two resolution refinements used to certify
         boundary displacement and topology.
     max_attempts : int, optional
-        Maximum bounding-box rejection draws per lens realization.
+        Maximum coordinate-pair draw budget per lens realization. Polygon,
+        exact-point-caustic, and narrow-boundary rejections all consume it.
     seed : object, optional
         Seed accepted by ``numpy.random.default_rng`` for the node-owned
         fallback generator.
@@ -232,7 +235,7 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     max_boundary_refinements : int
         Stored maximum number of factor-of-two refinement steps.
     max_attempts : int
-        Stored maximum number of rejection draws per realization.
+        Stored maximum coordinate-pair draw budget per realization.
     _rng : numpy.random.Generator
         Node-owned seeded fallback generator used only when ``compute`` is not
         given ``rng_info``.
@@ -249,7 +252,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     strong_lensing_area : AttributeIndicator
         Graph output for geometric source-plane area in square arcseconds.
     sampling_attempts : AttributeIndicator
-        Graph output for the one-based rejection-draw count.
+        Graph output for the cumulative coordinate-pair draw count, including
+        polygon, exact-point-caustic, and narrow-boundary rejections.
     expected_num_images : AttributeIndicator
         Graph output for the certified regular-image count.
     critical_curve_fov : AttributeIndicator
@@ -266,9 +270,11 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
     Notes
     -----
-    ``strong_lensing_area`` is a geometric source-plane cross-section in square
-    arcseconds. It does not include magnification bias, detectability, cadence,
-    image resolution, or cross-section weighting of the upstream lens sample.
+    ``strong_lensing_area`` is the complete geometric source-plane
+    cross-section in square arcseconds. It is not reduced when accepted source
+    positions are conditioned to exceed the boundary uncertainty. It does not
+    include magnification bias, detectability, cadence, image resolution, or
+    cross-section weighting of the upstream lens sample.
     The configured ``pixelscale`` is an absolute upper bound. An optional
     fraction produces a realized initial upper bound per lens; each boundary
     refinement requests half the previous scale, while
@@ -297,10 +303,12 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
     Structural repair converts every final regular-boundary interior into valid
     polygonal geometry before union, and signed winding over those regular
-    curves provides the certified image count. A sampled point is accepted only
+    curves provides the certified image count. A candidate is accepted only
     after the penultimate and final winding counts agree and its final regular
     boundary clearance is strictly greater than the matched-boundary
-    uncertainty; certification failure does not resample the point.
+    uncertainty. Insufficient clearance retries from the remaining
+    ``max_attempts`` budget; a count mismatch remains fatal and is never
+    retried.
 
     The exact output order is ``source_x``, ``source_y``,
     ``strong_lensing_area``, ``sampling_attempts``, ``expected_num_images``,
@@ -308,9 +316,12 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
     ``source_boundary_clearance``, and ``boundary_refinements``. Each is a
     NumPy scalar for one graph sample and has shape ``(S,)`` for ``S > 1``;
     ``strong_lensing_area`` is in square arcseconds,
-    ``sampling_attempts`` is one-based, and ``boundary_refinements`` counts
-    completed factor-of-two steps. Only after every graph sample succeeds are
-    these newly computed results passed in order to ``_save_results``. Its
+    ``sampling_attempts`` counts all polygon, exact-point-caustic, and
+    narrow-boundary rejected coordinate pairs as well as the accepted pair,
+    and ``boundary_refinements`` counts completed factor-of-two steps. Only
+    after every graph sample succeeds are these newly computed results passed
+    in order to ``_save_results``. Exhaustion therefore leaves all nine outputs
+    from this call unsaved. Its
     ``GraphState.set`` calls update eligible nonfixed output entries and leave
     pre-fixed output entries unchanged. A successful return still contains all
     newly computed values, including those corresponding to preserved
@@ -398,7 +409,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             Positive maximum number of factor-of-two boundary-refinement
             steps.
         max_attempts : int, optional
-            Positive maximum rejection-draw count per realization.
+            Positive total coordinate-pair draw budget per realization.
+            Polygon, exact-point-caustic, and narrow-boundary rejections all
+            consume it.
         seed : object, optional
             Seed accepted by ``numpy.random.default_rng`` for the fallback
             generator.
@@ -1067,8 +1080,8 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         strong_lensing_area : float
             Area of the complete repaired region in square arcseconds.
         sampling_attempts : int
-            Cumulative coordinate-pair draws across proposal and narrow-band
-            rejections.
+            Cumulative coordinate-pair draws, including polygon,
+            exact-point-caustic, and narrow-boundary rejections.
         expected_num_images : int
             Final certified regular-image count.
         source_boundary_clearance : float
@@ -1085,6 +1098,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         A count disagreement is immediately fatal. Only candidates whose
         clearance is no greater than ``uncertainty`` are redrawn, and every
         coordinate pair consumes the one cumulative ``max_attempts`` budget.
+        The returned area remains that of the complete repaired region rather
+        than the clearance-conditioned accepted-position support. Exhaustion
+        propagates before ``compute`` can pass any results to ``_save_results``.
         """
         remaining_attempts = self.max_attempts
         total_attempts = 0
@@ -1107,14 +1123,21 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
             )
 
         while remaining_attempts > 0:
-            source_x, source_y, area, candidate_attempts = _source_geometry._sample_position(
-                region,
-                rng,
-                max_attempts=remaining_attempts,
-                lens_identifier=self._lens_identifier(sample_index),
-                geometry_settings=geometry_settings,
-                excluded_points=geometry.point_caustics,
-            )
+            try:
+                source_x, source_y, area, candidate_attempts = _source_geometry._sample_position(
+                    region,
+                    rng,
+                    max_attempts=remaining_attempts,
+                    lens_identifier=self._lens_identifier(sample_index),
+                    geometry_settings=geometry_settings,
+                    excluded_points=geometry.point_caustics,
+                )
+            except RuntimeError as err:
+                if narrow_boundary_rejections == 0:
+                    raise
+                total_attempts += remaining_attempts
+                remaining_attempts = 0
+                raise RuntimeError(exhaustion_message()) from err
             total_attempts += candidate_attempts
             remaining_attempts -= candidate_attempts
             previous_count = geometry_adapter.expected_num_images(
@@ -1187,8 +1210,9 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
 
             1. ``source_x``, source-plane arcseconds;
             2. ``source_y``, source-plane arcseconds;
-            3. ``strong_lensing_area``, square arcseconds;
-            4. ``sampling_attempts``, one-based rejection-draw count;
+            3. ``strong_lensing_area``, complete geometric region area in
+               square arcseconds;
+            4. ``sampling_attempts``, cumulative coordinate-pair draw count;
             5. ``expected_num_images``, regular-image count;
             6. ``critical_curve_fov``, successful image-plane FOV in
                arcseconds;
@@ -1240,11 +1264,18 @@ class CausticsSourcePositionNode(FunctionNode, CiteClass):
         parent generator has therefore consumed all ``S`` seeds even if a later
         sample raises.
 
-        The proposal must lie strictly inside the repaired union and must not
-        equal a certified point caustic exactly. It is not redrawn after
-        certification: the penultimate and final signed-winding image counts
-        must agree, and final regular-boundary clearance must be strictly
-        greater than boundary uncertainty, or the method raises before any of
+        Each proposal must lie strictly inside the repaired union and must not
+        equal a certified point caustic exactly. Polygon and exact-point
+        rejections occur within the proposal sampler. If the penultimate and
+        final signed-winding image counts disagree, the method raises
+        immediately without retrying. If the counts agree but final
+        regular-boundary clearance is no greater than boundary uncertainty, a
+        new candidate is drawn from the remaining total ``max_attempts``
+        budget. ``sampling_attempts`` includes every coordinate-pair draw from
+        polygon, exact-point-caustic, and narrow-boundary rejection. The
+        accepted-position distribution is therefore clearance-conditioned,
+        while ``strong_lensing_area`` retains the complete repaired geometric
+        region area. Exhaustion and count mismatch both occur before any of
         this call's results are passed to ``_save_results``.
         Sampling-exhaustion context includes
         ``fov``, configured/fractional/realized pixel-scale settings,

@@ -1467,6 +1467,43 @@ def test_source_compute_isolates_later_samples_from_first_rejection_count(
         np.testing.assert_array_equal(baseline_result[1:], perturbed_result[1:])
 
 
+def test_source_compute_retry_keeps_later_sample_rng_isolated(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Keep later outputs fixed when a narrow first-sample draw is retried."""
+    node = _source_node(valid_sis_spec, fixed_cosmology)
+    _patch_source_compute_runtime(monkeypatch, node)
+    baseline_clearances = iter([0.5, 0.5])
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: next(baseline_clearances),
+    )
+    baseline = node.compute(
+        _graph_state_for(node, 2),
+        rng_info=np.random.default_rng(77),
+    )
+
+    retried_clearances = iter([0.1, 0.5, 0.5])
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: next(retried_clearances),
+    )
+    retried = node.compute(
+        _graph_state_for(node, 2),
+        rng_info=np.random.default_rng(77),
+    )
+
+    assert baseline[0][0] != retried[0][0]
+    assert baseline[3][0] == 1
+    assert retried[3][0] == 2
+    for baseline_result, retried_result in zip(baseline, retried, strict=True):
+        np.testing.assert_array_equal(baseline_result[1:], retried_result[1:])
+
+
 @pytest.mark.parametrize("num_samples", [1, 2])
 def test_source_compute_shapes_output_order_persistence_and_fixed_semantics(
     monkeypatch,
@@ -1580,6 +1617,76 @@ def test_source_compute_redraws_narrow_boundary_candidate_with_remaining_budget(
     assert results[0:5] == [1.25, -0.75, 10.0, 5, 4]
     assert results[7] == 0.5
     assert budgets == [10, 8]
+
+
+def test_source_compute_exhausts_narrow_boundary_retry_budget(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Report cumulative exhaustion after every candidate is too narrow."""
+    node = _source_node(valid_sis_spec, fixed_cosmology, max_attempts=3)
+    _patch_source_compute_runtime(monkeypatch, node)
+    budgets = []
+
+    def sample_position(*args, max_attempts, **kwargs):
+        del args, kwargs
+        budgets.append(max_attempts)
+        return (0.0, 0.0, 10.0, 1)
+
+    monkeypatch.setattr(caustics_source_geometry, "_sample_position", sample_position)
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: 0.1,
+    )
+    graph_state = _graph_state_for(node, 1)
+
+    with pytest.raises(RuntimeError) as error:
+        node.compute(graph_state, rng_info=np.random.default_rng(5))
+
+    assert budgets == [3, 2, 1]
+    assert "after 3 attempts" in str(error.value)
+    assert "narrow_boundary_rejections=3" in str(error.value)
+    assert "last_source_boundary_clearance=0.1 arcsec" in str(error.value)
+    assert "boundary_uncertainty=0.1 arcsec" in str(error.value)
+    assert not set(_SOURCE_OUTPUTS).intersection(graph_state[node.node_string])
+
+
+def test_source_compute_wraps_sampling_exhaustion_after_narrow_boundary_rejection(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Preserve proposal exhaustion as the cause of total-budget exhaustion."""
+    node = _source_node(valid_sis_spec, fixed_cosmology, max_attempts=3)
+    _patch_source_compute_runtime(monkeypatch, node)
+    inner_error = RuntimeError("unique proposal exhaustion")
+    budgets = []
+
+    def sample_position(*args, max_attempts, **kwargs):
+        del args, kwargs
+        budgets.append(max_attempts)
+        if len(budgets) == 1:
+            return (0.0, 0.0, 10.0, 1)
+        raise inner_error
+
+    monkeypatch.setattr(caustics_source_geometry, "_sample_position", sample_position)
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: 0.1,
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        node.compute(_graph_state_for(node, 1), rng_info=np.random.default_rng(5))
+
+    assert budgets == [3, 2]
+    assert "after 3 attempts" in str(error.value)
+    assert "narrow_boundary_rejections=1" in str(error.value)
+    assert "last_source_boundary_clearance=0.1 arcsec" in str(error.value)
+    assert "boundary_uncertainty=0.1 arcsec" in str(error.value)
+    assert error.value.__cause__ is inner_error
 
 
 def test_source_compute_count_mismatch_remains_nonretryable(
