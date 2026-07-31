@@ -1458,7 +1458,7 @@ class CausticsLensImageNode(FunctionNode, CiteClass):
         pixelscale_fraction=None,
         epsilon=1.0e-3,
         epsilon_fraction=None,
-        max_depth=25,
+        max_depth=50,
         max_fov_expansions=5,
         fov_expansion_factor=1.25,
         max_pixelscale_refinements=5,
