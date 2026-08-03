@@ -115,6 +115,52 @@ def test_trace_pseudo_caustics_caps_initial_radius_halves_to_convergence_and_clo
     )
 
 
+def test_trace_pseudo_caustics_is_equivalent_under_homothetic_scaling(monkeypatch):
+    """Preserve normalized curves and shrink counts under angular scaling."""
+
+    class GeneratorAdapter:
+        """Supply one uncapped origin-centered pseudo-caustic loop."""
+
+        def pseudo_caustic_generators(self, values):
+            del values
+            return (lens_system._PseudoCausticGenerator(center=(0.0, 0.0)),)
+
+    calls = {}
+
+    def raytrace_curve(lens, coordinates):
+        calls[lens.scale] = calls.get(lens.scale, 0) + 1
+        return lens.scale * np.array([2.0, -3.0]) + coordinates
+
+    monkeypatch.setattr(runtime, "_raytrace_curve", raytrace_curve)
+    first_lens = SimpleNamespace(scale=1.0)
+    second_lens = SimpleNamespace(scale=1.0e-6)
+
+    (first_curve,) = source_geometry._trace_pseudo_caustics(
+        first_lens,
+        GeneratorAdapter(),
+        {},
+        num_points=8,
+        epsilon=0.2,
+        geometry_tolerance=0.03,
+    )
+    (second_curve,) = source_geometry._trace_pseudo_caustics(
+        second_lens,
+        GeneratorAdapter(),
+        {},
+        num_points=8,
+        epsilon=0.2e-6,
+        geometry_tolerance=0.03e-6,
+    )
+
+    assert calls[1.0] == calls[1.0e-6]
+    np.testing.assert_allclose(
+        first_curve,
+        second_curve / 1.0e-6,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
 def test_trace_pseudo_caustics_reports_bounded_halving_exhaustion(monkeypatch):
     """Stop after exactly 32 failed refinements and report final movement."""
     lens = object()
@@ -150,6 +196,9 @@ def test_trace_pseudo_caustics_reports_bounded_halving_exhaustion(monkeypatch):
     message = str(error.value)
     assert "did not converge after 32 refinements" in message
     assert "final boundary change" in message
+    assert "initial_radius=0.8 arcsec" in message
+    assert "epsilon=0.8 arcsec" in message
+    assert "geometry_tolerance=0.01 arcsec" in message
 
 
 def test_outer_grid_boundary_uses_rows_then_side_interiors():

@@ -67,10 +67,10 @@ def _trace_pseudo_caustics(
 
     for generator in geometry_adapter.pseudo_caustic_generators(values):
         center = np.asarray(generator.center, dtype=float)
-        if generator.max_initial_radius is None:
-            radius = epsilon
-        else:
-            radius = min(epsilon, generator.max_initial_radius)
+        initial_radius = epsilon
+        if generator.max_initial_radius is not None:
+            initial_radius = min(initial_radius, generator.max_initial_radius)
+        radius = initial_radius
         previous_curve = _runtime._raytrace_curve(lens, center + radius * directions)
         last_change = np.inf
 
@@ -85,6 +85,8 @@ def _trace_pseudo_caustics(
         else:
             raise RuntimeError(
                 "Pseudo-caustic extraction did not converge after 32 refinements; "
+                f"initial_radius={initial_radius} arcsec, epsilon={epsilon} arcsec, "
+                f"geometry_tolerance={geometry_tolerance} arcsec, "
                 f"final boundary change was {last_change} arcsec."
             )
 
@@ -1258,7 +1260,9 @@ def _validate_source_position_configuration(
     pseudo_caustic_points,
     pseudo_caustic_epsilon,
     geometry_tolerance,
+    geometry_tolerance_fraction,
     boundary_tolerance,
+    boundary_tolerance_fraction,
     max_boundary_refinements,
     max_attempts,
 ):
@@ -1286,9 +1290,15 @@ def _validate_source_position_configuration(
     geometry_tolerance : object
         Float-convertible positive curve/topology tolerance in arcseconds,
         strictly smaller than ``pixelscale``.
+    geometry_tolerance_fraction : float or None
+        Pre-normalized positive dimensionless curve/topology tolerance fraction
+        of the realized characteristic angular scale, or ``None``.
     boundary_tolerance : object
         Float-convertible positive certification tolerance in arcseconds, at
         least ``geometry_tolerance``.
+    boundary_tolerance_fraction : float or None
+        Pre-normalized positive dimensionless certification tolerance fraction
+        of the realized characteristic angular scale, or ``None``.
     max_boundary_refinements : int
         Positive maximum number of factor-of-two boundary-refinement steps.
     max_attempts : int
@@ -1301,8 +1311,8 @@ def _validate_source_position_configuration(
         ``pseudo_caustic_epsilon``, ``geometry_tolerance``,
         ``boundary_tolerance``, and ``fov_expansion_factor``; the additional
         key ``fov`` is present only when ``fov`` was configured. Integer
-        settings are validated, while pre-normalized ``pixelscale_fraction``
-        is consumed only for the static FOV relation; neither is returned.
+        settings are validated, while pre-normalized fraction settings are
+        consumed only for static relations and are not returned.
 
     Raises
     ------
@@ -1321,9 +1331,10 @@ def _validate_source_position_configuration(
     ``pixelscale``, while ``boundary_tolerance`` may equal but not undercut
     ``geometry_tolerance``. A configured absolute ``fov`` must exceed
     ``pixelscale`` only when relative pixel scaling is disabled; the relative
-    FOV relation is checked after realization. This helper does not recompare
-    ``geometry_tolerance`` with a potentially smaller fractional realized
-    pixelscale. ``max_fov_expansions`` is non-negative,
+    FOV relation is checked after realization. Configured relative geometry
+    tolerance must be smaller than relative pixel scale, and relative boundary
+    tolerance may equal but not undercut relative geometry tolerance.
+    ``max_fov_expansions`` is non-negative,
     ``pseudo_caustic_points`` is at least three, and both
     ``max_boundary_refinements`` and ``max_attempts`` are positive. Unlike the
     image node's integer settings, these four checks use
@@ -1358,6 +1369,18 @@ def _validate_source_position_configuration(
         raise ValueError("geometry_tolerance must be smaller than pixelscale.")
     if normalized["boundary_tolerance"] < normalized["geometry_tolerance"]:
         raise ValueError("boundary_tolerance must be at least geometry_tolerance.")
+    if (
+        pixelscale_fraction is not None
+        and geometry_tolerance_fraction is not None
+        and geometry_tolerance_fraction >= pixelscale_fraction
+    ):
+        raise ValueError("geometry_tolerance_fraction must be smaller than pixelscale_fraction.")
+    if (
+        geometry_tolerance_fraction is not None
+        and boundary_tolerance_fraction is not None
+        and boundary_tolerance_fraction < geometry_tolerance_fraction
+    ):
+        raise ValueError("boundary_tolerance_fraction must be at least geometry_tolerance_fraction.")
     if not isinstance(max_fov_expansions, int) or max_fov_expansions < 0:
         raise ValueError("max_fov_expansions must be a non-negative integer.")
     if not isinstance(pseudo_caustic_points, int) or pseudo_caustic_points < 3:

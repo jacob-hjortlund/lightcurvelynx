@@ -29,6 +29,8 @@ _IMAGE_OUTPUTS = (
     "image_y",
     "macro_magnifications",
     "time_delays",
+    "macro_convergences",
+    "macro_shear",
     "image_count_deficit",
     "solver_fov",
     "solver_pixelscale",
@@ -216,7 +218,7 @@ class _RecoveryGeometryAdapter(_FakeGeometryAdapter):
 
 
 class _FakeLens:
-    """Return deterministic magnifications and arrival times."""
+    """Return deterministic image observables."""
 
     def magnification(self, image_x, image_y):
         """Return signed values so the node must take absolute magnitudes."""
@@ -228,15 +230,38 @@ class _FakeLens:
         del image_x, image_y
         return _FakeTensor([12.0, 10.0])
 
+    def convergence(self, image_x, image_y):
+        """Return deterministic macro convergences."""
+        del image_x, image_y
+        return _FakeTensor([0.25, 0.5])
+
+    def shear(self, image_x, image_y):
+        """Return deterministic Cartesian macro-shear components."""
+        del image_x, image_y
+        return (_FakeTensor([3.0, 5.0]), _FakeTensor([4.0, 12.0]))
+
 
 class _ArrayLens:
     """Return configurable observables while recording their evaluation count."""
 
-    def __init__(self, magnifications, delays):
+    def __init__(self, magnifications, delays, convergences=None, shear1=None, shear2=None):
         self.magnifications = np.asarray(magnifications, dtype=float)
         self.delays = np.asarray(delays, dtype=float)
+        self.convergences = (
+            np.zeros_like(self.magnifications)
+            if convergences is None
+            else np.asarray(convergences, dtype=float)
+        )
+        self.shear1 = (
+            np.zeros_like(self.magnifications) if shear1 is None else np.asarray(shear1, dtype=float)
+        )
+        self.shear2 = (
+            np.zeros_like(self.magnifications) if shear2 is None else np.asarray(shear2, dtype=float)
+        )
         self.magnification_calls = 0
         self.delay_calls = 0
+        self.convergence_calls = 0
+        self.shear_calls = 0
 
     def magnification(self, image_x, image_y):
         """Return configured signed magnifications."""
@@ -249,6 +274,18 @@ class _ArrayLens:
         del image_x, image_y
         self.delay_calls += 1
         return _FakeTensor(self.delays)
+
+    def convergence(self, image_x, image_y):
+        """Return configured macro convergences."""
+        del image_x, image_y
+        self.convergence_calls += 1
+        return _FakeTensor(self.convergences)
+
+    def shear(self, image_x, image_y):
+        """Return configured Cartesian macro-shear components."""
+        del image_x, image_y
+        self.shear_calls += 1
+        return (_FakeTensor(self.shear1), _FakeTensor(self.shear2))
 
 
 def _closed_square(center=(0.0, 0.0), half_width=1.0):
@@ -311,8 +348,11 @@ def _source_node(lens, cosmology, **overrides):
         "fov_expansion_factor": 2.0,
         "pseudo_caustic_points": 8,
         "pseudo_caustic_epsilon": 0.1,
+        "pseudo_caustic_epsilon_fraction": None,
         "geometry_tolerance": 0.01,
+        "geometry_tolerance_fraction": None,
         "boundary_tolerance": 0.1,
+        "boundary_tolerance_fraction": None,
         "max_boundary_refinements": 3,
         "max_attempts": 10,
         "seed": 17,
@@ -428,7 +468,7 @@ def _patch_source_compute_runtime(monkeypatch, node, *, extra_draws=(), events=N
             0.1,
             2,
             region,
-            0.5,
+            (None, 0.5, 0.1, 0.01, 0.1),
         )
 
     def sample_position(
@@ -725,6 +765,125 @@ def test_source_node_rejects_non_spec_lens(fixed_cosmology):
         _source_node(object(), fixed_cosmology)
 
 
+def test_source_node_defaults_to_scale_aware_geometry_settings(valid_sis_spec, fixed_cosmology):
+    """Enable all three new characteristic-scale fractions by default."""
+    node = caustics_models.CausticsSourcePositionNode(
+        valid_sis_spec,
+        cosmology=fixed_cosmology,
+        source_redshift=1.5,
+    )
+
+    assert node.pseudo_caustic_epsilon_fraction == 1.0e-5
+    assert node.geometry_tolerance_fraction == 1.0e-6
+    assert node.boundary_tolerance_fraction == 1.0e-4
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "pseudo_caustic_epsilon_fraction",
+        "geometry_tolerance_fraction",
+        "boundary_tolerance_fraction",
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "error_type", "message"),
+    [
+        (np.array([0.1]), TypeError, "must be None or a scalar value convertible to float"),
+        (object(), TypeError, "must be None or a scalar value convertible to float"),
+        (0.0, ValueError, "must be finite and positive"),
+        (-0.1, ValueError, "must be finite and positive"),
+        (np.inf, ValueError, "must be finite and positive"),
+        (np.nan, ValueError, "must be finite and positive"),
+    ],
+)
+def test_source_node_validates_optional_tolerance_fractions(
+    valid_sis_spec,
+    fixed_cosmology,
+    name,
+    value,
+    error_type,
+    message,
+):
+    """Give all source tolerance fractions the shared scalar contract."""
+    with pytest.raises(error_type, match=rf"{name} {message}"):
+        _source_node(valid_sis_spec, fixed_cosmology, **{name: value})
+
+
+def test_source_node_normalizes_scalar_tolerance_fractions_and_accepts_none(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Normalize zero-dimensional arrays and preserve independent opt-outs."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pseudo_caustic_epsilon_fraction=np.array(0.2),
+        geometry_tolerance_fraction=np.array(0.03),
+        boundary_tolerance_fraction=None,
+        pixelscale_fraction=0.2,
+    )
+
+    assert node.pseudo_caustic_epsilon_fraction == 0.2
+    assert node.geometry_tolerance_fraction == 0.03
+    assert node.boundary_tolerance_fraction is None
+
+
+def test_source_node_does_not_order_pseudo_epsilon_and_geometry_fractions(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Leave image-loop radius versus source-change policy lens-dependent."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pseudo_caustic_epsilon_fraction=1.0e-8,
+        geometry_tolerance_fraction=1.0e-6,
+    )
+
+    assert node.pseudo_caustic_epsilon_fraction < node.geometry_tolerance_fraction
+
+
+def test_source_node_accepts_equal_boundary_and_geometry_fractions(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Accept the inclusive relative certification threshold boundary."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale_fraction=0.1,
+        geometry_tolerance_fraction=0.01,
+        boundary_tolerance_fraction=0.01,
+    )
+
+    assert node.boundary_tolerance_fraction == node.geometry_tolerance_fraction
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"pixelscale_fraction": 0.01, "geometry_tolerance_fraction": 0.01},
+            "geometry_tolerance_fraction must be smaller than pixelscale_fraction",
+        ),
+        (
+            {"geometry_tolerance_fraction": 0.02, "boundary_tolerance_fraction": 0.01},
+            "boundary_tolerance_fraction must be at least geometry_tolerance_fraction",
+        ),
+    ],
+)
+def test_source_node_rejects_inconsistent_fractional_relations(
+    valid_sis_spec,
+    fixed_cosmology,
+    overrides,
+    message,
+):
+    """Reject scale-dependent relations that are invalid for every lens."""
+    with pytest.raises(ValueError, match=message):
+        _source_node(valid_sis_spec, fixed_cosmology, **overrides)
+
+
 @pytest.mark.parametrize(
     ("overrides", "error_type", "message"),
     [
@@ -1016,31 +1175,182 @@ def test_public_nodes_keep_cosmology_fixed_and_register_exact_output_order(
     assert tuple(node.list_params()[-len(outputs) :]) == outputs
 
 
-def test_source_node_resolves_absolute_and_relative_pixelscales(valid_sis_spec, fixed_cosmology):
-    """Use the configured scale directly or the smaller relative lens scale."""
-    adapter = _FakeGeometryAdapter()
+def test_source_node_realizes_all_angular_settings_from_one_scale_lookup(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Use one characteristic-scale call for every enabled fraction."""
+
+    class RecordingAdapter(_FakeGeometryAdapter):
+        """Record one configurable characteristic-scale lookup."""
+
+        def __init__(self, scale):
+            self.scale = scale
+            self.calls = 0
+
+        def resolution_scale(self, values):
+            assert values == {"lens": "values"}
+            self.calls += 1
+            return self.scale
+
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale=0.75,
+        pixelscale_fraction=0.25,
+        pseudo_caustic_epsilon=0.3,
+        pseudo_caustic_epsilon_fraction=0.1,
+        geometry_tolerance=0.05,
+        geometry_tolerance_fraction=0.01,
+        boundary_tolerance=0.4,
+        boundary_tolerance_fraction=0.1,
+    )
+    adapter = RecordingAdapter(2.0)
+
+    settings = node._realized_angular_settings(
+        adapter,
+        {"lens": "values"},
+        sample_index=3,
+    )
+
+    assert settings == (2.0, 0.5, 0.2, 0.02, 0.2)
+    assert adapter.calls == 1
+
+
+def test_source_node_caps_relative_settings_and_skips_scale_for_absolute_only(
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Keep absolute caps and preserve the no-lookup compatibility path."""
+    capped = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale=0.75,
+        pixelscale_fraction=2.0,
+        pseudo_caustic_epsilon=0.3,
+        pseudo_caustic_epsilon_fraction=1.0,
+        geometry_tolerance=0.05,
+        geometry_tolerance_fraction=1.0,
+        boundary_tolerance=0.4,
+        boundary_tolerance_fraction=1.0,
+    )
+    assert capped._realized_angular_settings(
+        _FakeGeometryAdapter(),
+        {},
+        sample_index=0,
+    ) == (2.0, 0.75, 0.3, 0.05, 0.4)
+
+    class UnexpectedScaleAdapter(_FakeGeometryAdapter):
+        """Fail if the absolute-only path requests a scale."""
+
+        def resolution_scale(self, values):
+            raise AssertionError("absolute-only realization requested a scale")
+
     absolute = _source_node(
         valid_sis_spec,
         fixed_cosmology,
         pixelscale=0.75,
         pixelscale_fraction=None,
+        pseudo_caustic_epsilon=0.3,
+        pseudo_caustic_epsilon_fraction=None,
+        geometry_tolerance=0.05,
+        geometry_tolerance_fraction=None,
+        boundary_tolerance=0.4,
+        boundary_tolerance_fraction=None,
     )
-    relative = _source_node(
+    assert absolute._realized_angular_settings(
+        UnexpectedScaleAdapter(),
+        {},
+        sample_index=0,
+    ) == (None, 0.75, 0.3, 0.05, 0.4)
+
+
+@pytest.mark.parametrize(
+    ("scale", "error_type", "message"),
+    [
+        (None, TypeError, "must be a scalar value convertible to float"),
+        (np.array([1.0]), TypeError, "must be a scalar value convertible to float"),
+        (0.0, ValueError, "must be finite and positive"),
+        (-1.0, ValueError, "must be finite and positive"),
+        (np.inf, ValueError, "must be finite and positive"),
+        (np.nan, ValueError, "must be finite and positive"),
+    ],
+)
+def test_source_node_validates_required_characteristic_scale(
+    valid_sis_spec,
+    fixed_cosmology,
+    scale,
+    error_type,
+    message,
+):
+    """Validate the adapter value once before fractional arithmetic."""
+
+    class ScaleAdapter(_FakeGeometryAdapter):
+        """Expose the parametrized invalid scale value."""
+
+        def resolution_scale(self, values):
+            """Return the parametrized invalid adapter value."""
+            del values
+            return scale
+
+    adapter = ScaleAdapter()
+    node = _source_node(
         valid_sis_spec,
         fixed_cosmology,
-        pixelscale=0.75,
-        pixelscale_fraction=0.25,
-    )
-    capped = _source_node(
-        valid_sis_spec,
-        fixed_cosmology,
-        pixelscale=0.75,
-        pixelscale_fraction=1.0,
+        geometry_tolerance_fraction=0.01,
     )
 
-    assert absolute._realized_pixelscale_for_one_lens(adapter, {}) == 0.75
-    assert relative._realized_pixelscale_for_one_lens(adapter, {}) == 0.5
-    assert capped._realized_pixelscale_for_one_lens(adapter, {}) == 0.75
+    with pytest.raises(error_type, match=message) as error:
+        node._realized_angular_settings(adapter, {}, sample_index=7)
+
+    assert "lens model 'SIS' sample 7 at node 'source_node'" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {
+                "pixelscale": 0.75,
+                "pixelscale_fraction": 0.1,
+                "geometry_tolerance": 0.3,
+                "geometry_tolerance_fraction": None,
+                "boundary_tolerance": 0.4,
+            },
+            "realized_geometry_tolerance must be smaller than realized_pixelscale",
+        ),
+        (
+            {
+                "pixelscale": 0.75,
+                "geometry_tolerance": 0.2,
+                "geometry_tolerance_fraction": None,
+                "boundary_tolerance": 0.4,
+                "boundary_tolerance_fraction": 0.05,
+            },
+            "realized_boundary_tolerance must be at least realized_geometry_tolerance",
+        ),
+    ],
+)
+def test_source_node_rejects_inconsistent_realized_angular_settings(
+    valid_sis_spec,
+    fixed_cosmology,
+    overrides,
+    message,
+):
+    """Catch invalid mixed absolute/relative policies for the current lens."""
+    node = _source_node(valid_sis_spec, fixed_cosmology, **overrides)
+
+    with pytest.raises(ValueError, match=message) as error:
+        node._realized_angular_settings(_FakeGeometryAdapter(), {}, sample_index=5)
+
+    text = str(error.value)
+    assert "characteristic_scale=2.0" in text
+    assert "configured_geometry_tolerance=" in text
+    assert "geometry_tolerance_fraction=" in text
+    assert "realized_geometry_tolerance=" in text
+    assert "configured_boundary_tolerance=" in text
+    assert "boundary_tolerance_fraction=" in text
+    assert "realized_boundary_tolerance=" in text
 
 
 def test_source_node_uses_configured_or_adapter_derived_fov(valid_sis_spec, fixed_cosmology):
@@ -1110,12 +1420,14 @@ def test_source_caustic_search_expands_fov_with_fixed_pixelscale(
         {},
         sample_index=3,
         pixelscale=0.25,
+        geometry_tolerance=0.003,
     )
 
     assert curves == (curve,)
     assert successful_fov == 8.0
     assert [call[1]["fov"] for call in calls] == [2.0, 4.0, 8.0]
     assert [call[1]["pixelscale"] for call in calls] == [0.25, 0.25, 0.25]
+    assert [call[1]["geometry_tolerance"] for call in calls] == [0.003] * 3
     assert [call[1]["center"] for call in calls] == [(0.0, 0.0)] * 3
     assert [call[1]["jacobian_mask_points"] for call in calls] == [()] * 3
 
@@ -1139,7 +1451,7 @@ def test_source_caustic_search_reports_bounded_fov_exhaustion(
 
     def always_incomplete(lens, **kwargs):
         del lens
-        calls.append(kwargs["fov"])
+        calls.append(kwargs)
         raise last_error
 
     monkeypatch.setattr(caustics_source_geometry, "_find_all_caustics", always_incomplete)
@@ -1151,14 +1463,59 @@ def test_source_caustic_search_reports_bounded_fov_exhaustion(
             {},
             sample_index=7,
             pixelscale=0.25,
+            geometry_tolerance=0.003,
         )
 
-    assert calls == [2.0, 6.0]
+    assert [call["fov"] for call in calls] == [2.0, 6.0]
+    assert [call["geometry_tolerance"] for call in calls] == [0.003, 0.003]
     assert error.value.__cause__ is last_error
     message = str(error.value)
     assert "lens model 'SIS' sample 7 at node 'source_node'" in message
     assert "initial fov=2.0 arcsec, final fov=6.0 arcsec" in message
     assert "pixelscale=0.25 arcsec, max_fov_expansions=1" in message
+
+
+def test_source_boundary_snapshot_uses_realized_epsilon_and_geometry_tolerance(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Pass effective settings to mapped and pseudo-caustic extraction."""
+    node = _source_node(valid_sis_spec, fixed_cosmology)
+    calls = {}
+
+    def find_all(lens, adapter, values, **kwargs):
+        calls["find"] = (lens, adapter, values, kwargs)
+        return (_closed_square(),), 4.0
+
+    def trace(lens, adapter, values, **kwargs):
+        calls["trace"] = (lens, adapter, values, kwargs)
+        return ()
+
+    monkeypatch.setattr(node, "_find_all_caustics_for_one_lens", find_all)
+    monkeypatch.setattr(caustics_source_geometry, "_trace_pseudo_caustics", trace)
+    lens = object()
+    adapter = _FakeGeometryAdapter()
+    values = {"lens": "values"}
+
+    geometry = node._boundary_geometry_for_one_lens(
+        lens,
+        adapter,
+        values,
+        sample_index=2,
+        pixelscale=0.5,
+        pseudo_caustic_points=16,
+        pseudo_caustic_epsilon=0.02,
+        geometry_tolerance=0.003,
+    )
+
+    assert calls["find"][3]["geometry_tolerance"] == 0.003
+    assert calls["trace"][3] == {
+        "num_points": 16,
+        "epsilon": 0.02,
+        "geometry_tolerance": 0.003,
+    }
+    assert geometry.pixelscale == 0.5
 
 
 def test_source_boundary_certification_refines_until_displacement_converges(
@@ -1172,7 +1529,7 @@ def test_source_boundary_certification_refines_until_displacement_converges(
         valid_sis_spec,
         fixed_cosmology,
         pixelscale=1.0,
-        boundary_tolerance=0.2,
+        boundary_tolerance=0.9,
         max_boundary_refinements=3,
     )
     snapshots = [
@@ -1188,6 +1545,14 @@ def test_source_boundary_certification_refines_until_displacement_converges(
         return snapshots[len(calls) - 1]
 
     monkeypatch.setattr(node, "_boundary_geometry_for_one_lens", boundary_snapshot)
+    original_compare = caustics_source_geometry._compare_boundary_geometry
+    comparison_tolerances = []
+
+    def compare(previous, current, geometry_tolerance):
+        comparison_tolerances.append(geometry_tolerance)
+        return original_compare(previous, current, geometry_tolerance)
+
+    monkeypatch.setattr(caustics_source_geometry, "_compare_boundary_geometry", compare)
 
     previous, current, uncertainty, refinements = node._certified_boundary_geometry_for_one_lens(
         object(),
@@ -1195,11 +1560,17 @@ def test_source_boundary_certification_refines_until_displacement_converges(
         {},
         sample_index=0,
         pixelscale=1.0,
+        pseudo_caustic_epsilon=0.02,
+        geometry_tolerance=0.003,
+        boundary_tolerance=0.2,
     )
 
     assert [call["pixelscale"] for call in calls] == [1.0, 0.5, 0.25]
     assert [call["pseudo_caustic_points"] for call in calls] == [8, 16, 32]
     assert [call["initial_fov"] for call in calls] == [None, 4.0, 6.0]
+    assert [call["pseudo_caustic_epsilon"] for call in calls] == [0.02] * 3
+    assert [call["geometry_tolerance"] for call in calls] == [0.003] * 3
+    assert comparison_tolerances == [0.003, 0.003]
     assert previous.critical_curve_fov == 6.0
     assert current.critical_curve_fov == 8.0
     assert uncertainty == pytest.approx(0.1)
@@ -1241,9 +1612,14 @@ def test_source_boundary_certification_reports_nonconverging_snapshots(
             {},
             sample_index=4,
             pixelscale=1.0,
+            pseudo_caustic_epsilon=0.02,
+            geometry_tolerance=0.003,
+            boundary_tolerance=0.1,
         )
 
     assert len(calls) == 3
+    assert [call["pseudo_caustic_epsilon"] for call in calls] == [0.02] * 3
+    assert [call["geometry_tolerance"] for call in calls] == [0.003] * 3
     message = str(error.value)
     assert "lens model 'SIS' sample 4 at node 'source_node'" in message
     assert "last displacement=1.0 arcsec, topology_stable=True" in message
@@ -1252,6 +1628,15 @@ def test_source_boundary_certification_reports_nonconverging_snapshots(
     assert "current_pixelscale=0.25 arcsec" in message
     assert "previous_critical_curve_fov=5.0 arcsec" in message
     assert "current_critical_curve_fov=6.0 arcsec" in message
+    assert "configured_pseudo_caustic_epsilon=0.1 arcsec" in message
+    assert "pseudo_caustic_epsilon_fraction=None" in message
+    assert "realized_pseudo_caustic_epsilon=0.02 arcsec" in message
+    assert "configured_geometry_tolerance=0.01 arcsec" in message
+    assert "geometry_tolerance_fraction=None" in message
+    assert "realized_geometry_tolerance=0.003 arcsec" in message
+    assert "configured_boundary_tolerance=0.1 arcsec" in message
+    assert "boundary_tolerance_fraction=None" in message
+    assert "realized_boundary_tolerance=0.1 arcsec" in message
 
 
 def test_axisymmetric_boundary_certification_partitions_stable_point_and_converges(
@@ -1307,6 +1692,26 @@ def test_axisymmetric_boundary_certification_partitions_stable_point_and_converg
         return snapshots[len(calls) - 1]
 
     monkeypatch.setattr(node, "_boundary_geometry_for_one_lens", boundary_snapshot)
+    original_partition = caustics_source_geometry._partition_axisymmetric_point_caustics
+    partition_tolerances = []
+
+    def partition(*curves, boundary_tolerance):
+        partition_tolerances.append(boundary_tolerance)
+        return original_partition(*curves, boundary_tolerance=boundary_tolerance)
+
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_partition_axisymmetric_point_caustics",
+        partition,
+    )
+    original_compare = caustics_source_geometry._compare_boundary_geometry
+    comparison_tolerances = []
+
+    def compare(previous, current, geometry_tolerance):
+        comparison_tolerances.append(geometry_tolerance)
+        return original_compare(previous, current, geometry_tolerance)
+
+    monkeypatch.setattr(caustics_source_geometry, "_compare_boundary_geometry", compare)
 
     previous, current, uncertainty, refinements = node._certified_boundary_geometry_for_one_lens(
         lens,
@@ -1314,11 +1719,18 @@ def test_axisymmetric_boundary_certification_partitions_stable_point_and_converg
         adapter_values,
         sample_index=2,
         pixelscale=1.0,
+        pseudo_caustic_epsilon=0.02,
+        geometry_tolerance=0.003,
+        boundary_tolerance=0.1,
     )
 
     assert [call["pixelscale"] for call in calls] == [1.0, 0.5, 0.25]
     assert [call["pseudo_caustic_points"] for call in calls] == [8, 16, 32]
     assert [call["initial_fov"] for call in calls] == [None, 4.0, 5.0]
+    assert [call["pseudo_caustic_epsilon"] for call in calls] == [0.02] * 3
+    assert [call["geometry_tolerance"] for call in calls] == [0.003] * 3
+    assert partition_tolerances == [0.1]
+    assert comparison_tolerances == [0.003]
     assert previous.caustic_curves == (regular_curves[1],)
     assert current.caustic_curves == (regular_curves[2],)
     np.testing.assert_allclose(previous.point_caustics, [[0.04, 0.0]])
@@ -1378,14 +1790,288 @@ def test_axisymmetric_boundary_certification_exhausts_on_partition_count_change(
             {},
             sample_index=6,
             pixelscale=1.0,
+            pseudo_caustic_epsilon=0.02,
+            geometry_tolerance=0.003,
+            boundary_tolerance=0.1,
         )
 
     assert len(calls) == 3
+    assert [call["pseudo_caustic_epsilon"] for call in calls] == [0.02] * 3
+    assert [call["geometry_tolerance"] for call in calls] == [0.003] * 3
     message = str(error.value)
     assert "lens model 'SIS' sample 6 at node 'source_node'" in message
     assert "last displacement=inf arcsec, topology_stable=False" in message
     assert "previous_pixelscale=0.5 arcsec" in message
     assert "current_pixelscale=0.25 arcsec" in message
+
+
+def test_axisymmetric_certification_uses_realized_boundary_tolerance_for_point_centers(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Reject point-center motion above the effective per-lens threshold."""
+    pytest.importorskip("shapely")
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        boundary_tolerance=0.9,
+        max_boundary_refinements=2,
+    )
+
+    class AxisymmetricAdapter(_FakeGeometryAdapter):
+        """Enable the axisymmetric certification branch."""
+
+        def axisymmetry_center(self, values):
+            del values
+            return (0.0, 0.0)
+
+    snapshots = [
+        _boundary_snapshot(
+            center_x=0.0,
+            fov=4.0 + index,
+            pixelscale=1.0 / 2**index,
+            pseudo_caustic_points=8 * 2**index,
+        )
+        for index in range(3)
+    ]
+    calls = []
+
+    def boundary_snapshot(*args, **kwargs):
+        del args
+        calls.append(kwargs)
+        return snapshots[len(calls) - 1]
+
+    partition_tolerances = []
+
+    def partition(older, previous, current, *, boundary_tolerance):
+        del older, previous, current
+        partition_tolerances.append(boundary_tolerance)
+        square = _closed_square()
+        return caustics_source_geometry._PointCausticPartition(
+            previous_curves=(square,),
+            current_curves=(square.copy(),),
+            previous_points=(np.array([0.0, 0.0]),),
+            current_points=(np.array([0.2, 0.0]),),
+        )
+
+    monkeypatch.setattr(node, "_boundary_geometry_for_one_lens", boundary_snapshot)
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_partition_axisymmetric_point_caustics",
+        partition,
+    )
+
+    with pytest.raises(RuntimeError, match="topology_stable=False"):
+        node._certified_boundary_geometry_for_one_lens(
+            object(),
+            AxisymmetricAdapter(),
+            {},
+            sample_index=8,
+            pixelscale=1.0,
+            pseudo_caustic_epsilon=0.02,
+            geometry_tolerance=0.003,
+            boundary_tolerance=0.1,
+        )
+
+    assert partition_tolerances == [0.1]
+
+
+def test_source_region_realizes_once_and_threads_all_angular_settings(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Use one settings realization throughout boundary and region policy."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale=0.75,
+        pixelscale_fraction=0.25,
+        pseudo_caustic_epsilon=0.3,
+        pseudo_caustic_epsilon_fraction=0.1,
+        geometry_tolerance=0.05,
+        geometry_tolerance_fraction=0.01,
+        boundary_tolerance=0.4,
+        boundary_tolerance_fraction=0.1,
+    )
+    lens = object()
+    adapter = _FakeGeometryAdapter()
+    adapter_values = {"lens": "values"}
+    previous = _boundary_snapshot(
+        center_x=0.0,
+        fov=4.0,
+        pixelscale=0.5,
+        pseudo_caustic_points=16,
+    )
+    geometry = _boundary_snapshot(
+        center_x=0.01,
+        fov=4.0,
+        pixelscale=0.25,
+        pseudo_caustic_points=32,
+    )
+    region = object()
+    calls = {}
+
+    monkeypatch.setattr(
+        caustics_lens_system,
+        "_build_lens_system",
+        lambda *args, **kwargs: (lens, adapter, adapter_values),
+    )
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_validate_source_geometry_support",
+        lambda *args, **kwargs: None,
+    )
+
+    def certify(passed_lens, passed_adapter, passed_values, **kwargs):
+        assert passed_lens is lens
+        assert passed_adapter is adapter
+        assert passed_values is adapter_values
+        calls["certify"] = kwargs
+        return previous, geometry, 0.01, 1
+
+    def build(caustic_curves, pseudo_caustic_curves, *, geometry_tolerance):
+        assert caustic_curves is geometry.caustic_curves
+        assert pseudo_caustic_curves is geometry.pseudo_caustic_curves
+        calls["region_tolerance"] = geometry_tolerance
+        return region
+
+    monkeypatch.setattr(node, "_certified_boundary_geometry_for_one_lens", certify)
+    monkeypatch.setattr(caustics_source_geometry, "_build_strong_lensing_region", build)
+
+    result = node._region_for_one_lens({"source_redshift": 1.5}, sample_index=4)
+
+    assert calls["certify"] == {
+        "sample_index": 4,
+        "pixelscale": 0.5,
+        "pseudo_caustic_epsilon": 0.2,
+        "geometry_tolerance": 0.02,
+        "boundary_tolerance": 0.2,
+    }
+    assert calls["region_tolerance"] == 0.02
+    assert result[0] is adapter
+    assert result[1] is adapter_values
+    assert result[2] is previous
+    assert result[3] is geometry
+    assert result[4:6] == (0.01, 1)
+    assert result[6] is region
+    assert result[7] == (2.0, 0.5, 0.2, 0.02, 0.2)
+
+
+def test_source_compute_uses_realized_clearance_tolerance_and_settings_context(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Use and report effective values without mutating configured caps."""
+    node = _source_node(
+        valid_sis_spec,
+        fixed_cosmology,
+        pixelscale_fraction=0.25,
+        pseudo_caustic_epsilon_fraction=0.01,
+        geometry_tolerance_fraction=0.0015,
+        boundary_tolerance_fraction=0.02,
+    )
+    adapter = _FakeGeometryAdapter()
+    previous = _boundary_snapshot(
+        center_x=0.0,
+        fov=4.0,
+        pixelscale=0.5,
+        pseudo_caustic_points=16,
+    )
+    geometry = _boundary_snapshot(
+        center_x=0.05,
+        fov=5.0,
+        pixelscale=0.25,
+        pseudo_caustic_points=32,
+    )
+    region = object()
+    captured = {}
+
+    monkeypatch.setattr(
+        node,
+        "_region_for_one_lens",
+        lambda values, sample_index: (
+            adapter,
+            {},
+            previous,
+            geometry,
+            0.01,
+            2,
+            region,
+            (2.0, 0.5, 0.02, 0.003, 0.04),
+        ),
+    )
+
+    def sample_position(
+        passed_region,
+        rng,
+        *,
+        max_attempts,
+        lens_identifier,
+        geometry_settings,
+        excluded_points,
+    ):
+        del rng, max_attempts, lens_identifier, excluded_points
+        assert passed_region is region
+        captured["geometry_settings"] = geometry_settings
+        return 0.0, 0.0, 1.0, 1
+
+    def clearance(source_x, source_y, passed_geometry, geometry_tolerance):
+        del source_x, source_y
+        assert passed_geometry is geometry
+        captured["clearance_tolerance"] = geometry_tolerance
+        return 0.5
+
+    monkeypatch.setattr(caustics_source_geometry, "_sample_position", sample_position)
+    monkeypatch.setattr(caustics_source_geometry, "_source_boundary_clearance", clearance)
+
+    node.compute(_graph_state_for(node, 1), rng_info=np.random.default_rng(5))
+
+    assert captured["clearance_tolerance"] == 0.003
+    settings = captured["geometry_settings"]
+    assert {
+        "characteristic_scale": settings["characteristic_scale"],
+        "configured_pixelscale": settings["configured_pixelscale"],
+        "pixelscale_fraction": settings["pixelscale_fraction"],
+        "realized_pixelscale": settings["realized_pixelscale"],
+        "configured_pseudo_caustic_epsilon": settings["configured_pseudo_caustic_epsilon"],
+        "pseudo_caustic_epsilon_fraction": settings["pseudo_caustic_epsilon_fraction"],
+        "realized_pseudo_caustic_epsilon": settings["realized_pseudo_caustic_epsilon"],
+        "configured_geometry_tolerance": settings["configured_geometry_tolerance"],
+        "geometry_tolerance_fraction": settings["geometry_tolerance_fraction"],
+        "realized_geometry_tolerance": settings["realized_geometry_tolerance"],
+        "configured_boundary_tolerance": settings["configured_boundary_tolerance"],
+        "boundary_tolerance_fraction": settings["boundary_tolerance_fraction"],
+        "realized_boundary_tolerance": settings["realized_boundary_tolerance"],
+    } == {
+        "characteristic_scale": 2.0,
+        "configured_pixelscale": node.pixelscale,
+        "pixelscale_fraction": node.pixelscale_fraction,
+        "realized_pixelscale": 0.5,
+        "configured_pseudo_caustic_epsilon": node.pseudo_caustic_epsilon,
+        "pseudo_caustic_epsilon_fraction": node.pseudo_caustic_epsilon_fraction,
+        "realized_pseudo_caustic_epsilon": 0.02,
+        "configured_geometry_tolerance": node.geometry_tolerance,
+        "geometry_tolerance_fraction": node.geometry_tolerance_fraction,
+        "realized_geometry_tolerance": 0.003,
+        "configured_boundary_tolerance": node.boundary_tolerance,
+        "boundary_tolerance_fraction": node.boundary_tolerance_fraction,
+        "realized_boundary_tolerance": 0.04,
+    }
+    assert settings["fov"] == node.fov
+    assert settings["max_fov_expansions"] == node.max_fov_expansions
+    assert settings["pseudo_caustic_points"] == node.pseudo_caustic_points
+    assert settings["max_boundary_refinements"] == node.max_boundary_refinements
+    assert settings["final_pixelscale"] == geometry.pixelscale
+    assert settings["final_pseudo_caustic_points"] == geometry.pseudo_caustic_points
+    assert settings["final_critical_curve_fov"] == geometry.critical_curve_fov
+    assert settings["boundary_uncertainty"] == 0.01
+    assert settings["boundary_refinements"] == 2
+    assert node.pseudo_caustic_epsilon == 0.1
+    assert node.geometry_tolerance == 0.01
+    assert node.boundary_tolerance == 0.1
 
 
 def test_source_compute_draws_all_subseeds_before_sample_work(
@@ -1467,6 +2153,43 @@ def test_source_compute_isolates_later_samples_from_first_rejection_count(
         np.testing.assert_array_equal(baseline_result[1:], perturbed_result[1:])
 
 
+def test_source_compute_retry_keeps_later_sample_rng_isolated(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Keep later outputs fixed when a narrow first-sample draw is retried."""
+    node = _source_node(valid_sis_spec, fixed_cosmology)
+    _patch_source_compute_runtime(monkeypatch, node)
+    baseline_clearances = iter([0.5, 0.5])
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: next(baseline_clearances),
+    )
+    baseline = node.compute(
+        _graph_state_for(node, 2),
+        rng_info=np.random.default_rng(77),
+    )
+
+    retried_clearances = iter([0.1, 0.5, 0.5])
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: next(retried_clearances),
+    )
+    retried = node.compute(
+        _graph_state_for(node, 2),
+        rng_info=np.random.default_rng(77),
+    )
+
+    assert baseline[0][0] != retried[0][0]
+    assert baseline[3][0] == 1
+    assert retried[3][0] == 2
+    for baseline_result, retried_result in zip(baseline, retried, strict=True):
+        np.testing.assert_array_equal(baseline_result[1:], retried_result[1:])
+
+
 @pytest.mark.parametrize("num_samples", [1, 2])
 def test_source_compute_shapes_output_order_persistence_and_fixed_semantics(
     monkeypatch,
@@ -1543,22 +2266,148 @@ def test_source_compute_shapes_output_order_persistence_and_fixed_semantics(
         assert all(result.shape == (2,) for result in results)
 
 
-@pytest.mark.parametrize(
-    ("counts", "clearance", "message"),
-    [
-        ((3, 4), 0.5, "penultimate expected_num_images=3, final expected_num_images=4"),
-        ((4, 4), 0.1, "source_boundary_clearance=0.1 arcsec, boundary_uncertainty=0.1 arcsec"),
-    ],
-)
-def test_source_compute_rejects_uncertified_sample_before_persistence(
+def test_source_compute_redraws_narrow_boundary_candidate_with_remaining_budget(
     monkeypatch,
     valid_sis_spec,
     fixed_cosmology,
-    counts,
-    clearance,
-    message,
 ):
-    """Require stable counts and clearance strictly above boundary uncertainty."""
+    """Retry equality-clearance candidates within one cumulative draw budget."""
+    node = _source_node(valid_sis_spec, fixed_cosmology)
+    _patch_source_compute_runtime(monkeypatch, node)
+    candidates = iter(
+        [
+            (0.0, 0.0, 10.0, 2),
+            (1.25, -0.75, 10.0, 3),
+        ]
+    )
+    budgets = []
+
+    def sample_position(*args, max_attempts, **kwargs):
+        del args, kwargs
+        budgets.append(max_attempts)
+        return next(candidates)
+
+    clearances = iter([0.1, 0.5])
+    monkeypatch.setattr(caustics_source_geometry, "_sample_position", sample_position)
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: next(clearances),
+    )
+
+    results = node.compute(
+        _graph_state_for(node, 1),
+        rng_info=np.random.default_rng(5),
+    )
+
+    assert results[0:5] == [1.25, -0.75, 10.0, 5, 4]
+    assert results[7] == 0.5
+    assert budgets == [10, 8]
+
+
+def test_source_compute_exhausts_narrow_boundary_retry_budget(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Report cumulative exhaustion after every candidate is too narrow."""
+    node = _source_node(valid_sis_spec, fixed_cosmology, max_attempts=3)
+    _patch_source_compute_runtime(monkeypatch, node)
+    budgets = []
+
+    def sample_position(*args, max_attempts, **kwargs):
+        del args, kwargs
+        budgets.append(max_attempts)
+        return (0.0, 0.0, 10.0, 1)
+
+    monkeypatch.setattr(caustics_source_geometry, "_sample_position", sample_position)
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: 0.1,
+    )
+    graph_state = _graph_state_for(node, 1)
+
+    with pytest.raises(RuntimeError) as error:
+        node.compute(graph_state, rng_info=np.random.default_rng(5))
+
+    message = str(error.value)
+    assert budgets == [3, 2, 1]
+    assert "after 3 attempts" in message
+    assert "narrow_boundary_rejections=3" in message
+    assert "last_source_boundary_clearance=0.1 arcsec" in message
+    assert "boundary_uncertainty=0.1 arcsec" in message
+    for setting in (
+        "fov=4.0",
+        "characteristic_scale=None",
+        "configured_pixelscale=1.0",
+        "pixelscale_fraction=None",
+        "realized_pixelscale=0.5",
+        "max_fov_expansions=2",
+        "pseudo_caustic_points=8",
+        "configured_pseudo_caustic_epsilon=0.1",
+        "pseudo_caustic_epsilon_fraction=None",
+        "realized_pseudo_caustic_epsilon=0.1",
+        "configured_geometry_tolerance=0.01",
+        "geometry_tolerance_fraction=None",
+        "realized_geometry_tolerance=0.01",
+        "configured_boundary_tolerance=0.1",
+        "boundary_tolerance_fraction=None",
+        "realized_boundary_tolerance=0.1",
+        "max_boundary_refinements=3",
+        "final_pixelscale=0.25",
+        "final_pseudo_caustic_points=32",
+        "final_critical_curve_fov=5.0",
+        "boundary_uncertainty=0.1",
+        "boundary_refinements=2",
+    ):
+        assert setting in message
+    assert not set(_SOURCE_OUTPUTS).intersection(graph_state[node.node_string])
+
+
+def test_source_compute_wraps_sampling_exhaustion_after_narrow_boundary_rejection(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Preserve proposal exhaustion as the cause of total-budget exhaustion."""
+    node = _source_node(valid_sis_spec, fixed_cosmology, max_attempts=3)
+    _patch_source_compute_runtime(monkeypatch, node)
+    inner_error = RuntimeError("unique proposal exhaustion")
+    budgets = []
+
+    def sample_position(*args, max_attempts, **kwargs):
+        del args, kwargs
+        budgets.append(max_attempts)
+        if len(budgets) == 1:
+            return (0.0, 0.0, 10.0, 1)
+        raise inner_error
+
+    monkeypatch.setattr(caustics_source_geometry, "_sample_position", sample_position)
+    monkeypatch.setattr(
+        caustics_source_geometry,
+        "_source_boundary_clearance",
+        lambda *args, **kwargs: 0.1,
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        node.compute(_graph_state_for(node, 1), rng_info=np.random.default_rng(5))
+
+    assert budgets == [3, 2]
+    assert "after 3 attempts" in str(error.value)
+    assert "narrow_boundary_rejections=1" in str(error.value)
+    assert "last_source_boundary_clearance=0.1 arcsec" in str(error.value)
+    assert "boundary_uncertainty=0.1 arcsec" in str(error.value)
+    assert "realized_geometry_tolerance=0.01" in str(error.value)
+    assert error.value.__cause__ is inner_error
+
+
+def test_source_compute_count_mismatch_remains_nonretryable(
+    monkeypatch,
+    valid_sis_spec,
+    fixed_cosmology,
+):
+    """Raise immediately when penultimate and final image counts disagree."""
     node = _source_node(valid_sis_spec, fixed_cosmology)
     previous = _boundary_snapshot(
         center_x=0.0,
@@ -1575,7 +2424,7 @@ def test_source_compute_rejects_uncertified_sample_before_persistence(
 
     class CountAdapter(_FakeGeometryAdapter):
         def __init__(self):
-            self.counts = iter(counts)
+            self.counts = iter((3, 4))
 
         def expected_num_images(self, source_x, source_y, **kwargs):
             del source_x, source_y, kwargs
@@ -1592,24 +2441,37 @@ def test_source_compute_rejects_uncertified_sample_before_persistence(
             0.1,
             2,
             object(),
-            0.5,
+            (None, 0.5, 0.1, 0.01, 0.1),
         ),
     )
+
+    sampler_calls = 0
+
+    def sample_position(*args, **kwargs):
+        nonlocal sampler_calls
+        del args, kwargs
+        sampler_calls += 1
+        return (0.0, 0.0, 1.0, 1)
+
     monkeypatch.setattr(
         caustics_source_geometry,
         "_sample_position",
-        lambda *args, **kwargs: (0.0, 0.0, 1.0, 1),
+        sample_position,
     )
     monkeypatch.setattr(
         caustics_source_geometry,
         "_source_boundary_clearance",
-        lambda *args, **kwargs: clearance,
+        lambda *args, **kwargs: 0.5,
     )
     graph_state = _graph_state_for(node, 1)
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(
+        RuntimeError,
+        match="penultimate expected_num_images=3, final expected_num_images=4",
+    ):
         node.compute(graph_state, rng_info=np.random.default_rng(5))
 
+    assert sampler_calls == 1
     assert not set(_SOURCE_OUTPUTS).intersection(graph_state[node.node_string])
 
 
@@ -1776,7 +2638,7 @@ def test_image_solve_derives_none_fov_or_converts_explicit_fov(
     assert adapter.initial_fov_calls == ([adapter_values] if uses_adapter else [])
     assert len(forward_calls) == 1
     assert forward_calls[0]["current_fov"] == expected_initial_fov
-    assert result[4]["solver_fov"] == expected_initial_fov
+    assert result[6]["solver_fov"] == expected_initial_fov
 
 
 @pytest.mark.parametrize(
@@ -1849,7 +2711,13 @@ def test_image_one_attempt_uses_actual_spacing_and_sorts_all_observables(
         epsilon=0.3,
         epsilon_fraction=0.1,
     )
-    lens = _ArrayLens([-2.0, 3.0, -4.0, 5.0], [10.0, 10.0, 10.0, 11.0])
+    lens = _ArrayLens(
+        [-2.0, 3.0, -4.0, 5.0],
+        [10.0, 10.0, 10.0, 11.0],
+        convergences=[0.1, 0.2, 0.3, 0.4],
+        shear1=[3.0, 5.0, 8.0, 7.0],
+        shear2=[4.0, 12.0, 15.0, 24.0],
+    )
     _patch_image_runtime(monkeypatch, lens, _FakeGeometryAdapter())
     calls = []
     coordinates = np.array(
@@ -1868,9 +2736,15 @@ def test_image_one_attempt_uses_actual_spacing_and_sorts_all_observables(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    image_x, image_y, magnifications, delays, diagnostics = node._solve_one(
-        _image_values(fov=5.0, expected_num_images=4)
-    )
+    (
+        image_x,
+        image_y,
+        magnifications,
+        delays,
+        convergences,
+        shears,
+        diagnostics,
+    ) = node._solve_one(_image_values(fov=5.0, expected_num_images=4))
 
     assert len(calls) == 1
     assert calls[0] == {
@@ -1884,6 +2758,8 @@ def test_image_one_attempt_uses_actual_spacing_and_sorts_all_observables(
     np.testing.assert_array_equal(image_y, [2.0, 3.0, 2.0, 9.0])
     np.testing.assert_array_equal(magnifications, [4.0, 3.0, 2.0, 5.0])
     np.testing.assert_array_equal(delays, [0.0, 0.0, 0.0, 1.0])
+    np.testing.assert_array_equal(convergences, [0.3, 0.2, 0.1, 0.4])
+    np.testing.assert_array_equal(shears, [17.0, 13.0, 5.0, 25.0])
     assert diagnostics == {
         "image_count_deficit": 0,
         "solver_fov": 10.0,
@@ -1894,6 +2770,8 @@ def test_image_one_attempt_uses_actual_spacing_and_sorts_all_observables(
     }
     assert lens.magnification_calls == 1
     assert lens.delay_calls == 1
+    assert lens.convergence_calls == 1
+    assert lens.shear_calls == 1
 
 
 def test_image_singular_base_uses_divisions_plus_one_variant(
@@ -1920,7 +2798,7 @@ def test_image_singular_base_uses_divisions_plus_one_variant(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    _, _, _, _, diagnostics = node._solve_one(_image_values())
+    _, _, _, _, _, _, diagnostics = node._solve_one(_image_values())
 
     assert [(call["center_x"], call["center_y"], call["divisions"]) for call in calls] == [
         (0.0, 0.0, 3),
@@ -1957,7 +2835,7 @@ def test_image_three_singular_variants_then_expand_fov(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    _, _, _, _, diagnostics = node._solve_one(_image_values())
+    _, _, _, _, _, _, diagnostics = node._solve_one(_image_values())
 
     assert [call["current_fov"] for call in calls] == [4.0, 4.0, 4.0, 8.0]
     assert [(call["center_x"], call["center_y"], call["divisions"]) for call in calls] == [
@@ -1996,7 +2874,7 @@ def test_image_empty_candidate_error_moves_directly_to_outer_schedule(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    _, _, _, _, diagnostics = node._solve_one(_image_values())
+    _, _, _, _, _, _, diagnostics = node._solve_one(_image_values())
 
     assert [(call["current_fov"], call["divisions"]) for call in calls] == [
         (4.0, 4),
@@ -2059,7 +2937,7 @@ def test_image_outer_schedule_finishes_fov_before_pixelscale_refinement(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    _, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
+    _, _, _, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
 
     assert [call["current_fov"] for call in calls] == [4.0, 8.0, 16.0, 16.0, 16.0]
     assert [call["divisions"] for call in calls] == [3, 6, 11, 22, 43]
@@ -2165,7 +3043,7 @@ def test_image_targeted_recovery_adds_one_batch_and_keeps_duplicates(
     monkeypatch.setattr(caustics_image_recovery, "_recovery_image_seeds", recovery_seeds)
     monkeypatch.setattr(caustics_image_recovery, "_refine_image_seeds", refine_seeds)
 
-    image_x, image_y, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
+    image_x, image_y, _, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
 
     assert len(seed_calls) == 1
     assert seed_calls[0][0] is lens
@@ -2230,7 +3108,7 @@ def test_image_targeted_recovery_policy_gates(
     else:
         result = node._solve_one(_image_values(expected_num_images=expected_num_images))
         assert len(result[0]) == count
-        assert result[4]["solver_attempts"] == 1
+        assert result[6]["solver_attempts"] == 1
 
 
 def test_image_retryable_targeted_failure_retains_deficient_global_result(
@@ -2267,7 +3145,7 @@ def test_image_retryable_targeted_failure_retains_deficient_global_result(
         lambda *args, **kwargs: (_ for _ in ()).throw(IndexError("index 0 is out of bounds for dimension 0")),
     )
 
-    image_x, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
+    image_x, _, _, _, _, _, diagnostics = node._solve_one(_image_values(expected_num_images=3))
 
     np.testing.assert_array_equal(image_x, [4.0, 0.0])
     assert diagnostics["image_count_deficit"] == 1
@@ -2405,7 +3283,7 @@ def test_image_bounded_deficit_requires_at_least_min_images(
     else:
         result = node._solve_one(_image_values(expected_num_images=3))
         assert len(result[0]) == 2
-        assert result[4]["image_count_deficit"] == deficit
+        assert result[6]["image_count_deficit"] == deficit
 
 
 def test_image_no_expectation_completes_at_minimum_with_deficit_sentinel(
@@ -2433,7 +3311,7 @@ def test_image_no_expectation_completes_at_minimum_with_deficit_sentinel(
 
     monkeypatch.setattr(node, "_forward_raytrace_images", forward)
 
-    image_x, image_y, magnifications, delays, diagnostics = node._solve_one(
+    image_x, image_y, magnifications, delays, convergences, shears, diagnostics = node._solve_one(
         _image_values(expected_num_images=None)
     )
 
@@ -2444,6 +3322,8 @@ def test_image_no_expectation_completes_at_minimum_with_deficit_sentinel(
     np.testing.assert_array_equal(image_y, [0.0, 0.0])
     np.testing.assert_array_equal(magnifications, [3.0, 2.0])
     np.testing.assert_array_equal(delays, [0.0, 3.0])
+    np.testing.assert_array_equal(convergences, [0.0, 0.0])
+    np.testing.assert_array_equal(shears, [0.0, 0.0])
     assert diagnostics == {
         "image_count_deficit": -1,
         "solver_fov": 4.0,
@@ -2473,6 +3353,8 @@ def test_image_compute_single_sample_packs_padding_and_preserves_fixed_output(
         np.array([-2.0, -1.0]),
         np.array([5.0, 6.0]),
         np.array([0.0, 3.0]),
+        np.array([0.2, 0.4]),
+        np.array([0.5, 0.7]),
         {
             "image_count_deficit": -1,
             "solver_fov": 8.0,
@@ -2498,24 +3380,28 @@ def test_image_compute_single_sample_packs_padding_and_preserves_fixed_output(
     assert tuple(name for name in saved if name in _IMAGE_OUTPUTS) == _IMAGE_OUTPUTS
     assert "cosmology" not in saved
     assert np.isscalar(results[0])
-    assert all(np.isscalar(result) for result in results[5:])
-    assert all(result.shape == (4,) for result in results[1:5])
+    assert all(np.isscalar(result) for result in results[7:])
+    assert all(result.shape == (4,) for result in results[1:7])
     assert results[0] == 2
     np.testing.assert_array_equal(results[1], [2.0, 1.0, np.nan, np.nan])
     np.testing.assert_array_equal(results[2], [-2.0, -1.0, np.nan, np.nan])
     np.testing.assert_array_equal(results[3], [5.0, 6.0, 0.0, 0.0])
     np.testing.assert_array_equal(results[4], [0.0, 3.0, np.nan, np.nan])
-    assert results[5] == -1
-    assert results[6] == 8.0
-    assert results[7] == 0.25
-    assert results[8] == 3
-    assert results[9] == 1
-    assert results[10] == 0
+    np.testing.assert_array_equal(results[5], [0.2, 0.4, np.nan, np.nan])
+    np.testing.assert_array_equal(results[6], [0.5, 0.7, np.nan, np.nan])
+    assert results[7] == -1
+    assert results[8] == 8.0
+    assert results[9] == 0.25
+    assert results[10] == 3
+    assert results[11] == 1
+    assert results[12] == 0
     assert saved["num_images"] == 99
     np.testing.assert_array_equal(saved["image_x"], [2.0, 1.0, np.nan, np.nan])
     np.testing.assert_array_equal(saved["image_y"], [-2.0, -1.0, np.nan, np.nan])
     np.testing.assert_array_equal(saved["macro_magnifications"], [5.0, 6.0, 0.0, 0.0])
     np.testing.assert_array_equal(saved["time_delays"], [0.0, 3.0, np.nan, np.nan])
+    np.testing.assert_array_equal(saved["macro_convergences"], [0.2, 0.4, np.nan, np.nan])
+    np.testing.assert_array_equal(saved["macro_shear"], [0.5, 0.7, np.nan, np.nan])
     assert saved["image_count_deficit"] == -1
     assert saved["solver_fov"] == 8.0
     assert saved["solver_pixelscale"] == 0.25
@@ -2547,6 +3433,8 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
                 np.array([-2.0, -1.0]),
                 np.array([5.0, 6.0]),
                 np.array([0.0, 3.0]),
+                np.array([0.2, 0.4]),
+                np.array([0.5, 0.7]),
                 {
                     "image_count_deficit": -1,
                     "solver_fov": 8.0,
@@ -2561,6 +3449,8 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
                 np.array([-7.0]),
                 np.array([9.0]),
                 np.array([0.0]),
+                np.array([0.9]),
+                np.array([1.1]),
                 {
                     "image_count_deficit": -1,
                     "solver_fov": 16.0,
@@ -2590,8 +3480,8 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
 
     np.testing.assert_array_equal(seen_source_x, [0.1, 0.2])
     assert tuple(name for name in saved if name in _IMAGE_OUTPUTS) == _IMAGE_OUTPUTS
-    assert all(result.shape == (2,) for result in (results[0], *results[5:]))
-    assert all(result.shape == (2, 4) for result in results[1:5])
+    assert all(result.shape == (2,) for result in (results[0], *results[7:]))
+    assert all(result.shape == (2, 4) for result in results[1:7])
     np.testing.assert_array_equal(results[0], [2, 1])
     np.testing.assert_array_equal(
         results[1],
@@ -2606,12 +3496,20 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
         results[4],
         [[0.0, 3.0, np.nan, np.nan], [0.0, np.nan, np.nan, np.nan]],
     )
-    np.testing.assert_array_equal(results[5], [-1, -1])
-    np.testing.assert_array_equal(results[6], [8.0, 16.0])
-    np.testing.assert_array_equal(results[7], [0.25, 0.125])
-    np.testing.assert_array_equal(results[8], [3, 5])
-    np.testing.assert_array_equal(results[9], [1, 2])
-    np.testing.assert_array_equal(results[10], [0, 1])
+    np.testing.assert_array_equal(
+        results[5],
+        [[0.2, 0.4, np.nan, np.nan], [0.9, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(
+        results[6],
+        [[0.5, 0.7, np.nan, np.nan], [1.1, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(results[7], [-1, -1])
+    np.testing.assert_array_equal(results[8], [8.0, 16.0])
+    np.testing.assert_array_equal(results[9], [0.25, 0.125])
+    np.testing.assert_array_equal(results[10], [3, 5])
+    np.testing.assert_array_equal(results[11], [1, 2])
+    np.testing.assert_array_equal(results[12], [0, 1])
     np.testing.assert_array_equal(saved["num_images"], [2, 1])
     np.testing.assert_array_equal(
         saved["image_x"],
@@ -2628,6 +3526,14 @@ def test_image_compute_multiple_samples_packs_rows_and_persists_all_outputs(
     np.testing.assert_array_equal(
         saved["time_delays"],
         [[0.0, 3.0, np.nan, np.nan], [0.0, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(
+        saved["macro_convergences"],
+        [[0.2, 0.4, np.nan, np.nan], [0.9, np.nan, np.nan, np.nan]],
+    )
+    np.testing.assert_array_equal(
+        saved["macro_shear"],
+        [[0.5, 0.7, np.nan, np.nan], [1.1, np.nan, np.nan, np.nan]],
     )
     np.testing.assert_array_equal(saved["image_count_deficit"], [-1, -1])
     np.testing.assert_array_equal(saved["solver_fov"], [8.0, 16.0])
